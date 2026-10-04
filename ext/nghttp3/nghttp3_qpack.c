@@ -159,8 +159,9 @@ static VALUE rb_nghttp3_qpack_encoder_read_decoder(VALUE self, VALUE rb_data) {
 
   Check_Type(rb_data, T_STRING);
 
-  rv = nghttp3_qpack_encoder_read_decoder(
-      obj->encoder, (const uint8_t *)RSTRING_PTR(rb_data), RSTRING_LEN(rb_data));
+  rv = nghttp3_qpack_encoder_read_decoder(obj->encoder,
+                                          (const uint8_t *)RSTRING_PTR(rb_data),
+                                          RSTRING_LEN(rb_data));
 
   if (rv < 0) {
     nghttp3_rb_raise((int)rv, "Failed to read decoder stream");
@@ -352,8 +353,8 @@ get_or_create_stream_context(DecoderObj *obj, int64_t stream_id) {
 
   /* Create new context */
   nghttp3_qpack_stream_context *sctx;
-  int rv = nghttp3_qpack_stream_context_new(&sctx, stream_id,
-                                            nghttp3_mem_default());
+  int rv =
+      nghttp3_qpack_stream_context_new(&sctx, stream_id, nghttp3_mem_default());
 
   if (rv != 0) {
     return NULL;
@@ -442,8 +443,7 @@ static VALUE rb_nghttp3_qpack_decoder_decode(int argc, VALUE *argv,
 
     if (flags & NGHTTP3_QPACK_DECODE_FLAG_EMIT) {
       VALUE header = rb_hash_new();
-      rb_hash_aset(header, ID2SYM(rb_intern("name")),
-                   rcbuf_to_string(nv.name));
+      rb_hash_aset(header, ID2SYM(rb_intern("name")), rcbuf_to_string(nv.name));
       rb_hash_aset(header, ID2SYM(rb_intern("value")),
                    rcbuf_to_string(nv.value));
       rb_hash_aset(header, ID2SYM(rb_intern("token")), INT2NUM(nv.token));
@@ -471,11 +471,10 @@ static VALUE rb_nghttp3_qpack_decoder_decode(int argc, VALUE *argv,
   }
 
   result = rb_hash_new();
-  rb_hash_aset(result, ID2SYM(rb_intern("headers")),
-               blocked ? Qnil : headers);
-  rb_hash_aset(result, ID2SYM(rb_intern("blocked")),
-               blocked ? Qtrue : Qfalse);
-  rb_hash_aset(result, ID2SYM(rb_intern("consumed")), SIZET2NUM(total_consumed));
+  rb_hash_aset(result, ID2SYM(rb_intern("headers")), blocked ? Qnil : headers);
+  rb_hash_aset(result, ID2SYM(rb_intern("blocked")), blocked ? Qtrue : Qfalse);
+  rb_hash_aset(result, ID2SYM(rb_intern("consumed")),
+               SIZET2NUM(total_consumed));
 
   return result;
 }
@@ -498,8 +497,9 @@ static VALUE rb_nghttp3_qpack_decoder_read_encoder(VALUE self, VALUE rb_data) {
 
   Check_Type(rb_data, T_STRING);
 
-  rv = nghttp3_qpack_decoder_read_encoder(
-      obj->decoder, (const uint8_t *)RSTRING_PTR(rb_data), RSTRING_LEN(rb_data));
+  rv = nghttp3_qpack_decoder_read_encoder(obj->decoder,
+                                          (const uint8_t *)RSTRING_PTR(rb_data),
+                                          RSTRING_LEN(rb_data));
 
   if (rv < 0) {
     nghttp3_rb_raise((int)rv, "Failed to read encoder stream");
