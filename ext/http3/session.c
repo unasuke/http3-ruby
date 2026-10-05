@@ -28,7 +28,19 @@
 VALUE rb_cHTTP3Session;
 
 static ID id_on_begin_headers, id_on_header, id_on_end_headers, id_on_data,
-    id_on_end_stream;
+    id_on_end_stream, id_on_fields_too_large;
+
+/* What h3_session.field_sizes holds for a request whose header section has
+ * gone over max_field_section_size. */
+#define H3_FIELD_SECTION_OVER UINT64_MAX
+
+/* The size RFC 9114 section 4.2.2 counts a field at: its name and value
+ * plus 32 bytes. */
+#define H3_FIELD_OVERHEAD 32
+
+/* The largest value a QUIC variable-length integer, such as a SETTINGS
+ * value, can hold. */
+#define H3_VARINT_MAX ((1ULL << 62) - 1)
 
 _Static_assert(sizeof(quic_ext_vec) == sizeof(nghttp3_vec),
                "quic_ext_vec must have the layout of nghttp3_vec");
@@ -69,6 +81,12 @@ typedef struct {
   st_table *streams; /* stream_id => h3_stream * */
   VALUE pending_exc; /* an exception the Ruby part raised in a callback */
   VALUE closed_ids;  /* ids of the streams nghttp3 closed, for #take_closed */
+  /* The largest header section a request may have. nghttp3 only advertises
+   * the limit in SETTINGS; it is enforced here. */
+  uint64_t max_field_section_size;
+  /* stream_id => size of the header section received so far, while the
+   * headers of that request come in */
+  st_table *field_sizes;
 } h3_session;
 
 /* Streams */
@@ -184,7 +202,59 @@ typedef struct {
 
 static VALUE h3_closed_body(VALUE arg) {
   const h3_closed_arg *a = (const h3_closed_arg *)arg;
+  st_data_t key = (st_data_t)a->id;
+  st_delete(a->s->field_sizes, &key, NULL);
   rb_ary_push(a->s->closed_ids, LL2NUM(a->id));
+  return Qnil;
+}
+
+/* Header sections. The bookkeeping in field_sizes may allocate, so it runs
+ * under rb_protect together with the call into Ruby. */
+
+typedef struct {
+  h3_session *s;
+  int64_t id;
+  nghttp3_vec name, value;
+} h3_field_arg;
+
+static VALUE h3_begin_headers_body(VALUE arg) {
+  const h3_field_arg *a = (const h3_field_arg *)arg;
+  st_insert(a->s->field_sizes, (st_data_t)a->id, 0);
+  rb_funcall(a->s->self, id_on_begin_headers, 1, LL2NUM(a->id));
+  return Qnil;
+}
+
+/* Pass the field on, unless the section has grown past
+ * max_field_section_size: then tell Ruby once, so that it can answer 431,
+ * and drop that field and every later one. */
+static VALUE h3_recv_header_body(VALUE arg) {
+  const h3_field_arg *a = (const h3_field_arg *)arg;
+  h3_session *s = a->s;
+  st_data_t size = 0;
+  st_lookup(s->field_sizes, (st_data_t)a->id, &size);
+  if ((uint64_t)size == H3_FIELD_SECTION_OVER) {
+    return Qnil;
+  }
+  uint64_t total =
+      (uint64_t)size + a->name.len + a->value.len + H3_FIELD_OVERHEAD;
+  if (total > s->max_field_section_size) {
+    st_insert(s->field_sizes, (st_data_t)a->id,
+              (st_data_t)H3_FIELD_SECTION_OVER);
+    rb_funcall(s->self, id_on_fields_too_large, 1, LL2NUM(a->id));
+    return Qnil;
+  }
+  st_insert(s->field_sizes, (st_data_t)a->id, (st_data_t)total);
+  rb_funcall(s->self, id_on_header, 3, LL2NUM(a->id),
+             rb_str_new((const char *)a->name.base, a->name.len),
+             rb_str_new((const char *)a->value.base, a->value.len));
+  return Qnil;
+}
+
+static VALUE h3_end_headers_body(VALUE arg) {
+  const h3_field_arg *a = (const h3_field_arg *)arg;
+  st_data_t key = (st_data_t)a->id;
+  st_delete(a->s->field_sizes, &key, NULL);
+  rb_funcall(a->s->self, id_on_end_headers, 1, LL2NUM(a->id));
   return Qnil;
 }
 
@@ -240,21 +310,23 @@ static int h3_deferred_consume_cb(nghttp3_conn *conn, int64_t id,
 
 static int h3_begin_headers_cb(nghttp3_conn *conn, int64_t id, void *user_data,
                                void *stream_user_data) {
-  return h3_call_ruby(user_data, id_on_begin_headers, id, 0, NULL);
+  h3_field_arg arg = {user_data, id};
+  return h3_protect(user_data, h3_begin_headers_body, (VALUE)&arg);
 }
 
 static int h3_recv_header_cb(nghttp3_conn *conn, int64_t id, int32_t token,
                              nghttp3_rcbuf *name, nghttp3_rcbuf *value,
                              uint8_t flags, void *user_data,
                              void *stream_user_data) {
-  nghttp3_vec bytes[2] = {nghttp3_rcbuf_get_buf(name),
-                          nghttp3_rcbuf_get_buf(value)};
-  return h3_call_ruby(user_data, id_on_header, id, 2, bytes);
+  h3_field_arg arg = {user_data, id, nghttp3_rcbuf_get_buf(name),
+                      nghttp3_rcbuf_get_buf(value)};
+  return h3_protect(user_data, h3_recv_header_body, (VALUE)&arg);
 }
 
 static int h3_end_headers_cb(nghttp3_conn *conn, int64_t id, int fin,
                              void *user_data, void *stream_user_data) {
-  return h3_call_ruby(user_data, id_on_end_headers, id, 0, NULL);
+  h3_field_arg arg = {user_data, id};
+  return h3_protect(user_data, h3_end_headers_body, (VALUE)&arg);
 }
 
 static int h3_end_stream_cb(nghttp3_conn *conn, int64_t id, void *user_data,
@@ -381,6 +453,7 @@ static int h3_handshake_completed(void *ud) {
   nghttp3_settings_default(&settings);
   settings.qpack_max_dtable_capacity = 4096;
   settings.qpack_blocked_streams = 100;
+  settings.max_field_section_size = s->max_field_section_size;
 
   if (nghttp3_conn_server_new(&s->h3, &callbacks, &settings, NULL, s) != 0) {
     s->h3 = NULL;
@@ -579,6 +652,9 @@ static void h3_session_free(void *ptr) {
     st_foreach(s->streams, h3_free_stream_i, 0);
     st_free_table(s->streams);
   }
+  if (s->field_sizes != NULL) {
+    st_free_table(s->field_sizes);
+  }
   xfree(s);
 }
 
@@ -645,13 +721,21 @@ static void h3_stream_wake(h3_session *s, h3_stream *st) {
 
 /*
  * call-seq:
- *   HTTP3::Session._attach(quic_conn) -> Session
+ *   HTTP3::Session._attach(quic_conn, max_field_section_size) -> Session
  *
  * Take over the streams of quic_conn, a QUIC::Connection::Server no stream
  * has been opened on yet. The nghttp3 connection is made when the
- * handshake completes (at once if it already has).
+ * handshake completes (at once if it already has). A request whose header
+ * section (counted as RFC 9114 section 4.2.2 does) exceeds
+ * max_field_section_size gets #on_fields_too_large instead of the rest of
+ * its headers.
  */
-static VALUE rb_http3_session_s_attach(VALUE klass, VALUE quic_conn) {
+static VALUE rb_http3_session_s_attach(VALUE klass, VALUE quic_conn,
+                                       VALUE max_field_section_size) {
+  uint64_t max_fields = NUM2ULL(max_field_section_size);
+  if (max_fields == 0 || max_fields > H3_VARINT_MAX) {
+    rb_raise(rb_eArgError, "max_field_section_size must be 1..2**62-1");
+  }
   quic_ext_conn *qc = http3_quic_api->conn_get(quic_conn);
 
   h3_session *s;
@@ -662,7 +746,9 @@ static VALUE rb_http3_session_s_attach(VALUE klass, VALUE quic_conn) {
   s->qc = qc;
   s->pending_exc = Qnil;
   s->closed_ids = Qnil;
+  s->max_field_section_size = max_fields;
   s->streams = st_init_numtable();
+  s->field_sizes = st_init_numtable();
   s->closed_ids = rb_ary_new();
 
   int rv = http3_quic_api->set_stream_handler(qc, &h3_handler, s, self);
@@ -892,11 +978,12 @@ void Init_http3_session(VALUE rb_mHTTP3) {
   id_on_end_headers = rb_intern("on_end_headers");
   id_on_data = rb_intern("on_data");
   id_on_end_stream = rb_intern("on_end_stream");
+  id_on_fields_too_large = rb_intern("on_fields_too_large");
 
   rb_cHTTP3Session = rb_define_class_under(rb_mHTTP3, "Session", rb_cObject);
   rb_undef_alloc_func(rb_cHTTP3Session);
   rb_define_singleton_method(rb_cHTTP3Session, "_attach",
-                             rb_http3_session_s_attach, 1);
+                             rb_http3_session_s_attach, 2);
   rb_define_method(rb_cHTTP3Session, "submit_response",
                    rb_http3_session_submit_response, 3);
   rb_define_method(rb_cHTTP3Session, "push_chunk", rb_http3_session_push_chunk,
