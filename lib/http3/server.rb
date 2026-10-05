@@ -127,12 +127,18 @@ module HTTP3
       timeouts.min
     end
 
+    # Read into one buffer reused for every datagram: a buffer of RECV_SIZE
+    # per datagram would be garbage at once, and under a download the client
+    # sends thousands of ACKs, enough to grow the process by tens of MiB
+    # between GCs. read_pkt keeps nothing of the buffer.
     def receive
+      @recv_buffer ||= String.new(capacity: RECV_SIZE, encoding: Encoding::BINARY)
       RECV_BATCH.times do
-        result = @sock.recvmsg_nonblock(RECV_SIZE, exception: false)
+        result = @sock.recvfrom_nonblock(RECV_SIZE, 0, @recv_buffer, exception: false)
         break if result == :wait_readable
 
-        data, sender = result
+        data, sender_addr = result
+        sender = Addrinfo.new(sender_addr, nil, :DGRAM)
         conn = @endpoint.read_pkt(data, remote: sender.to_sockaddr)
         next if conn.nil? || @sessions.key?(conn)
 
