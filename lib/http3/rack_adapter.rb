@@ -60,6 +60,11 @@ module HTTP3
       }
       fields.each do |name, values|
         next if name == "host"
+        # "x_forwarded_for" would become HTTP_X_FORWARDED_FOR just like
+        # "x-forwarded-for", letting a client slip a value past a proxy that
+        # only removes or overwrites the latter. Such names are dropped, as
+        # nginx and Puma do.
+        next if name.include?("_")
 
         # Cookies are split into one field each in HTTP/3 and joined with
         # "; " again (RFC 9114 section 4.2.1).
