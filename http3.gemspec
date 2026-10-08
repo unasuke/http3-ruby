@@ -9,7 +9,8 @@ Gem::Specification.new do |spec|
   spec.email = ["yusuke1994525@gmail.com"]
 
   spec.summary = "[WIP] An HTTP/3 server for Ruby, built on nghttp3 and the quic gem"
-  spec.description = "[WIP] HTTP/3 for Ruby: Ruby bindings for nghttp3 (HTTP/3 mapping over QUIC and QPACK)."
+  spec.description = "[WIP] HTTP/3 for Ruby: Ruby bindings for nghttp3 (HTTP/3 mapping over QUIC and QPACK), " \
+    "built at install time and linked statically via mini_portile2."
   spec.homepage = "https://github.com/unasuke/http3-ruby"
   spec.license = "MIT"
   spec.required_ruby_version = ">= 3.2.0"
@@ -32,8 +33,8 @@ Gem::Specification.new do |spec|
   spec.require_paths = ["lib"]
   spec.extensions = ["ext/http3/extconf.rb"]
 
-  # Uncomment to register a new dependency of your gem
-  # spec.add_dependency "example-gem", "~> 1.0"
+  # nghttp3 is downloaded and built from source via mini_portile2
+  spec.add_dependency "mini_portile2", "~> 2.8"
 
   # For more information and examples about making a new gem, check out our
   # guide at: https://bundler.io/guides/creating_gem.html

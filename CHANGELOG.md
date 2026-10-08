@@ -6,6 +6,7 @@
 
 ### Changed
 - The gem is now `http3` (`require "http3"`), and the top-level namespace is `HTTP3`. The nghttp3 bindings move from `Nghttp3` to `HTTP3::Nghttp3`, and the helpers built on them (`Client`, `Server`, `Request`, ...) move with them. No `Nghttp3` alias is left behind.
+- nghttp3 is no longer taken from the system. Version 1.13.1 is downloaded and built at install time with mini_portile2 and linked statically, so `libnghttp3-dev` is no longer needed. http3.so exports only `Init_http3`; the nghttp3 symbols stay hidden.
 
 ### Fixed
 - An exception raised by a callback block or a body block no longer unwinds through nghttp3's frames, which left nghttp3 in an inconsistent state. It is kept until nghttp3 returns and then raised from the method that called into it (`#read_stream`, `#writev_stream`, `#add_ack_offset`, ...). ([#2](https://github.com/unasuke/nghttp3-ruby/pull/2))
