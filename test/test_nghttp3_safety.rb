@@ -3,9 +3,10 @@
 require "test_helper"
 
 # The C extension's contract with nghttp3 and the GC: exceptions from Ruby
-# never unwind through nghttp3, and callbacks keep working after GC.compact.
-# A client and a server Connection talk to each other directly, as a
-# lossless QUIC without flow control would carry their streams.
+# never unwind through nghttp3, body Strings stay put until the peer
+# acknowledges them, and callbacks keep working after GC.compact. A client
+# and a server Connection talk to each other directly, as a lossless QUIC
+# without flow control would carry their streams.
 class TestNghttp3Safety < Minitest::Test
   REQUEST_STREAM = 0
 
@@ -34,6 +35,22 @@ class TestNghttp3Safety < Minitest::Test
     assert_raises(TypeError) { Nghttp3::Connection.server_new(nil, "callbacks") }
   end
 
+  # nghttp3 reports acknowledged body bytes only. A String goes once the
+  # peer has acknowledged it to its end; one acknowledged in part stays.
+  def test_pending_data_shrinks_as_the_peer_acknowledges
+    chunks = ["a" * 100, "b" * 200, "c" * 300]
+    client = new_client
+    client.submit_request(REQUEST_STREAM, request_headers(method: "POST")) { |_stream_id| chunks.shift }
+    sent = drain(client)
+    assert_equal ["a" * 100, "b" * 200, "c" * 300], client.pending_data(REQUEST_STREAM)
+
+    client.add_ack_offset(REQUEST_STREAM, sent[REQUEST_STREAM] - 1)
+    assert_equal ["c" * 300], client.pending_data(REQUEST_STREAM)
+
+    client.add_ack_offset(REQUEST_STREAM, 1)
+    assert_empty client.pending_data(REQUEST_STREAM)
+  end
+
   # submit_* keeps a frozen copy, so changing the String afterwards does not
   # change what is sent.
   def test_body_is_copied_when_submitted
@@ -48,21 +65,32 @@ class TestNghttp3Safety < Minitest::Test
     assert_equal "original body", received
   end
 
-  # The server's callbacks find their connection through conn_user_data,
-  # which must survive the server object moving.
-  def test_callbacks_survive_gc_compaction
+  # Until add_write_offset, writev_stream hands out the same bytes again,
+  # read from the body String nghttp3 holds. That String is short enough to
+  # be embedded, so only pinning keeps compaction from moving its bytes. The
+  # server's callbacks find their connection through conn_user_data, which
+  # must survive the server object moving too.
+  def test_body_and_callbacks_survive_gc_compaction
     headers = []
+    received = +""
     callbacks = Nghttp3::Callbacks.new
       .on_recv_header { |_stream_id, name, value, _flags| headers << [name, value] }
+      .on_recv_data { |_stream_id, data| received << data }
     client = new_client
     server = new_server(callbacks)
-    client.submit_request(REQUEST_STREAM, request_headers)
+    client.submit_request(REQUEST_STREAM, request_headers(method: "POST"), body: "compact me")
+
+    transfer(client, server, until_stream: REQUEST_STREAM)
+    before = client.writev_stream
+    assert_equal REQUEST_STREAM, before[:stream_id]
 
     GC.start
     GC.verify_compaction_references(expand_heap: true, toward: :empty)
 
+    assert_equal before, client.writev_stream
     transfer(client, server)
-    assert_includes headers, [":method", "GET"]
+    assert_includes headers, [":method", "POST"]
+    assert_equal "compact me", received
   end
 
   private
@@ -101,9 +129,12 @@ class TestNghttp3Safety < Minitest::Test
     sent
   end
 
-  # Hand everything from's writev_stream offers to to.
-  def transfer(from, to)
+  # Hand everything from's writev_stream offers to to. With until_stream,
+  # stop before the first data of that stream, leaving it unwritten.
+  def transfer(from, to, until_stream: nil)
     while (out = from.writev_stream)
+      break if out[:stream_id] == until_stream
+
       to.read_stream(out[:stream_id], out[:data], fin: out[:fin])
       from.add_write_offset(out[:stream_id], out[:data].bytesize)
     end

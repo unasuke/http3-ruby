@@ -2,24 +2,51 @@
 
 VALUE rb_cNghttp3Connection;
 
+/* The body Strings handed to nghttp3 for one stream and not yet wholly
+ * acknowledged, oldest first. acked counts the bytes of the first of them
+ * the peer has acknowledged so far. */
+typedef struct {
+  VALUE strings;
+  uint64_t acked;
+} PendingStream;
+
+static int pending_mark_i(st_data_t key, st_data_t value, st_data_t arg) {
+  const PendingStream *ps = (const PendingStream *)value;
+  /* rb_gc_mark, not rb_gc_mark_movable: nghttp3 holds pointers into these
+   * Strings, so neither they nor (for an embedded String) their bytes may
+   * move. */
+  rb_gc_mark(ps->strings);
+  if (!NIL_P(ps->strings)) {
+    for (long i = 0; i < RARRAY_LEN(ps->strings); i++) {
+      rb_gc_mark(RARRAY_AREF(ps->strings, i));
+    }
+  }
+  return ST_CONTINUE;
+}
+
+static int pending_free_i(st_data_t key, st_data_t value, st_data_t arg) {
+  xfree((void *)value);
+  return ST_CONTINUE;
+}
+
+static void pending_clear(ConnectionObj *obj) {
+  if (obj->pending == NULL) {
+    return;
+  }
+  st_foreach(obj->pending, pending_free_i, 0);
+  st_clear(obj->pending);
+}
+
 static void connection_mark(void *ptr) {
   ConnectionObj *obj = (ConnectionObj *)ptr;
-  if (obj->settings != Qnil) {
-    rb_gc_mark(obj->settings);
-  }
-  if (obj->callbacks != Qnil) {
-    rb_gc_mark(obj->callbacks);
-  }
-  if (obj->stream_data_readers != Qnil) {
-    rb_gc_mark(obj->stream_data_readers);
-  }
-  if (obj->stream_user_data != Qnil) {
-    rb_gc_mark(obj->stream_user_data);
-  }
-  if (obj->pending_data != Qnil) {
-    rb_gc_mark(obj->pending_data);
-  }
+  rb_gc_mark(obj->settings);
+  rb_gc_mark(obj->callbacks);
+  rb_gc_mark(obj->stream_data_readers);
+  rb_gc_mark(obj->stream_user_data);
   rb_gc_mark(obj->pending_exc);
+  if (obj->pending != NULL) {
+    st_foreach(obj->pending, pending_mark_i, 0);
+  }
 }
 
 static void connection_free(void *ptr) {
@@ -28,11 +55,17 @@ static void connection_free(void *ptr) {
     nghttp3_conn_del(obj->conn);
     obj->conn = NULL;
   }
+  if (obj->pending != NULL) {
+    pending_clear(obj);
+    st_free_table(obj->pending);
+  }
   xfree(ptr);
 }
 
 static size_t connection_memsize(const void *ptr) {
-  return sizeof(ConnectionObj);
+  const ConnectionObj *obj = (const ConnectionObj *)ptr;
+  return sizeof(ConnectionObj) +
+         (obj->pending != NULL ? st_memsize(obj->pending) : 0);
 }
 
 /* self is the object wrapping this struct, so it is not marked, but
@@ -62,12 +95,14 @@ static VALUE connection_alloc(VALUE klass) {
   obj->self = self;
   obj->settings = Qnil;
   obj->callbacks = Qnil;
+  obj->stream_data_readers = Qnil;
+  obj->stream_user_data = Qnil;
   obj->pending_exc = Qnil;
-  obj->stream_data_readers = rb_hash_new();
-  obj->stream_user_data = rb_hash_new();
-  obj->pending_data = rb_hash_new();
   obj->is_closed = 0;
   obj->is_server = 0;
+  obj->pending = st_init_numtable();
+  obj->stream_data_readers = rb_hash_new();
+  obj->stream_user_data = rb_hash_new();
   return self;
 }
 
@@ -97,6 +132,57 @@ static void connection_raise_pending(ConnectionObj *obj) {
   rb_exc_raise(exc);
 }
 
+static PendingStream *pending_lookup(ConnectionObj *obj, int64_t stream_id) {
+  st_data_t value;
+  if (!st_lookup(obj->pending, (st_data_t)stream_id, &value)) {
+    return NULL;
+  }
+  return (PendingStream *)value;
+}
+
+/* Keep str, which nghttp3 is about to read from, until the peer has
+ * acknowledged all of it. */
+static void pending_push(ConnectionObj *obj, int64_t stream_id, VALUE str) {
+  PendingStream *ps = pending_lookup(obj, stream_id);
+  if (ps == NULL) {
+    ps = ALLOC(PendingStream);
+    ps->strings = Qnil;
+    ps->acked = 0;
+    st_insert(obj->pending, (st_data_t)stream_id, (st_data_t)ps);
+    ps->strings = rb_ary_new();
+  }
+  rb_ary_push(ps->strings, str);
+}
+
+/* Drop the Strings at the front that the peer has now acknowledged to their
+ * end, as quic-ruby's quic_acked_stream_data_offset_cb does. A String
+ * acknowledged only in part stays. */
+void nghttp3_rb_conn_acked(ConnectionObj *obj, int64_t stream_id,
+                           uint64_t datalen) {
+  PendingStream *ps = pending_lookup(obj, stream_id);
+  if (ps == NULL) {
+    return;
+  }
+  ps->acked += datalen;
+  while (RARRAY_LEN(ps->strings) > 0) {
+    uint64_t len = (uint64_t)RSTRING_LEN(RARRAY_AREF(ps->strings, 0));
+    if (ps->acked < len) {
+      break;
+    }
+    ps->acked -= len;
+    rb_ary_shift(ps->strings);
+  }
+}
+
+void nghttp3_rb_conn_stream_closed(ConnectionObj *obj, int64_t stream_id) {
+  st_data_t key = (st_data_t)stream_id;
+  st_data_t value;
+  if (st_delete(obj->pending, &key, &value)) {
+    xfree((void *)value);
+  }
+  rb_hash_delete(obj->stream_data_readers, LL2NUM(stream_id));
+}
+
 /* Prepare the nghttp3_callbacks for a new connection. A Callbacks object is
  * checked here, so that the C callbacks can take it as one. */
 static void connection_setup_callbacks(ConnectionObj *obj, VALUE rb_callbacks,
@@ -105,8 +191,8 @@ static void connection_setup_callbacks(ConnectionObj *obj, VALUE rb_callbacks,
   if (!NIL_P(rb_callbacks)) {
     rb_check_typeddata(rb_callbacks, &callbacks_data_type);
     obj->callbacks = rb_callbacks;
-    nghttp3_rb_setup_callbacks(callbacks);
   }
+  nghttp3_rb_setup_callbacks(callbacks);
 }
 
 /*
@@ -272,6 +358,8 @@ static VALUE rb_nghttp3_connection_close(VALUE self) {
     nghttp3_conn_del(obj->conn);
     obj->conn = NULL;
     obj->is_closed = 1;
+    /* nghttp3 reads none of the body Strings any more. */
+    pending_clear(obj);
   }
 
   return Qnil;
@@ -704,13 +792,8 @@ static VALUE read_data_body(VALUE arg) {
     data = rb_str_new_frozen(result);
   }
 
-  /* Keep data in pending_data until ACKed */
-  VALUE pending = rb_hash_aref(obj->pending_data, rb_stream_id);
-  if (NIL_P(pending)) {
-    pending = rb_ary_new();
-    rb_hash_aset(obj->pending_data, rb_stream_id, pending);
-  }
-  rb_ary_push(pending, data);
+  /* nghttp3 reads from data until the peer acknowledges it. */
+  pending_push(obj, a->stream_id, data);
   a->vec[0].base = (uint8_t *)RSTRING_PTR(data);
   a->vec[0].len = (size_t)RSTRING_LEN(data);
   a->result = 1;
@@ -1023,6 +1106,23 @@ static VALUE rb_nghttp3_connection_shutdown(VALUE self) {
 
 /*
  * call-seq:
+ *   connection.pending_data(stream_id) -> Array
+ *
+ * The body Strings handed to nghttp3 on the stream that the peer has not
+ * acknowledged in full yet, oldest first. A copy, for inspection.
+ */
+static VALUE rb_nghttp3_connection_pending_data(VALUE self,
+                                                VALUE rb_stream_id) {
+  ConnectionObj *obj;
+
+  TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
+
+  PendingStream *ps = pending_lookup(obj, NUM2LL(rb_stream_id));
+  return ps == NULL ? rb_ary_new() : rb_ary_dup(ps->strings);
+}
+
+/*
+ * call-seq:
  *   connection.set_stream_user_data(stream_id, data) -> self
  *
  * Associates arbitrary data with the given stream.
@@ -1110,6 +1210,8 @@ void Init_nghttp3_connection(void) {
                    rb_nghttp3_connection_shutdown_stream_write, 1);
   rb_define_method(rb_cNghttp3Connection, "resume_stream",
                    rb_nghttp3_connection_resume_stream, 1);
+  rb_define_method(rb_cNghttp3Connection, "pending_data",
+                   rb_nghttp3_connection_pending_data, 1);
 
   /* HTTP operation methods */
   rb_define_method(rb_cNghttp3Connection, "submit_request",

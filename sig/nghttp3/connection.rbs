@@ -58,6 +58,10 @@ module Nghttp3
     # Resumes a stream that was blocked for input data
     def resume_stream: (Integer stream_id) -> self
 
+    # The body Strings handed to nghttp3 that the peer has not acknowledged
+    # in full yet, oldest first (a copy)
+    def pending_data: (Integer stream_id) -> Array[String]
+
     # HTTP operations
 
     # Submits an HTTP request (client only)

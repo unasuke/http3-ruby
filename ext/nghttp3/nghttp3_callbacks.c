@@ -363,13 +363,37 @@ static int cb_dispatch(ConnectionObj *obj, size_t proc_offset, int argc,
                        (int)(sizeof(args_) / sizeof(args_[0])), args_);        \
   } while (0)
 
+typedef struct {
+  ConnectionObj *obj;
+  int64_t stream_id;
+  uint64_t datalen;
+} stream_event;
+
+static VALUE acked_body(VALUE arg) {
+  const stream_event *e = (const stream_event *)arg;
+  nghttp3_rb_conn_acked(e->obj, e->stream_id, e->datalen);
+  return Qnil;
+}
+
+static VALUE stream_closed_body(VALUE arg) {
+  const stream_event *e = (const stream_event *)arg;
+  nghttp3_rb_conn_stream_closed(e->obj, e->stream_id);
+  return Qnil;
+}
+
+/* Let go of the body Strings acknowledged in full before the Ruby block
+ * runs, whether or not there is one. */
 static int nghttp3_rb_acked_stream_data_callback(nghttp3_conn *conn,
                                                  int64_t stream_id,
                                                  uint64_t datalen,
                                                  void *conn_user_data,
                                                  void *stream_user_data) {
-  CB_DISPATCH((ConnectionObj *)conn_user_data, on_acked_stream_data,
-              CB_I64(stream_id), CB_U64(datalen));
+  ConnectionObj *obj = conn_user_data;
+  stream_event e = {obj, stream_id, datalen};
+  if (nghttp3_rb_protect(obj, acked_body, (VALUE)&e) != 0) {
+    return NGHTTP3_ERR_CALLBACK_FAILURE;
+  }
+  CB_DISPATCH(obj, on_acked_stream_data, CB_I64(stream_id), CB_U64(datalen));
 }
 
 static int nghttp3_rb_stream_close_callback(nghttp3_conn *conn,
@@ -377,8 +401,12 @@ static int nghttp3_rb_stream_close_callback(nghttp3_conn *conn,
                                             uint64_t app_error_code,
                                             void *conn_user_data,
                                             void *stream_user_data) {
-  CB_DISPATCH((ConnectionObj *)conn_user_data, on_stream_close,
-              CB_I64(stream_id), CB_U64(app_error_code));
+  ConnectionObj *obj = conn_user_data;
+  stream_event e = {obj, stream_id, 0};
+  if (nghttp3_rb_protect(obj, stream_closed_body, (VALUE)&e) != 0) {
+    return NGHTTP3_ERR_CALLBACK_FAILURE;
+  }
+  CB_DISPATCH(obj, on_stream_close, CB_I64(stream_id), CB_U64(app_error_code));
 }
 
 static int nghttp3_rb_recv_data_callback(nghttp3_conn *conn, int64_t stream_id,
@@ -529,6 +557,8 @@ static int nghttp3_rb_recv_settings_callback(nghttp3_conn *conn,
 
 /*
  * Sets up the nghttp3_callbacks structure with our C wrapper functions.
+ * They are installed whether or not the connection has Callbacks, since
+ * acked_stream_data and stream_close also release the body Strings.
  */
 void nghttp3_rb_setup_callbacks(nghttp3_callbacks *callbacks) {
   callbacks->acked_stream_data = nghttp3_rb_acked_stream_data_callback;

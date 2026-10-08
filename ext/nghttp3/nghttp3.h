@@ -2,6 +2,7 @@
 #define NGHTTP3_RUBY_H 1
 
 #include "ruby.h"
+#include "ruby/st.h"
 #include <nghttp3/nghttp3.h>
 
 extern VALUE rb_mNghttp3;
@@ -51,7 +52,10 @@ typedef struct {
   VALUE callbacks;           /* An Nghttp3::Callbacks, or nil */
   VALUE stream_data_readers; /* stream_id => Proc/String for body data */
   VALUE stream_user_data;    /* stream_id => arbitrary user data */
-  VALUE pending_data;        /* stream_id => [String, ...] for ACK tracking */
+  /* stream_id => PendingStream *: the body Strings handed to nghttp3 and
+   * not yet wholly acknowledged, which nghttp3 may still read. dmark pins
+   * every one of them, so that GC.compact cannot move their bytes. */
+  st_table *pending;
   /* An exception a Ruby callback raised inside nghttp3, kept here instead
    * of unwinding through nghttp3's frames; the method that called into
    * nghttp3 raises it once nghttp3 has returned. Qnil when there is none. */
@@ -65,6 +69,13 @@ typedef struct {
  * into NGHTTP3_ERR_CALLBACK_FAILURE; 0 otherwise. */
 int nghttp3_rb_protect(ConnectionObj *obj, VALUE (*body)(VALUE), VALUE arg);
 
+/* Bookkeeping of the body Strings, for the acked_stream_data and
+ * stream_close callbacks. Both touch Ruby objects, so call them under
+ * nghttp3_rb_protect. */
+void nghttp3_rb_conn_acked(ConnectionObj *obj, int64_t stream_id,
+                           uint64_t datalen);
+void nghttp3_rb_conn_stream_closed(ConnectionObj *obj, int64_t stream_id);
+
 /* Helper functions */
 VALUE nghttp3_rb_error_class_for_code(int error_code);
 void nghttp3_rb_raise(int error_code, const char *fmt, ...);
@@ -75,7 +86,8 @@ nghttp3_settings *nghttp3_rb_get_settings(VALUE rb_settings);
 /* NV helper */
 nghttp3_nv nghttp3_rb_nv_to_c(VALUE rb_nv);
 
-/* Callbacks helper */
+/* Callbacks helper: install the C callbacks, which do their own
+ * bookkeeping and then call the Ruby blocks of conn's Callbacks, if any. */
 void nghttp3_rb_setup_callbacks(nghttp3_callbacks *callbacks);
 
 /* Init functions */
