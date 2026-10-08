@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/random.h>
+#include <unistd.h>
 
 /*
  * HTTP3::Session, the C part: the glue between the quic gem's stream handler
@@ -13,13 +14,16 @@
  * functions below from inside QUIC::Connection#read_pkt / #write_pkt; they
  * feed nghttp3, whose callbacks hand the parts of each request to the Ruby
  * part (lib/http3/session.rb) and take response bodies from what Ruby
- * queued with #push_chunk.
+ * queued with #push_chunk or #attach_file.
  *
  * Neither the handler functions nor the nghttp3 callbacks may raise. Ruby is
  * only called under rb_protect, and an exception waits in pending_exc for
  * #take_error. Memory a callback allocates is malloc()ed, not xmalloc()ed,
  * since ruby_xmalloc raises NoMemoryError on failure.
  */
+
+/* How much of a file body read_data reads at a time. */
+#define H3_FILE_CHUNK_SIZE (16 * 1024)
 
 VALUE rb_cHTTP3Session;
 
@@ -34,7 +38,8 @@ _Static_assert(offsetof(quic_ext_vec, len) == offsetof(nghttp3_vec, len),
                "quic_ext_vec.len must line up with nghttp3_vec.len");
 
 /* A piece of a response body handed to nghttp3, kept until the peer has
- * acknowledged it. str is the frozen String it points into, pinned by dmark. */
+ * acknowledged it. str is the frozen String it points into, pinned by dmark;
+ * for a piece read from a file, str is Qnil and base is malloc()ed. */
 typedef struct {
   const uint8_t *base;
   size_t len;
@@ -50,8 +55,10 @@ typedef struct {
   uint64_t unsent;  /* bytes queued but not handed to nghttp3 yet */
   uint64_t acked;   /* bytes the peer has acknowledged */
   uint64_t shifted; /* bytes of the chunks already dropped */
-  bool eof;         /* nothing follows the queued chunks */
-  bool blocked;     /* read_data returned NGHTTP3_ERR_WOULDBLOCK */
+  int fd;           /* a file body (#attach_file), or -1 */
+  off_t file_off, file_end;
+  bool eof;     /* nothing follows the queued chunks */
+  bool blocked; /* read_data returned NGHTTP3_ERR_WOULDBLOCK */
 } h3_stream;
 
 typedef struct {
@@ -66,8 +73,20 @@ typedef struct {
 
 /* Streams */
 
+static void h3_chunk_release(h3_chunk *chunk) {
+  if (NIL_P(chunk->str)) {
+    free((void *)chunk->base);
+  }
+}
+
 static void h3_stream_free(h3_stream *st) {
+  for (size_t i = 0; i < st->nchunks; i++) {
+    h3_chunk_release(&st->chunks[i]);
+  }
   free(st->chunks);
+  if (st->fd >= 0) {
+    close(st->fd);
+  }
   xfree(st);
 }
 
@@ -101,6 +120,7 @@ static void h3_stream_acked(h3_stream *st, uint64_t n) {
   st->acked += n;
   while (drop < st->handed && st->shifted + st->chunks[drop].len <= st->acked) {
     st->shifted += st->chunks[drop].len;
+    h3_chunk_release(&st->chunks[drop]);
     drop++;
   }
   if (drop == 0) {
@@ -278,8 +298,8 @@ static void h3_rand_cb(uint8_t *dest, size_t destlen) {
   }
 }
 
-/* The body reader. Queued chunks are handed over as they are, without
- * copying. */
+/* The body reader. A file body is read 16 KiB at a time as nghttp3 asks;
+ * queued chunks are handed over as they are, without copying. */
 static nghttp3_ssize h3_read_data_cb(nghttp3_conn *conn, int64_t id,
                                      nghttp3_vec *vec, size_t veccnt,
                                      uint32_t *pflags, void *user_data,
@@ -288,6 +308,28 @@ static nghttp3_ssize h3_read_data_cb(nghttp3_conn *conn, int64_t id,
   if (st == NULL) {
     *pflags |= NGHTTP3_DATA_FLAG_EOF;
     return 0;
+  }
+
+  if (st->fd >= 0 && st->handed == st->nchunks && st->file_off < st->file_end) {
+    size_t want = (size_t)(st->file_end - st->file_off);
+    if (want > H3_FILE_CHUNK_SIZE) {
+      want = H3_FILE_CHUNK_SIZE;
+    }
+    uint8_t *buf = malloc(want);
+    if (buf == NULL) {
+      return NGHTTP3_ERR_NOMEM;
+    }
+    ssize_t n = pread(st->fd, buf, want, st->file_off);
+    if (n <= 0 || h3_stream_push(st, buf, (size_t)n, Qnil) != 0) {
+      /* A read error, or the file shrank under us: the response cannot be
+       * completed. */
+      free(buf);
+      return NGHTTP3_ERR_CALLBACK_FAILURE;
+    }
+    st->file_off += n;
+    if (st->file_off >= st->file_end) {
+      st->eof = true;
+    }
   }
 
   size_t n = 0;
@@ -641,7 +683,8 @@ static VALUE rb_http3_session_s_attach(VALUE klass, VALUE quic_conn) {
  *   session.submit_response(stream_id, headers, has_body) -> self
  *
  * headers is an Array of [name, value] Strings, ":status" first. With
- * has_body, the body follows through #push_chunk / #push_eof.
+ * has_body, the body follows through #push_chunk / #push_eof or
+ * #attach_file.
  */
 static VALUE rb_http3_session_submit_response(VALUE self, VALUE rb_id,
                                               VALUE headers, VALUE has_body) {
@@ -672,6 +715,7 @@ static VALUE rb_http3_session_submit_response(VALUE self, VALUE rb_id,
   if (RTEST(has_body) && h3_stream_find(s, id) == NULL) {
     st = ZALLOC(h3_stream);
     st->id = id;
+    st->fd = -1;
     st_insert(s->streams, (st_data_t)id, (st_data_t)st);
   }
 
@@ -727,6 +771,39 @@ static VALUE rb_http3_session_push_eof(VALUE self, VALUE rb_id) {
   h3_session *s = h3_session_get(self);
   h3_stream *st = h3_session_stream(self, rb_id);
   st->eof = true;
+  h3_stream_wake(s, st);
+  return self;
+}
+
+/*
+ * call-seq:
+ *   session.attach_file(stream_id, io, offset, length) -> self
+ *
+ * Send length bytes of io from offset as the whole response body. The
+ * descriptor is duplicated, so io may be closed afterwards.
+ */
+static VALUE rb_http3_session_attach_file(VALUE self, VALUE rb_id, VALUE io,
+                                          VALUE offset, VALUE length) {
+  h3_session *s = h3_session_get(self);
+  h3_stream *st = h3_session_stream(self, rb_id);
+  if (st->fd >= 0 || st->eof || st->nchunks > 0) {
+    rb_raise(rb_eNghttp3InvalidStateError, "the body is already given");
+  }
+  off_t off = NUM2OFFT(offset);
+  off_t len = NUM2OFFT(length);
+  if (off < 0 || len < 0) {
+    rb_raise(rb_eArgError, "offset and length must not be negative");
+  }
+  int fd = dup(NUM2INT(rb_funcall(io, rb_intern("fileno"), 0)));
+  if (fd < 0) {
+    rb_sys_fail("dup");
+  }
+  st->fd = fd;
+  st->file_off = off;
+  st->file_end = off + len;
+  if (len == 0) {
+    st->eof = true;
+  }
   h3_stream_wake(s, st);
   return self;
 }
@@ -825,6 +902,8 @@ void Init_http3_session(VALUE rb_mHTTP3) {
   rb_define_method(rb_cHTTP3Session, "push_chunk", rb_http3_session_push_chunk,
                    2);
   rb_define_method(rb_cHTTP3Session, "push_eof", rb_http3_session_push_eof, 1);
+  rb_define_method(rb_cHTTP3Session, "attach_file",
+                   rb_http3_session_attach_file, 4);
   rb_define_method(rb_cHTTP3Session, "unsent_bytes",
                    rb_http3_session_unsent_bytes, 1);
   rb_define_method(rb_cHTTP3Session, "take_closed",
