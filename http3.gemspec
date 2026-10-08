@@ -38,6 +38,8 @@ Gem::Specification.new do |spec|
   # The QUIC layer, and the C function table (quic/ext.h) the extension
   # drives it through
   spec.add_dependency "quic", "~> 0.0.3"
+  # HTTP3::Server serves Rack 3 applications
+  spec.add_dependency "rack", ">= 3.0"
 
   # For more information and examples about making a new gem, check out our
   # guide at: https://bundler.io/guides/creating_gem.html

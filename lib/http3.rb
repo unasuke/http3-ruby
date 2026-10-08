@@ -14,6 +14,7 @@ require_relative "http3/nghttp3/server"
 require_relative "http3/request"
 require_relative "http3/response"
 require_relative "http3/session"
+require_relative "http3/rack_adapter"
 
 module HTTP3
   module Nghttp3
