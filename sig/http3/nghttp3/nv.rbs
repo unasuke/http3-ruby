@@ -1,0 +1,11 @@
+module HTTP3
+  module Nghttp3
+    class NV
+      def initialize: (String name, String value, ?flags: Integer) -> void
+
+      def name: () -> String
+      def value: () -> String
+      def flags: () -> Integer
+    end
+  end
+end

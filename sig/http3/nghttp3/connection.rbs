@@ -1,0 +1,101 @@
+module HTTP3
+  module Nghttp3
+    class Connection
+      # Creates a new client connection
+      def self.client_new: (?Settings? settings, ?Callbacks? callbacks) -> Connection
+
+      # Creates a new server connection
+      def self.server_new: (?Settings? settings, ?Callbacks? callbacks) -> Connection
+
+      # Binds the control stream
+      def bind_control_stream: (Integer stream_id) -> self
+
+      # Binds QPACK encoder and decoder streams
+      def bind_qpack_streams: (Integer encoder_stream_id, Integer decoder_stream_id) -> self
+
+      # Closes the connection
+      def close: () -> nil
+
+      # Returns true if the connection is closed
+      def closed?: () -> bool
+
+      # Returns true if this is a server connection
+      def server?: () -> bool
+
+      # Returns true if this is a client connection
+      def client?: () -> bool
+
+      # Stream operations
+
+      # Reads data on a stream from the QUIC layer. ts is the time in
+      # nanoseconds on a monotonic clock (CLOCK_MONOTONIC by default). An
+      # exception raised by a callback comes out of here.
+      def read_stream: (Integer stream_id, String data, ?fin: bool, ?ts: Integer?) -> Integer
+
+      # Gets stream data to send to the QUIC layer. An exception raised by a
+      # body block comes out of here.
+      def writev_stream: () -> { stream_id: Integer, fin: bool, data: String }?
+
+      # Tells the connection that n bytes have been accepted by the QUIC layer
+      def add_write_offset: (Integer stream_id, Integer n) -> self
+
+      # Tells the connection that n bytes have been acknowledged by the remote peer
+      def add_ack_offset: (Integer stream_id, Integer n) -> self
+
+      # Marks a stream as blocked due to QUIC flow control
+      def block_stream: (Integer stream_id) -> self
+
+      # Marks a stream as unblocked
+      def unblock_stream: (Integer stream_id) -> self
+
+      # Returns true if the stream is writable
+      def stream_writable?: (Integer stream_id) -> bool
+
+      # Closes the stream with the given error code
+      def close_stream: (Integer stream_id, Integer app_error_code) -> self
+
+      # Prevents any further write operations on the stream
+      def shutdown_stream_write: (Integer stream_id) -> self
+
+      # Resumes a stream that was blocked for input data
+      def resume_stream: (Integer stream_id) -> self
+
+      # Tells the connection that no more data will be read on the stream
+      def shutdown_stream_read: (Integer stream_id) -> self
+
+      # Tells a server connection how many bidirectional streams the client
+      # may open in total
+      def set_max_client_streams_bidi: (Integer max_streams) -> self
+
+      # The body Strings handed to nghttp3 that the peer has not acknowledged
+      # in full yet, oldest first (a copy)
+      def pending_data: (Integer stream_id) -> Array[String]
+
+      # HTTP operations
+
+      # Submits an HTTP request (client only)
+      def submit_request: (Integer stream_id, Array[NV] headers, ?body: String?) ?{ (Integer stream_id) -> (String | Symbol | nil) } -> self
+
+      # Submits an HTTP response (server only)
+      def submit_response: (Integer stream_id, Array[NV] headers, ?body: String?) ?{ (Integer stream_id) -> (String | Symbol | nil) } -> self
+
+      # Submits a 1xx informational response
+      def submit_info: (Integer stream_id, Array[NV] headers) -> self
+
+      # Submits trailer headers (implicitly ends the stream)
+      def submit_trailers: (Integer stream_id, Array[NV] trailers) -> self
+
+      # Signals the intention to shut down the connection gracefully
+      def submit_shutdown_notice: () -> self
+
+      # Initiates graceful shutdown
+      def shutdown: () -> self
+
+      # Associates arbitrary data with a stream
+      def set_stream_user_data: (Integer stream_id, untyped data) -> self
+
+      # Returns data associated with a stream
+      def get_stream_user_data: (Integer stream_id) -> untyped
+    end
+  end
+end

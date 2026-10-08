@@ -2,7 +2,7 @@
 
 source "https://rubygems.org"
 
-# Specify your gem's dependencies in nghttp3.gemspec
+# Specify your gem's dependencies in http3.gemspec
 gemspec
 
 gem "irb"

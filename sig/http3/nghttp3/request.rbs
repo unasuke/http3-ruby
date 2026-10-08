@@ -1,0 +1,37 @@
+module HTTP3
+  module Nghttp3
+    class Request
+      attr_reader method: String
+      attr_reader scheme: String
+      attr_reader authority: String?
+      attr_reader path: String
+      attr_reader headers: Headers
+      attr_reader body: String?
+
+      def initialize: (
+        method: String | Symbol,
+        path: String,
+        ?scheme: String,
+        ?authority: String?,
+        ?headers: Hash[String, String] | Headers,
+        ?body: String?
+      ) -> void
+
+      def to_nv_array: () -> Array[NV]
+      def body?: () -> bool
+      def inspect: () -> String
+
+      def self.get: (String url, ?headers: Hash[String, String]) -> Request
+      def self.post: (String url, ?body: String?, ?headers: Hash[String, String]) -> Request
+      def self.put: (String url, ?body: String?, ?headers: Hash[String, String]) -> Request
+      def self.delete: (String url, ?headers: Hash[String, String]) -> Request
+      def self.head: (String url, ?headers: Hash[String, String]) -> Request
+      def self.patch: (String url, ?body: String?, ?headers: Hash[String, String]) -> Request
+      def self.options: (String url, ?headers: Hash[String, String]) -> Request
+
+      private
+
+      def self.build_from_url: (String method, String url, ?body: String?, ?headers: Hash[String, String]) -> Request
+    end
+  end
+end

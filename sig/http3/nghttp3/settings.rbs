@@ -1,0 +1,27 @@
+module HTTP3
+  module Nghttp3
+    class Settings
+      def self.default: () -> Settings
+
+      def initialize: () -> void
+
+      def max_field_section_size: () -> Integer
+      def max_field_section_size=: (Integer value) -> Integer
+
+      def qpack_max_dtable_capacity: () -> Integer
+      def qpack_max_dtable_capacity=: (Integer value) -> Integer
+
+      def qpack_encoder_max_dtable_capacity: () -> Integer
+      def qpack_encoder_max_dtable_capacity=: (Integer value) -> Integer
+
+      def qpack_blocked_streams: () -> Integer
+      def qpack_blocked_streams=: (Integer value) -> Integer
+
+      def enable_connect_protocol: () -> bool
+      def enable_connect_protocol=: (boolish value) -> boolish
+
+      def h3_datagram: () -> bool
+      def h3_datagram=: (boolish value) -> boolish
+    end
+  end
+end

@@ -12,7 +12,7 @@ jobs:
 
     environment:
       name: rubygems.org
-      url: https://rubygems.org/gems/nghttp3
+      url: https://rubygems.org/gems/http3
 
     permissions:
       contents: write
@@ -47,7 +47,7 @@ jobs:
       - name: Compile extension on host
         run: bundle exec rake compile
 
-      # Tags from lib/nghttp3/version.rb, pushes the gem. The gem is source
+      # Tags from lib/http3/version.rb, pushes the gem. The gem is source
       # only; there is no precompiled platform gem to build or push alongside it.
       - uses: rubygems/release-gem@7f9650160c1a4e7989fdc9855807bdbd421d8b6b # v1.4.1
 

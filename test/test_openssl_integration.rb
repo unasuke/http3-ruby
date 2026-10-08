@@ -87,7 +87,7 @@ class TestOpenSSLIntegration < Minitest::Test
 
   def test_client_with_quic_streams
     # Create nghttp3 client
-    client = Nghttp3::Client.new
+    client = HTTP3::Nghttp3::Client.new
 
     # In a real scenario, these stream IDs would come from QUIC layer
     # Client-initiated unidirectional streams: 2, 6, 10
@@ -112,7 +112,7 @@ class TestOpenSSLIntegration < Minitest::Test
   end
 
   def test_client_pump_writes_to_quic
-    client = Nghttp3::Client.new
+    client = HTTP3::Nghttp3::Client.new
     client.bind_streams(control: 2, qpack_encoder: 6, qpack_decoder: 10)
 
     # Submit a request
@@ -143,7 +143,7 @@ class TestOpenSSLIntegration < Minitest::Test
   end
 
   def test_client_pump_writes_with_mock_quic_transport
-    client = Nghttp3::Client.new
+    client = HTTP3::Nghttp3::Client.new
     client.bind_streams(control: 2, qpack_encoder: 6, qpack_decoder: 10)
 
     # Submit request
@@ -171,7 +171,7 @@ class TestOpenSSLIntegration < Minitest::Test
   end
 
   def test_client_read_stream_from_quic
-    client = Nghttp3::Client.new
+    client = HTTP3::Nghttp3::Client.new
     client.bind_streams(control: 2, qpack_encoder: 6, qpack_decoder: 10)
 
     # Submit a request to create response tracking
@@ -188,13 +188,13 @@ class TestOpenSSLIntegration < Minitest::Test
       # In real integration, this would be actual QUIC data
       mock_response_data = "\x00\x00"  # Placeholder
       client.read_stream(stream_id, mock_response_data, fin: false)
-    rescue Nghttp3::Error
+    rescue HTTP3::Nghttp3::Error
       # Expected - mock data is not valid HTTP/3 frames
     end
 
     # Response object should exist for the stream
     response = client.responses[stream_id]
-    assert_kind_of Nghttp3::Response, response
+    assert_kind_of HTTP3::Nghttp3::Response, response
     assert_equal stream_id, response.stream_id
   ensure
     begin
@@ -226,7 +226,7 @@ class TestOpenSSLIntegration < Minitest::Test
     assert_equal "h3", ssl.alpn_protocol
 
     # Setup nghttp3 client
-    client = Nghttp3::Client.new
+    client = HTTP3::Nghttp3::Client.new
     # In real implementation, stream IDs come from ssl.new_stream
     client.bind_streams(control: 2, qpack_encoder: 6, qpack_decoder: 10)
 
@@ -275,7 +275,7 @@ class TestOpenSSLIntegration < Minitest::Test
   #
 
   def test_server_with_quic_streams
-    server = Nghttp3::Server.new
+    server = HTTP3::Nghttp3::Server.new
 
     # Server-initiated unidirectional streams: 3, 7, 11
     server.bind_streams(
@@ -296,7 +296,7 @@ class TestOpenSSLIntegration < Minitest::Test
     end
 
     # Verify server is ready to accept requests
-    assert_kind_of Nghttp3::Connection, server.connection
+    assert_kind_of HTTP3::Nghttp3::Connection, server.connection
   ensure
     begin
       server&.close
@@ -306,7 +306,7 @@ class TestOpenSSLIntegration < Minitest::Test
   end
 
   def test_server_pump_writes_generates_settings
-    server = Nghttp3::Server.new
+    server = HTTP3::Nghttp3::Server.new
     server.bind_streams(control: 3, qpack_encoder: 7, qpack_decoder: 11)
 
     # Register a simple handler
@@ -334,7 +334,7 @@ class TestOpenSSLIntegration < Minitest::Test
   end
 
   def test_server_receives_request_from_quic
-    server = Nghttp3::Server.new
+    server = HTTP3::Nghttp3::Server.new
     server.bind_streams(control: 3, qpack_encoder: 7, qpack_decoder: 11)
 
     received_request = nil
@@ -354,7 +354,7 @@ class TestOpenSSLIntegration < Minitest::Test
       # Request stream ID would be 0 (client-initiated bidi)
       mock_request_data = "\x00\x00"  # Placeholder - not valid HTTP/3
       server.read_stream(0, mock_request_data, fin: false)
-    rescue Nghttp3::Error
+    rescue HTTP3::Nghttp3::Error
       # Expected - mock data is not valid
     end
 
@@ -369,7 +369,7 @@ class TestOpenSSLIntegration < Minitest::Test
   end
 
   def test_server_sends_response_to_quic
-    server = Nghttp3::Server.new
+    server = HTTP3::Nghttp3::Server.new
     server.bind_streams(control: 3, qpack_encoder: 7, qpack_decoder: 11)
 
     server.on_request do |request, response|
@@ -383,7 +383,7 @@ class TestOpenSSLIntegration < Minitest::Test
     # pump_writes would then yield the response frames.
 
     # For now, verify the response structure
-    response = Nghttp3::Response.new(stream_id: 0, status: 200)
+    response = HTTP3::Nghttp3::Response.new(stream_id: 0, status: 200)
     response.headers["content-type"] = "application/json"
     response.body = '{"status":"ok"}'
 
@@ -403,7 +403,7 @@ class TestOpenSSLIntegration < Minitest::Test
   #
 
   def test_multiple_stream_data_flow
-    client = Nghttp3::Client.new
+    client = HTTP3::Nghttp3::Client.new
     client.bind_streams(control: 2, qpack_encoder: 6, qpack_decoder: 10)
 
     # Submit multiple requests
@@ -439,12 +439,12 @@ class TestOpenSSLIntegration < Minitest::Test
   end
 
   def test_stream_id_mapping
-    client = Nghttp3::Client.new
+    client = HTTP3::Nghttp3::Client.new
     client.bind_streams(control: 2, qpack_encoder: 6, qpack_decoder: 10)
 
     # Submit a request
     request_stream_id = client.submit(
-      Nghttp3::Request.get("https://#{TEST_HOST}/test")
+      HTTP3::Nghttp3::Request.get("https://#{TEST_HOST}/test")
     )
 
     # Create a mock stream mapping (stream_id -> socket)
@@ -480,10 +480,10 @@ class TestOpenSSLIntegration < Minitest::Test
 
   def test_connection_error_handling
     # Test behavior when QUIC connection fails
-    client = Nghttp3::Client.new
+    client = HTTP3::Nghttp3::Client.new
 
     # Attempting operations without binding streams should raise
-    assert_raises(Nghttp3::InvalidStateError) do
+    assert_raises(HTTP3::Nghttp3::InvalidStateError) do
       client.get("https://#{TEST_HOST}/")
     end
   ensure
@@ -495,7 +495,7 @@ class TestOpenSSLIntegration < Minitest::Test
   end
 
   def test_stream_error_handling
-    client = Nghttp3::Client.new
+    client = HTTP3::Nghttp3::Client.new
     client.bind_streams(control: 2, qpack_encoder: 6, qpack_decoder: 10)
 
     # Submit a request
@@ -508,9 +508,9 @@ class TestOpenSSLIntegration < Minitest::Test
     begin
       invalid_data = "\xff\xff\xff\xff"  # Invalid HTTP/3 frame
       client.read_stream(stream_id, invalid_data, fin: false)
-    rescue Nghttp3::Error => e
+    rescue HTTP3::Nghttp3::Error => e
       # Expected - invalid frame should cause error
-      assert_kind_of Nghttp3::Error, e
+      assert_kind_of HTTP3::Nghttp3::Error, e
     end
   ensure
     begin
@@ -521,7 +521,7 @@ class TestOpenSSLIntegration < Minitest::Test
   end
 
   def test_closed_connection_handling
-    client = Nghttp3::Client.new
+    client = HTTP3::Nghttp3::Client.new
     client.bind_streams(control: 2, qpack_encoder: 6, qpack_decoder: 10)
 
     # Close the connection
@@ -529,7 +529,7 @@ class TestOpenSSLIntegration < Minitest::Test
     assert client.closed?
 
     # Operations on closed connection should fail
-    assert_raises(Nghttp3::InvalidStateError) do
+    assert_raises(HTTP3::Nghttp3::InvalidStateError) do
       client.get("https://#{TEST_HOST}/")
     end
   end
@@ -624,7 +624,7 @@ class TestOpenSSLIntegration < Minitest::Test
     endpoint = GOOGLE_ENDPOINT
 
     # Setup nghttp3 client
-    client = Nghttp3::Client.new
+    client = HTTP3::Nghttp3::Client.new
     client.bind_streams(control: 2, qpack_encoder: 6, qpack_decoder: 10)
 
     # Create request to Google
@@ -671,7 +671,7 @@ class TestOpenSSLIntegration < Minitest::Test
     endpoint = CLOUDFLARE_ENDPOINT
 
     # Setup nghttp3 client
-    client = Nghttp3::Client.new
+    client = HTTP3::Nghttp3::Client.new
     client.bind_streams(control: 2, qpack_encoder: 6, qpack_decoder: 10)
 
     # Create request to Cloudflare
@@ -713,7 +713,7 @@ class TestOpenSSLIntegration < Minitest::Test
   def test_multiple_requests_to_http3_endpoints
     skip_unless_network_available
 
-    client = Nghttp3::Client.new
+    client = HTTP3::Nghttp3::Client.new
     client.bind_streams(control: 2, qpack_encoder: 6, qpack_decoder: 10)
 
     # Submit requests to multiple endpoints
@@ -763,7 +763,7 @@ class TestOpenSSLIntegration < Minitest::Test
     ssl.connect
 
     # Setup nghttp3 client
-    client = Nghttp3::Client.new
+    client = HTTP3::Nghttp3::Client.new
     client.bind_streams(control: 2, qpack_encoder: 6, qpack_decoder: 10)
 
     # Submit request
@@ -826,8 +826,8 @@ class TestOpenSSLIntegration < Minitest::Test
 
   def test_client_server_loopback
     # Create client and server
-    client = Nghttp3::Client.new
-    server = Nghttp3::Server.new
+    client = HTTP3::Nghttp3::Client.new
+    server = HTTP3::Nghttp3::Server.new
 
     # Bind streams (using different stream IDs for client vs server)
     client.bind_streams(control: 2, qpack_encoder: 6, qpack_decoder: 10)
@@ -958,7 +958,7 @@ class TestOpenSSLIntegration < Minitest::Test
     streams[:qpack_decoder] = {id: 10, socket: nil}
 
     # Create nghttp3 client
-    client = Nghttp3::Client.new
+    client = HTTP3::Nghttp3::Client.new
     client.bind_streams(
       control: streams[:control][:id],
       qpack_encoder: streams[:qpack_encoder][:id],
@@ -983,7 +983,7 @@ class TestOpenSSLIntegration < Minitest::Test
     streams[:qpack_decoder] = {id: 11, socket: nil}
 
     # Create nghttp3 server
-    server = Nghttp3::Server.new
+    server = HTTP3::Nghttp3::Server.new
     server.bind_streams(
       control: streams[:control][:id],
       qpack_encoder: streams[:qpack_encoder][:id],
@@ -994,7 +994,7 @@ class TestOpenSSLIntegration < Minitest::Test
   end
 
   # Pump writes from nghttp3 to QUIC sockets
-  # @param h3_conn [Nghttp3::Client, Nghttp3::Server] HTTP/3 connection
+  # @param h3_conn [HTTP3::Nghttp3::Client, HTTP3::Nghttp3::Server] HTTP/3 connection
   # @param stream_map [Hash] stream_id -> socket mapping
   def pump_to_quic(h3_conn, stream_map)
     h3_conn.pump_writes do |stream_id, data, fin|
@@ -1011,7 +1011,7 @@ class TestOpenSSLIntegration < Minitest::Test
   end
 
   # Read from QUIC sockets and feed to nghttp3
-  # @param h3_conn [Nghttp3::Client, Nghttp3::Server] HTTP/3 connection
+  # @param h3_conn [HTTP3::Nghttp3::Client, HTTP3::Nghttp3::Server] HTTP/3 connection
   # @param stream_map [Hash] stream_id -> socket mapping
   def read_from_quic(h3_conn, stream_map)
     stream_map.each do |stream_id, socket|

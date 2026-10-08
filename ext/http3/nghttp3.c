@@ -157,9 +157,11 @@ static VALUE rb_nghttp3_strerror(VALUE self, VALUE rb_error_code) {
   return rb_str_new_cstr(str);
 }
 
-RUBY_FUNC_EXPORTED void Init_nghttp3(void) {
-  /* Define main module */
-  rb_mNghttp3 = rb_define_module("Nghttp3");
+RUBY_FUNC_EXPORTED void Init_http3(void) {
+  /* The nghttp3 bindings live in HTTP3::Nghttp3. HTTP3 is also opened in
+   * lib/http3.rb; both must stay modules. */
+  VALUE rb_mHTTP3 = rb_define_module("HTTP3");
+  rb_mNghttp3 = rb_define_module_under(rb_mHTTP3, "Nghttp3");
 
   /* Define compile-time version constants */
   rb_define_const(rb_mNghttp3, "NGHTTP3_VERSION",

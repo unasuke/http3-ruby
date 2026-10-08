@@ -1,7 +1,7 @@
 PATH
   remote: .
   specs:
-    nghttp3 (0.0.1)
+    http3 (0.0.1)
 
 GEM
   remote: https://rubygems.org/
@@ -83,9 +83,9 @@ PLATFORMS
   x86_64-linux
 
 DEPENDENCIES
+  http3!
   irb
   minitest (~> 5.16)
-  nghttp3!
   rake (~> 13.0)
   rake-compiler
   standard (~> 1.3)

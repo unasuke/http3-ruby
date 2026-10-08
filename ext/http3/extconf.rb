@@ -15,4 +15,4 @@ unless have_header("nghttp3/nghttp3.h")
   abort "nghttp3/nghttp3.h not found"
 end
 
-create_makefile("nghttp3/nghttp3")
+create_makefile("http3/http3")
