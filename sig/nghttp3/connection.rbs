@@ -26,10 +26,12 @@ module Nghttp3
 
     # Stream operations
 
-    # Reads data on a stream from the QUIC layer
+    # Reads data on a stream from the QUIC layer. An exception raised by a
+    # callback comes out of here.
     def read_stream: (Integer stream_id, String data, ?fin: bool) -> Integer
 
-    # Gets stream data to send to the QUIC layer
+    # Gets stream data to send to the QUIC layer. An exception raised by a
+    # body block comes out of here.
     def writev_stream: () -> { stream_id: Integer, fin: bool, data: String }?
 
     # Tells the connection that n bytes have been accepted by the QUIC layer

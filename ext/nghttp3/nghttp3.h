@@ -48,13 +48,22 @@ typedef struct {
   nghttp3_conn *conn;
   VALUE self;
   VALUE settings;            /* Prevent Settings from being GC'd */
-  VALUE callbacks;           /* Prevent Callbacks from being GC'd */
+  VALUE callbacks;           /* An Nghttp3::Callbacks, or nil */
   VALUE stream_data_readers; /* stream_id => Proc/String for body data */
   VALUE stream_user_data;    /* stream_id => arbitrary user data */
   VALUE pending_data;        /* stream_id => [String, ...] for ACK tracking */
+  /* An exception a Ruby callback raised inside nghttp3, kept here instead
+   * of unwinding through nghttp3's frames; the method that called into
+   * nghttp3 raises it once nghttp3 has returned. Qnil when there is none. */
+  VALUE pending_exc;
   int is_closed;
   int is_server;
 } ConnectionObj;
+
+/* Run body(arg) under rb_protect on behalf of a callback of obj. An
+ * exception is kept in obj->pending_exc (the first one wins) and turned
+ * into NGHTTP3_ERR_CALLBACK_FAILURE; 0 otherwise. */
+int nghttp3_rb_protect(ConnectionObj *obj, VALUE (*body)(VALUE), VALUE arg);
 
 /* Helper functions */
 VALUE nghttp3_rb_error_class_for_code(int error_code);

@@ -1,5 +1,7 @@
 #include "nghttp3.h"
 
+#include <stddef.h>
+
 VALUE rb_cNghttp3Callbacks;
 
 typedef struct {
@@ -285,27 +287,89 @@ static VALUE rb_nghttp3_callbacks_on_recv_settings(VALUE self) {
 
 /* C callback wrapper functions - called by nghttp3 */
 
+/* An argument for a Ruby callback, kept as C data until the protected body
+ * makes it a VALUE, so that nothing can raise outside rb_protect. */
+typedef struct {
+  enum { CB_ARG_I64, CB_ARG_U64, CB_ARG_BOOL, CB_ARG_BYTES } kind;
+  union {
+    int64_t i64;
+    uint64_t u64;
+    int b;
+    struct {
+      const uint8_t *base;
+      size_t len;
+    } bytes;
+  } v;
+} cb_arg;
+
+#define CB_I64(x) ((cb_arg){.kind = CB_ARG_I64, .v.i64 = (x)})
+#define CB_U64(x) ((cb_arg){.kind = CB_ARG_U64, .v.u64 = (x)})
+#define CB_BOOL(x) ((cb_arg){.kind = CB_ARG_BOOL, .v.b = (x)})
+#define CB_BYTES(vec)                                                          \
+  ((cb_arg){.kind = CB_ARG_BYTES, .v.bytes = {(vec).base, (vec).len}})
+
+typedef struct {
+  VALUE proc;
+  int argc;
+  const cb_arg *argv;
+} cb_call;
+
+static VALUE cb_arg_value(const cb_arg *arg) {
+  switch (arg->kind) {
+  case CB_ARG_I64:
+    return LL2NUM(arg->v.i64);
+  case CB_ARG_U64:
+    return ULL2NUM(arg->v.u64);
+  case CB_ARG_BOOL:
+    return arg->v.b ? Qtrue : Qfalse;
+  case CB_ARG_BYTES:
+    return rb_str_new((const char *)arg->v.bytes.base, arg->v.bytes.len);
+  }
+  return Qnil;
+}
+
+static VALUE cb_call_body(VALUE arg) {
+  const cb_call *call = (const cb_call *)arg;
+  VALUE values[4];
+  for (int i = 0; i < call->argc; i++) {
+    values[i] = cb_arg_value(&call->argv[i]);
+  }
+  rb_proc_call(call->proc, rb_ary_new_from_values(call->argc, values));
+  return Qnil;
+}
+
+/* Call the block of obj's Callbacks stored at proc_offset in CallbacksObj,
+ * if there is one. Returns 0, or NGHTTP3_ERR_CALLBACK_FAILURE when it
+ * raised. */
+static int cb_dispatch(ConnectionObj *obj, size_t proc_offset, int argc,
+                       const cb_arg *argv) {
+  if (NIL_P(obj->callbacks)) {
+    return 0;
+  }
+  /* The type was checked when the connection was made. */
+  VALUE proc =
+      *(VALUE *)((char *)RTYPEDDATA_DATA(obj->callbacks) + proc_offset);
+  if (NIL_P(proc)) {
+    return 0;
+  }
+  cb_call call = {proc, argc, argv};
+  return nghttp3_rb_protect(obj, cb_call_body, (VALUE)&call);
+}
+
+#define CB_DISPATCH(obj, field, ...)                                           \
+  do {                                                                         \
+    const cb_arg args_[] = {__VA_ARGS__};                                      \
+    return cb_dispatch((obj), offsetof(CallbacksObj, field),                   \
+                       (int)(sizeof(args_) / sizeof(args_[0])), args_);        \
+  } while (0)
+
 static int nghttp3_rb_acked_stream_data_callback(nghttp3_conn *conn,
                                                  int64_t stream_id,
                                                  uint64_t datalen,
                                                  void *conn_user_data,
                                                  void *stream_user_data) {
-  ConnectionObj *obj = conn_user_data;
-  VALUE rb_callbacks = obj->callbacks;
-
-  if (NIL_P(rb_callbacks))
-    return 0;
-
-  CallbacksObj *cb;
-  TypedData_Get_Struct(rb_callbacks, CallbacksObj, &callbacks_data_type, cb);
-
-  if (NIL_P(cb->on_acked_stream_data))
-    return 0;
-
-  VALUE args[2] = {LL2NUM(stream_id), ULL2NUM(datalen)};
-  rb_proc_call(cb->on_acked_stream_data, rb_ary_new_from_values(2, args));
-
-  return 0;
+  CB_DISPATCH((ConnectionObj *)conn_user_data, on_acked_stream_data,
+              CB_I64(stream_id), CB_U64(datalen));
 }
 
 static int nghttp3_rb_stream_close_callback(nghttp3_conn *conn,
@@ -313,45 +377,17 @@ static int nghttp3_rb_stream_close_callback(nghttp3_conn *conn,
                                             uint64_t app_error_code,
                                             void *conn_user_data,
                                             void *stream_user_data) {
-  ConnectionObj *obj = conn_user_data;
-  VALUE rb_callbacks = obj->callbacks;
-
-  if (NIL_P(rb_callbacks))
-    return 0;
-
-  CallbacksObj *cb;
-  TypedData_Get_Struct(rb_callbacks, CallbacksObj, &callbacks_data_type, cb);
-
-  if (NIL_P(cb->on_stream_close))
-    return 0;
-
-  VALUE args[2] = {LL2NUM(stream_id), ULL2NUM(app_error_code)};
-  rb_proc_call(cb->on_stream_close, rb_ary_new_from_values(2, args));
-
-  return 0;
+  CB_DISPATCH((ConnectionObj *)conn_user_data, on_stream_close,
+              CB_I64(stream_id), CB_U64(app_error_code));
 }
 
 static int nghttp3_rb_recv_data_callback(nghttp3_conn *conn, int64_t stream_id,
                                          const uint8_t *data, size_t datalen,
                                          void *conn_user_data,
                                          void *stream_user_data) {
-  ConnectionObj *obj = conn_user_data;
-  VALUE rb_callbacks = obj->callbacks;
-
-  if (NIL_P(rb_callbacks))
-    return 0;
-
-  CallbacksObj *cb;
-  TypedData_Get_Struct(rb_callbacks, CallbacksObj, &callbacks_data_type, cb);
-
-  if (NIL_P(cb->on_recv_data))
-    return 0;
-
-  VALUE rb_data = rb_str_new((const char *)data, datalen);
-  VALUE args[2] = {LL2NUM(stream_id), rb_data};
-  rb_proc_call(cb->on_recv_data, rb_ary_new_from_values(2, args));
-
-  return 0;
+  nghttp3_vec vec = {(uint8_t *)data, datalen};
+  CB_DISPATCH((ConnectionObj *)conn_user_data, on_recv_data, CB_I64(stream_id),
+              CB_BYTES(vec));
 }
 
 static int nghttp3_rb_deferred_consume_callback(nghttp3_conn *conn,
@@ -359,44 +395,16 @@ static int nghttp3_rb_deferred_consume_callback(nghttp3_conn *conn,
                                                 size_t consumed,
                                                 void *conn_user_data,
                                                 void *stream_user_data) {
-  ConnectionObj *obj = conn_user_data;
-  VALUE rb_callbacks = obj->callbacks;
-
-  if (NIL_P(rb_callbacks))
-    return 0;
-
-  CallbacksObj *cb;
-  TypedData_Get_Struct(rb_callbacks, CallbacksObj, &callbacks_data_type, cb);
-
-  if (NIL_P(cb->on_deferred_consume))
-    return 0;
-
-  VALUE args[2] = {LL2NUM(stream_id), SIZET2NUM(consumed)};
-  rb_proc_call(cb->on_deferred_consume, rb_ary_new_from_values(2, args));
-
-  return 0;
+  CB_DISPATCH((ConnectionObj *)conn_user_data, on_deferred_consume,
+              CB_I64(stream_id), CB_U64(consumed));
 }
 
 static int nghttp3_rb_begin_headers_callback(nghttp3_conn *conn,
                                              int64_t stream_id,
                                              void *conn_user_data,
                                              void *stream_user_data) {
-  ConnectionObj *obj = conn_user_data;
-  VALUE rb_callbacks = obj->callbacks;
-
-  if (NIL_P(rb_callbacks))
-    return 0;
-
-  CallbacksObj *cb;
-  TypedData_Get_Struct(rb_callbacks, CallbacksObj, &callbacks_data_type, cb);
-
-  if (NIL_P(cb->on_begin_headers))
-    return 0;
-
-  VALUE args[1] = {LL2NUM(stream_id)};
-  rb_proc_call(cb->on_begin_headers, rb_ary_new_from_values(1, args));
-
-  return 0;
+  CB_DISPATCH((ConnectionObj *)conn_user_data, on_begin_headers,
+              CB_I64(stream_id));
 }
 
 static int nghttp3_rb_recv_header_callback(nghttp3_conn *conn,
@@ -405,72 +413,25 @@ static int nghttp3_rb_recv_header_callback(nghttp3_conn *conn,
                                            nghttp3_rcbuf *value, uint8_t flags,
                                            void *conn_user_data,
                                            void *stream_user_data) {
-  ConnectionObj *obj = conn_user_data;
-  VALUE rb_callbacks = obj->callbacks;
-
-  if (NIL_P(rb_callbacks))
-    return 0;
-
-  CallbacksObj *cb;
-  TypedData_Get_Struct(rb_callbacks, CallbacksObj, &callbacks_data_type, cb);
-
-  if (NIL_P(cb->on_recv_header))
-    return 0;
-
-  nghttp3_vec name_vec = nghttp3_rcbuf_get_buf(name);
-  nghttp3_vec value_vec = nghttp3_rcbuf_get_buf(value);
-
-  VALUE rb_name = rb_str_new((const char *)name_vec.base, name_vec.len);
-  VALUE rb_value = rb_str_new((const char *)value_vec.base, value_vec.len);
-
-  VALUE args[4] = {LL2NUM(stream_id), rb_name, rb_value, UINT2NUM(flags)};
-  rb_proc_call(cb->on_recv_header, rb_ary_new_from_values(4, args));
-
-  return 0;
+  CB_DISPATCH((ConnectionObj *)conn_user_data, on_recv_header,
+              CB_I64(stream_id), CB_BYTES(nghttp3_rcbuf_get_buf(name)),
+              CB_BYTES(nghttp3_rcbuf_get_buf(value)), CB_U64(flags));
 }
 
 static int nghttp3_rb_end_headers_callback(nghttp3_conn *conn,
                                            int64_t stream_id, int fin,
                                            void *conn_user_data,
                                            void *stream_user_data) {
-  ConnectionObj *obj = conn_user_data;
-  VALUE rb_callbacks = obj->callbacks;
-
-  if (NIL_P(rb_callbacks))
-    return 0;
-
-  CallbacksObj *cb;
-  TypedData_Get_Struct(rb_callbacks, CallbacksObj, &callbacks_data_type, cb);
-
-  if (NIL_P(cb->on_end_headers))
-    return 0;
-
-  VALUE args[2] = {LL2NUM(stream_id), fin ? Qtrue : Qfalse};
-  rb_proc_call(cb->on_end_headers, rb_ary_new_from_values(2, args));
-
-  return 0;
+  CB_DISPATCH((ConnectionObj *)conn_user_data, on_end_headers,
+              CB_I64(stream_id), CB_BOOL(fin));
 }
 
 static int nghttp3_rb_begin_trailers_callback(nghttp3_conn *conn,
                                               int64_t stream_id,
                                               void *conn_user_data,
                                               void *stream_user_data) {
-  ConnectionObj *obj = conn_user_data;
-  VALUE rb_callbacks = obj->callbacks;
-
-  if (NIL_P(rb_callbacks))
-    return 0;
-
-  CallbacksObj *cb;
-  TypedData_Get_Struct(rb_callbacks, CallbacksObj, &callbacks_data_type, cb);
-
-  if (NIL_P(cb->on_begin_trailers))
-    return 0;
-
-  VALUE args[1] = {LL2NUM(stream_id)};
-  rb_proc_call(cb->on_begin_trailers, rb_ary_new_from_values(1, args));
-
-  return 0;
+  CB_DISPATCH((ConnectionObj *)conn_user_data, on_begin_trailers,
+              CB_I64(stream_id));
 }
 
 static int nghttp3_rb_recv_trailer_callback(nghttp3_conn *conn,
@@ -479,50 +440,17 @@ static int nghttp3_rb_recv_trailer_callback(nghttp3_conn *conn,
                                             nghttp3_rcbuf *value, uint8_t flags,
                                             void *conn_user_data,
                                             void *stream_user_data) {
-  ConnectionObj *obj = conn_user_data;
-  VALUE rb_callbacks = obj->callbacks;
-
-  if (NIL_P(rb_callbacks))
-    return 0;
-
-  CallbacksObj *cb;
-  TypedData_Get_Struct(rb_callbacks, CallbacksObj, &callbacks_data_type, cb);
-
-  if (NIL_P(cb->on_recv_trailer))
-    return 0;
-
-  nghttp3_vec name_vec = nghttp3_rcbuf_get_buf(name);
-  nghttp3_vec value_vec = nghttp3_rcbuf_get_buf(value);
-
-  VALUE rb_name = rb_str_new((const char *)name_vec.base, name_vec.len);
-  VALUE rb_value = rb_str_new((const char *)value_vec.base, value_vec.len);
-
-  VALUE args[4] = {LL2NUM(stream_id), rb_name, rb_value, UINT2NUM(flags)};
-  rb_proc_call(cb->on_recv_trailer, rb_ary_new_from_values(4, args));
-
-  return 0;
+  CB_DISPATCH((ConnectionObj *)conn_user_data, on_recv_trailer,
+              CB_I64(stream_id), CB_BYTES(nghttp3_rcbuf_get_buf(name)),
+              CB_BYTES(nghttp3_rcbuf_get_buf(value)), CB_U64(flags));
 }
 
 static int nghttp3_rb_end_trailers_callback(nghttp3_conn *conn,
                                             int64_t stream_id, int fin,
                                             void *conn_user_data,
                                             void *stream_user_data) {
-  ConnectionObj *obj = conn_user_data;
-  VALUE rb_callbacks = obj->callbacks;
-
-  if (NIL_P(rb_callbacks))
-    return 0;
-
-  CallbacksObj *cb;
-  TypedData_Get_Struct(rb_callbacks, CallbacksObj, &callbacks_data_type, cb);
-
-  if (NIL_P(cb->on_end_trailers))
-    return 0;
-
-  VALUE args[2] = {LL2NUM(stream_id), fin ? Qtrue : Qfalse};
-  rb_proc_call(cb->on_end_trailers, rb_ary_new_from_values(2, args));
-
-  return 0;
+  CB_DISPATCH((ConnectionObj *)conn_user_data, on_end_trailers,
+              CB_I64(stream_id), CB_BOOL(fin));
 }
 
 static int nghttp3_rb_stop_sending_callback(nghttp3_conn *conn,
@@ -530,43 +458,15 @@ static int nghttp3_rb_stop_sending_callback(nghttp3_conn *conn,
                                             uint64_t app_error_code,
                                             void *conn_user_data,
                                             void *stream_user_data) {
-  ConnectionObj *obj = conn_user_data;
-  VALUE rb_callbacks = obj->callbacks;
-
-  if (NIL_P(rb_callbacks))
-    return 0;
-
-  CallbacksObj *cb;
-  TypedData_Get_Struct(rb_callbacks, CallbacksObj, &callbacks_data_type, cb);
-
-  if (NIL_P(cb->on_stop_sending))
-    return 0;
-
-  VALUE args[2] = {LL2NUM(stream_id), ULL2NUM(app_error_code)};
-  rb_proc_call(cb->on_stop_sending, rb_ary_new_from_values(2, args));
-
-  return 0;
+  CB_DISPATCH((ConnectionObj *)conn_user_data, on_stop_sending,
+              CB_I64(stream_id), CB_U64(app_error_code));
 }
 
 static int nghttp3_rb_end_stream_callback(nghttp3_conn *conn, int64_t stream_id,
                                           void *conn_user_data,
                                           void *stream_user_data) {
-  ConnectionObj *obj = conn_user_data;
-  VALUE rb_callbacks = obj->callbacks;
-
-  if (NIL_P(rb_callbacks))
-    return 0;
-
-  CallbacksObj *cb;
-  TypedData_Get_Struct(rb_callbacks, CallbacksObj, &callbacks_data_type, cb);
-
-  if (NIL_P(cb->on_end_stream))
-    return 0;
-
-  VALUE args[1] = {LL2NUM(stream_id)};
-  rb_proc_call(cb->on_end_stream, rb_ary_new_from_values(1, args));
-
-  return 0;
+  CB_DISPATCH((ConnectionObj *)conn_user_data, on_end_stream,
+              CB_I64(stream_id));
 }
 
 static int nghttp3_rb_reset_stream_callback(nghttp3_conn *conn,
@@ -574,58 +474,23 @@ static int nghttp3_rb_reset_stream_callback(nghttp3_conn *conn,
                                             uint64_t app_error_code,
                                             void *conn_user_data,
                                             void *stream_user_data) {
-  ConnectionObj *obj = conn_user_data;
-  VALUE rb_callbacks = obj->callbacks;
-
-  if (NIL_P(rb_callbacks))
-    return 0;
-
-  CallbacksObj *cb;
-  TypedData_Get_Struct(rb_callbacks, CallbacksObj, &callbacks_data_type, cb);
-
-  if (NIL_P(cb->on_reset_stream))
-    return 0;
-
-  VALUE args[2] = {LL2NUM(stream_id), ULL2NUM(app_error_code)};
-  rb_proc_call(cb->on_reset_stream, rb_ary_new_from_values(2, args));
-
-  return 0;
+  CB_DISPATCH((ConnectionObj *)conn_user_data, on_reset_stream,
+              CB_I64(stream_id), CB_U64(app_error_code));
 }
 
 static int nghttp3_rb_shutdown_callback(nghttp3_conn *conn, int64_t id,
                                         void *conn_user_data) {
-  ConnectionObj *obj = conn_user_data;
-  VALUE rb_callbacks = obj->callbacks;
-
-  if (NIL_P(rb_callbacks))
-    return 0;
-
-  CallbacksObj *cb;
-  TypedData_Get_Struct(rb_callbacks, CallbacksObj, &callbacks_data_type, cb);
-
-  if (NIL_P(cb->on_shutdown))
-    return 0;
-
-  VALUE args[1] = {LL2NUM(id)};
-  rb_proc_call(cb->on_shutdown, rb_ary_new_from_values(1, args));
-
-  return 0;
+  CB_DISPATCH((ConnectionObj *)conn_user_data, on_shutdown, CB_I64(id));
 }
 
-static int nghttp3_rb_recv_settings_callback(nghttp3_conn *conn,
-                                             const nghttp3_settings *settings,
-                                             void *conn_user_data) {
-  ConnectionObj *obj = conn_user_data;
-  VALUE rb_callbacks = obj->callbacks;
+typedef struct {
+  VALUE proc;
+  const nghttp3_settings *settings;
+} settings_call;
 
-  if (NIL_P(rb_callbacks))
-    return 0;
-
-  CallbacksObj *cb;
-  TypedData_Get_Struct(rb_callbacks, CallbacksObj, &callbacks_data_type, cb);
-
-  if (NIL_P(cb->on_recv_settings))
-    return 0;
+static VALUE recv_settings_body(VALUE arg) {
+  const settings_call *call = (const settings_call *)arg;
+  const nghttp3_settings *settings = call->settings;
 
   /* Create a Ruby hash with settings values */
   VALUE rb_settings = rb_hash_new();
@@ -643,10 +508,23 @@ static int nghttp3_rb_recv_settings_callback(nghttp3_conn *conn,
   rb_hash_aset(rb_settings, ID2SYM(rb_intern("h3_datagram")),
                settings->h3_datagram ? Qtrue : Qfalse);
 
-  VALUE args[1] = {rb_settings};
-  rb_proc_call(cb->on_recv_settings, rb_ary_new_from_values(1, args));
+  rb_proc_call(call->proc, rb_ary_new_from_values(1, &rb_settings));
+  return Qnil;
+}
 
-  return 0;
+static int nghttp3_rb_recv_settings_callback(nghttp3_conn *conn,
+                                             const nghttp3_settings *settings,
+                                             void *conn_user_data) {
+  ConnectionObj *obj = conn_user_data;
+  if (NIL_P(obj->callbacks)) {
+    return 0;
+  }
+  CallbacksObj *cb = RTYPEDDATA_DATA(obj->callbacks);
+  if (NIL_P(cb->on_recv_settings)) {
+    return 0;
+  }
+  settings_call call = {cb->on_recv_settings, settings};
+  return nghttp3_rb_protect(obj, recv_settings_body, (VALUE)&call);
 }
 
 /*

@@ -19,6 +19,7 @@ static void connection_mark(void *ptr) {
   if (obj->pending_data != Qnil) {
     rb_gc_mark(obj->pending_data);
   }
+  rb_gc_mark(obj->pending_exc);
 }
 
 static void connection_free(void *ptr) {
@@ -61,12 +62,39 @@ static VALUE connection_alloc(VALUE klass) {
   obj->self = self;
   obj->settings = Qnil;
   obj->callbacks = Qnil;
+  obj->pending_exc = Qnil;
   obj->stream_data_readers = rb_hash_new();
   obj->stream_user_data = rb_hash_new();
   obj->pending_data = rb_hash_new();
   obj->is_closed = 0;
   obj->is_server = 0;
   return self;
+}
+
+int nghttp3_rb_protect(ConnectionObj *obj, VALUE (*body)(VALUE), VALUE arg) {
+  int state = 0;
+  rb_protect(body, arg, &state);
+  if (state == 0) {
+    return 0;
+  }
+  if (NIL_P(obj->pending_exc)) {
+    obj->pending_exc = rb_errinfo();
+  }
+  rb_set_errinfo(Qnil);
+  return NGHTTP3_ERR_CALLBACK_FAILURE;
+}
+
+/* Raise the exception a callback left in obj->pending_exc, if any. Called
+ * right after nghttp3 returns, before its return value is looked at: the
+ * NGHTTP3_ERR_CALLBACK_FAILURE it reports is the result of that
+ * exception. */
+static void connection_raise_pending(ConnectionObj *obj) {
+  if (NIL_P(obj->pending_exc)) {
+    return;
+  }
+  VALUE exc = obj->pending_exc;
+  obj->pending_exc = Qnil;
+  rb_exc_raise(exc);
 }
 
 /* Prepare the nghttp3_callbacks for a new connection. A Callbacks object is
@@ -285,21 +313,43 @@ static VALUE rb_nghttp3_connection_client_p(VALUE self) {
   return obj->is_server ? Qfalse : Qtrue;
 }
 
+struct read_stream_args {
+  ConnectionObj *obj;
+  int64_t stream_id;
+  VALUE data;
+  int fin;
+};
+
+static VALUE read_stream_body(VALUE arg) {
+  struct read_stream_args *a = (struct read_stream_args *)arg;
+  nghttp3_ssize rv = nghttp3_conn_read_stream(
+      a->obj->conn, a->stream_id, (const uint8_t *)RSTRING_PTR(a->data),
+      (size_t)RSTRING_LEN(a->data), a->fin);
+  connection_raise_pending(a->obj);
+  if (rv < 0) {
+    nghttp3_rb_raise((int)rv, "Failed to read stream");
+  }
+  return LL2NUM(rv);
+}
+
+static VALUE read_stream_unlock(VALUE arg) {
+  rb_str_unlocktmp(((struct read_stream_args *)arg)->data);
+  return Qnil;
+}
+
 /*
  * call-seq:
  *   connection.read_stream(stream_id, data, fin: false) -> Integer
  *
  * Reads data on a stream. This should be called when data is received from
  * the QUIC layer. Returns the number of bytes consumed (for flow control).
+ * An exception raised by a callback comes out of here.
  */
 static VALUE rb_nghttp3_connection_read_stream(int argc, VALUE *argv,
                                                VALUE self) {
   VALUE rb_stream_id, rb_data, rb_opts;
   VALUE rb_fin = Qfalse;
   ConnectionObj *obj;
-  nghttp3_ssize rv;
-  int64_t stream_id;
-  int fin;
 
   rb_scan_args(argc, argv, "2:", &rb_stream_id, &rb_data, &rb_opts);
 
@@ -317,18 +367,17 @@ static VALUE rb_nghttp3_connection_read_stream(int argc, VALUE *argv,
   }
 
   Check_Type(rb_data, T_STRING);
-  stream_id = NUM2LL(rb_stream_id);
-  fin = RTEST(rb_fin) ? 1 : 0;
 
-  rv = nghttp3_conn_read_stream(obj->conn, stream_id,
-                                (const uint8_t *)RSTRING_PTR(rb_data),
-                                RSTRING_LEN(rb_data), fin);
+  struct read_stream_args args;
+  args.obj = obj;
+  args.stream_id = NUM2LL(rb_stream_id);
+  args.data = rb_data;
+  args.fin = RTEST(rb_fin) ? 1 : 0;
 
-  if (rv < 0) {
-    nghttp3_rb_raise((int)rv, "Failed to read stream");
-  }
-
-  return LL2NUM(rv);
+  /* Callbacks run Ruby code, which must not change data under nghttp3. */
+  rb_str_locktmp(rb_data);
+  return rb_ensure(read_stream_body, (VALUE)&args, read_stream_unlock,
+                   (VALUE)&args);
 }
 
 /*
@@ -354,6 +403,7 @@ static VALUE rb_nghttp3_connection_writev_stream(VALUE self) {
   }
 
   rv = nghttp3_conn_writev_stream(obj->conn, &stream_id, &fin, vec, 16);
+  connection_raise_pending(obj);
 
   if (rv < 0) {
     nghttp3_rb_raise((int)rv, "Failed to writev stream");
@@ -406,6 +456,7 @@ static VALUE rb_nghttp3_connection_add_write_offset(VALUE self,
   n = NUM2SIZET(rb_n);
 
   rv = nghttp3_conn_add_write_offset(obj->conn, stream_id, n);
+  connection_raise_pending(obj);
 
   if (rv != 0) {
     nghttp3_rb_raise(rv, "Failed to add write offset");
@@ -438,6 +489,7 @@ static VALUE rb_nghttp3_connection_add_ack_offset(VALUE self,
   n = NUM2ULL(rb_n);
 
   rv = nghttp3_conn_add_ack_offset(obj->conn, stream_id, n);
+  connection_raise_pending(obj);
 
   if (rv != 0) {
     nghttp3_rb_raise(rv, "Failed to add ack offset");
@@ -489,6 +541,7 @@ static VALUE rb_nghttp3_connection_unblock_stream(VALUE self,
 
   stream_id = NUM2LL(rb_stream_id);
   rv = nghttp3_conn_unblock_stream(obj->conn, stream_id);
+  connection_raise_pending(obj);
 
   if (rv != 0) {
     nghttp3_rb_raise(rv, "Failed to unblock stream");
@@ -544,6 +597,7 @@ static VALUE rb_nghttp3_connection_close_stream(VALUE self, VALUE rb_stream_id,
   app_error_code = NUM2ULL(rb_error_code);
 
   rv = nghttp3_conn_close_stream(obj->conn, stream_id, app_error_code);
+  connection_raise_pending(obj);
 
   if (rv != 0) {
     nghttp3_rb_raise(rv, "Failed to close stream");
@@ -571,6 +625,7 @@ static VALUE rb_nghttp3_connection_shutdown_stream_write(VALUE self,
 
   stream_id = NUM2LL(rb_stream_id);
   nghttp3_conn_shutdown_stream_write(obj->conn, stream_id);
+  connection_raise_pending(obj);
 
   return self;
 }
@@ -595,6 +650,7 @@ static VALUE rb_nghttp3_connection_resume_stream(VALUE self,
 
   stream_id = NUM2LL(rb_stream_id);
   rv = nghttp3_conn_resume_stream(obj->conn, stream_id);
+  connection_raise_pending(obj);
 
   if (rv != 0) {
     nghttp3_rb_raise(rv, "Failed to resume stream");
@@ -603,70 +659,80 @@ static VALUE rb_nghttp3_connection_resume_stream(VALUE self,
   return self;
 }
 
+struct read_data_args {
+  ConnectionObj *obj;
+  int64_t stream_id;
+  nghttp3_vec *vec;
+  uint32_t *pflags;
+  nghttp3_ssize result;
+};
+
+static VALUE read_data_body(VALUE arg) {
+  struct read_data_args *a = (struct read_data_args *)arg;
+  ConnectionObj *obj = a->obj;
+  VALUE rb_stream_id = LL2NUM(a->stream_id);
+  VALUE reader = rb_hash_aref(obj->stream_data_readers, rb_stream_id);
+  VALUE data;
+
+  a->result = 0;
+  if (NIL_P(reader)) {
+    *a->pflags |= NGHTTP3_DATA_FLAG_EOF;
+    return Qnil;
+  }
+
+  if (RB_TYPE_P(reader, T_STRING)) {
+    /* String: return all data at once */
+    data = reader;
+    rb_hash_delete(obj->stream_data_readers, rb_stream_id);
+    *a->pflags |= NGHTTP3_DATA_FLAG_EOF;
+  } else {
+    /* Proc: call it to get data */
+    VALUE result = rb_funcall(reader, rb_intern("call"), 1, rb_stream_id);
+
+    if (NIL_P(result)) {
+      *a->pflags |= NGHTTP3_DATA_FLAG_EOF;
+      rb_hash_delete(obj->stream_data_readers, rb_stream_id);
+      return Qnil;
+    }
+
+    if (SYMBOL_P(result) && SYM2ID(result) == rb_intern("wouldblock")) {
+      a->result = NGHTTP3_ERR_WOULDBLOCK;
+      return Qnil;
+    }
+
+    /* Result should be a String */
+    StringValue(result);
+    data = result;
+  }
+
+  /* Keep data in pending_data until ACKed */
+  VALUE pending = rb_hash_aref(obj->pending_data, rb_stream_id);
+  if (NIL_P(pending)) {
+    pending = rb_ary_new();
+    rb_hash_aset(obj->pending_data, rb_stream_id, pending);
+  }
+  rb_ary_push(pending, data);
+  a->vec[0].base = (uint8_t *)RSTRING_PTR(data);
+  a->vec[0].len = (size_t)RSTRING_LEN(data);
+  a->result = 1;
+  return Qnil;
+}
+
 /*
- * Callback function for providing body data to nghttp3.
+ * Callback function for providing body data to nghttp3. The Ruby side runs
+ * under rb_protect: an exception waits in pending_exc for writev_stream.
  */
 static nghttp3_ssize read_data_callback(nghttp3_conn *conn, int64_t stream_id,
                                         nghttp3_vec *vec, size_t veccnt,
                                         uint32_t *pflags, void *conn_user_data,
                                         void *stream_user_data) {
   ConnectionObj *obj = conn_user_data;
-  VALUE readers, reader, result;
-  VALUE rb_stream_id = LL2NUM(stream_id);
+  struct read_data_args args = {obj, stream_id, vec, pflags, 0};
 
-  readers = obj->stream_data_readers;
-  reader = rb_hash_aref(readers, rb_stream_id);
-
-  if (NIL_P(reader)) {
-    *pflags |= NGHTTP3_DATA_FLAG_EOF;
-    return 0;
+  if (nghttp3_rb_protect(obj, read_data_body, (VALUE)&args) != 0) {
+    return NGHTTP3_ERR_CALLBACK_FAILURE;
   }
-
-  if (RB_TYPE_P(reader, T_STRING)) {
-    /* String: return all data at once */
-    vec[0].base = (uint8_t *)RSTRING_PTR(reader);
-    vec[0].len = RSTRING_LEN(reader);
-    *pflags |= NGHTTP3_DATA_FLAG_EOF;
-
-    /* Keep string in pending_data until ACKed */
-    VALUE pending = rb_hash_aref(obj->pending_data, rb_stream_id);
-    if (NIL_P(pending)) {
-      pending = rb_ary_new();
-      rb_hash_aset(obj->pending_data, rb_stream_id, pending);
-    }
-    rb_ary_push(pending, reader);
-    rb_hash_delete(readers, rb_stream_id);
-    return 1;
-  }
-
-  /* Proc: call it to get data */
-  result = rb_funcall(reader, rb_intern("call"), 1, rb_stream_id);
-
-  if (NIL_P(result)) {
-    *pflags |= NGHTTP3_DATA_FLAG_EOF;
-    rb_hash_delete(readers, rb_stream_id);
-    return 0;
-  }
-
-  if (SYMBOL_P(result) && SYM2ID(result) == rb_intern("wouldblock")) {
-    return NGHTTP3_ERR_WOULDBLOCK;
-  }
-
-  /* Result should be a String */
-  StringValue(result);
-
-  /* Store in pending_data for GC protection until ACKed */
-  VALUE pending = rb_hash_aref(obj->pending_data, rb_stream_id);
-  if (NIL_P(pending)) {
-    pending = rb_ary_new();
-    rb_hash_aset(obj->pending_data, rb_stream_id, pending);
-  }
-  rb_ary_push(pending, result);
-
-  vec[0].base = (uint8_t *)RSTRING_PTR(result);
-  vec[0].len = RSTRING_LEN(result);
-
-  return 1;
+  return args.result;
 }
 
 /* Static data_reader structure for use in submit functions */
@@ -733,6 +799,7 @@ static VALUE rb_nghttp3_connection_submit_request(int argc, VALUE *argv,
 
   rv = nghttp3_conn_submit_request(obj->conn, stream_id, nva, nvlen,
                                    has_body ? &data_reader : NULL, NULL);
+  connection_raise_pending(obj);
 
   if (rv != 0) {
     rb_hash_delete(obj->stream_data_readers, LL2NUM(stream_id));
@@ -802,6 +869,7 @@ static VALUE rb_nghttp3_connection_submit_response(int argc, VALUE *argv,
 
   rv = nghttp3_conn_submit_response(obj->conn, stream_id, nva, nvlen,
                                     has_body ? &data_reader : NULL);
+  connection_raise_pending(obj);
 
   if (rv != 0) {
     rb_hash_delete(obj->stream_data_readers, LL2NUM(stream_id));
@@ -843,6 +911,7 @@ static VALUE rb_nghttp3_connection_submit_info(VALUE self, VALUE rb_stream_id,
   }
 
   rv = nghttp3_conn_submit_info(obj->conn, stream_id, nva, nvlen);
+  connection_raise_pending(obj);
 
   if (rv != 0) {
     nghttp3_rb_raise(rv, "Failed to submit info");
@@ -885,6 +954,7 @@ static VALUE rb_nghttp3_connection_submit_trailers(VALUE self,
   }
 
   rv = nghttp3_conn_submit_trailers(obj->conn, stream_id, nva, nvlen);
+  connection_raise_pending(obj);
 
   if (rv != 0) {
     nghttp3_rb_raise(rv, "Failed to submit trailers");
@@ -911,6 +981,7 @@ static VALUE rb_nghttp3_connection_submit_shutdown_notice(VALUE self) {
   }
 
   rv = nghttp3_conn_submit_shutdown_notice(obj->conn);
+  connection_raise_pending(obj);
 
   if (rv != 0) {
     nghttp3_rb_raise(rv, "Failed to submit shutdown notice");
@@ -936,6 +1007,7 @@ static VALUE rb_nghttp3_connection_shutdown(VALUE self) {
   }
 
   rv = nghttp3_conn_shutdown(obj->conn);
+  connection_raise_pending(obj);
 
   if (rv != 0) {
     nghttp3_rb_raise(rv, "Failed to shutdown connection");

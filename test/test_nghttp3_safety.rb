@@ -2,12 +2,32 @@
 
 require "test_helper"
 
-# The C extension's contract with nghttp3 and the GC: callbacks keep working
-# after GC.compact. A client and a server Connection talk to each other
-# directly, as a lossless QUIC without flow control would carry their
-# streams.
+# The C extension's contract with nghttp3 and the GC: exceptions from Ruby
+# never unwind through nghttp3, and callbacks keep working after GC.compact.
+# A client and a server Connection talk to each other directly, as a
+# lossless QUIC without flow control would carry their streams.
 class TestNghttp3Safety < Minitest::Test
   REQUEST_STREAM = 0
+
+  def test_exception_in_a_callback_comes_out_of_read_stream
+    callbacks = Nghttp3::Callbacks.new.on_begin_headers { |_stream_id| raise "boom" }
+    client = new_client
+    client.submit_request(REQUEST_STREAM, request_headers)
+    server = new_server(callbacks)
+
+    error = assert_raises(RuntimeError) { transfer(client, server) }
+    assert_equal "boom", error.message
+  end
+
+  def test_exception_in_read_data_comes_out_of_writev_stream
+    client = new_client
+    client.submit_request(REQUEST_STREAM, request_headers(method: "POST")) do |_stream_id|
+      raise ArgumentError, "no body today"
+    end
+
+    error = assert_raises(ArgumentError) { drain(client) }
+    assert_equal "no body today", error.message
+  end
 
   def test_callbacks_must_be_a_callbacks_object
     assert_raises(TypeError) { Nghttp3::Connection.client_new(nil, Object.new) }
@@ -54,6 +74,17 @@ class TestNghttp3Safety < Minitest::Test
       Nghttp3::NV.new(":scheme", "https"),
       Nghttp3::NV.new(":authority", "example.com")
     ]
+  end
+
+  # Take everything from's writev_stream offers without a peer. Returns the
+  # bytes written per stream.
+  def drain(from)
+    sent = Hash.new(0)
+    while (out = from.writev_stream)
+      from.add_write_offset(out[:stream_id], out[:data].bytesize)
+      sent[out[:stream_id]] += out[:data].bytesize
+    end
+    sent
   end
 
   # Hand everything from's writev_stream offers to to.
