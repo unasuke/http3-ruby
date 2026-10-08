@@ -100,5 +100,6 @@ void Init_nghttp3_nv(void);
 void Init_nghttp3_connection(void);
 void Init_nghttp3_callbacks(void);
 void Init_nghttp3_qpack(void);
+void Init_http3_session(VALUE rb_mHTTP3);
 
 #endif /* NGHTTP3_RUBY_H */

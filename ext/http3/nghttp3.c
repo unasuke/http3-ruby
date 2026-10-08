@@ -343,4 +343,5 @@ RUBY_FUNC_EXPORTED void Init_http3(void) {
   Init_nghttp3_callbacks();
   Init_nghttp3_connection();
   Init_nghttp3_qpack();
+  Init_http3_session(rb_mHTTP3);
 }
