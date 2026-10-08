@@ -69,6 +69,18 @@ static VALUE connection_alloc(VALUE klass) {
   return self;
 }
 
+/* Prepare the nghttp3_callbacks for a new connection. A Callbacks object is
+ * checked here, so that the C callbacks can take it as one. */
+static void connection_setup_callbacks(ConnectionObj *obj, VALUE rb_callbacks,
+                                       nghttp3_callbacks *callbacks) {
+  memset(callbacks, 0, sizeof(*callbacks));
+  if (!NIL_P(rb_callbacks)) {
+    rb_check_typeddata(rb_callbacks, &callbacks_data_type);
+    obj->callbacks = rb_callbacks;
+    nghttp3_rb_setup_callbacks(callbacks);
+  }
+}
+
 /*
  * call-seq:
  *   Connection.client_new(settings = nil, callbacks = nil) -> Connection
@@ -100,13 +112,7 @@ static VALUE rb_nghttp3_connection_client_new(int argc, VALUE *argv,
     obj->settings = rb_settings;
   }
 
-  /* Initialize callbacks structure */
-  memset(&callbacks, 0, sizeof(callbacks));
-
-  if (!NIL_P(rb_callbacks)) {
-    obj->callbacks = rb_callbacks;
-    nghttp3_rb_setup_callbacks(&callbacks);
-  }
+  connection_setup_callbacks(obj, rb_callbacks, &callbacks);
 
   rv = nghttp3_conn_client_new(&obj->conn, &callbacks, settings_ptr, NULL, obj);
 
@@ -149,13 +155,7 @@ static VALUE rb_nghttp3_connection_server_new(int argc, VALUE *argv,
     obj->settings = rb_settings;
   }
 
-  /* Initialize callbacks structure */
-  memset(&callbacks, 0, sizeof(callbacks));
-
-  if (!NIL_P(rb_callbacks)) {
-    obj->callbacks = rb_callbacks;
-    nghttp3_rb_setup_callbacks(&callbacks);
-  }
+  connection_setup_callbacks(obj, rb_callbacks, &callbacks);
 
   rv = nghttp3_conn_server_new(&obj->conn, &callbacks, settings_ptr, NULL, obj);
 

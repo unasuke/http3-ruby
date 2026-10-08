@@ -9,6 +9,11 @@ require "test_helper"
 class TestNghttp3Safety < Minitest::Test
   REQUEST_STREAM = 0
 
+  def test_callbacks_must_be_a_callbacks_object
+    assert_raises(TypeError) { Nghttp3::Connection.client_new(nil, Object.new) }
+    assert_raises(TypeError) { Nghttp3::Connection.server_new(nil, "callbacks") }
+  end
+
   # The server's callbacks find their connection through conn_user_data,
   # which must survive the server object moving.
   def test_callbacks_survive_gc_compaction
