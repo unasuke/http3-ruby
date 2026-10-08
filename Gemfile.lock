@@ -2,6 +2,7 @@ PATH
   remote: .
   specs:
     http3 (0.0.1)
+      logger
       mini_portile2 (~> 2.8)
       quic (~> 0.0.3)
       rack (>= 3.0)
@@ -20,6 +21,7 @@ GEM
     json (2.18.0)
     language_server-protocol (3.17.0.5)
     lint_roller (1.1.0)
+    logger (1.7.0)
     mini_portile2 (2.8.9)
     minitest (5.27.0)
     parallel (1.27.0)
