@@ -1,0 +1,30 @@
+module HTTP3
+  # A response for a Session to send; headers exclude pseudo-headers.
+  class Response < Data
+    attr_reader status: Integer
+    attr_reader headers: Array[[String, String]]
+    attr_reader body: Body::File | Body::Chunks | nil
+
+    def self.new: (status: Integer, headers: Array[[String, String]], body: Body::File | Body::Chunks | nil) -> Response
+  end
+
+  module Body
+    # length bytes of io from offset, read by the C part of the Session.
+    class File < Data
+      attr_reader io: ::File
+      attr_reader offset: Integer
+      attr_reader length: Integer
+      attr_reader rack_body: untyped
+
+      def self.new: (io: ::File, offset: Integer, length: Integer, rack_body: untyped) -> File
+    end
+
+    # Chunks pulled with enum.next as the send buffer drains.
+    class Chunks < Data
+      attr_reader enum: Enumerator[String, untyped]
+      attr_reader rack_body: untyped
+
+      def self.new: (enum: Enumerator[String, untyped], rack_body: untyped) -> Chunks
+    end
+  end
+end

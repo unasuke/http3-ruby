@@ -1,6 +1,7 @@
 ## [Unreleased]
 
 ### Added
+- `HTTP3::Session`, HTTP/3 on one `QUIC::Connection::Server` through the quic gem's C function table, and `HTTP3::Request`, `HTTP3::Response` and `HTTP3::Body`, the data it passes to and from the application.
 - `HTTP3::Nghttp3::Connection#read_stream` takes `ts:`, the time in nanoseconds for nghttp3's rate limits (CLOCK_MONOTONIC by default), and now calls `nghttp3_conn_read_stream2`. ([#2](https://github.com/unasuke/nghttp3-ruby/pull/2))
 - `HTTP3::Nghttp3::Connection#shutdown_stream_read`, `#set_max_client_streams_bidi` and `#pending_data`. ([#2](https://github.com/unasuke/nghttp3-ruby/pull/2))
 

@@ -11,6 +11,10 @@ require_relative "http3/nghttp3/stream_manager"
 require_relative "http3/nghttp3/client"
 require_relative "http3/nghttp3/server"
 
+require_relative "http3/request"
+require_relative "http3/response"
+require_relative "http3/session"
+
 module HTTP3
   module Nghttp3
     class Error < StandardError; end

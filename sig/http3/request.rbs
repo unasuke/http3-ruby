@@ -1,0 +1,11 @@
+module HTTP3
+  # A request as a Session put it together. headers holds [name, value]
+  # pairs with lowercase names, the pseudo-headers first.
+  class Request < Data
+    attr_reader stream_id: Integer
+    attr_reader headers: Array[[String, String]]
+    attr_reader body: String
+
+    def self.new: (stream_id: Integer, headers: Array[[String, String]], body: String) -> Request
+  end
+end
