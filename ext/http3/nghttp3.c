@@ -1,6 +1,8 @@
 #include "nghttp3.h"
 #include <stdarg.h>
 
+const quic_ext_api *http3_quic_api;
+
 VALUE rb_mNghttp3;
 VALUE rb_cNghttp3Info;
 VALUE rb_eNghttp3Error;
@@ -157,10 +159,52 @@ static VALUE rb_nghttp3_strerror(VALUE self, VALUE rb_error_code) {
   return rb_str_new_cstr(str);
 }
 
+/*
+ * The quic gem's C function table for ABI major version major. quic must be
+ * loaded. Raises LoadError naming the versions when the quic gem has no
+ * such table (too old, or an incompatible major version) or a smaller one
+ * than this extension was built against.
+ */
+static const quic_ext_api *http3_load_quic_api(uint32_t major) {
+  quic_ext_get_api_fn get = (quic_ext_get_api_fn)rb_ext_resolve_symbol(
+      "quic/quic", "quic_ext_get_api");
+  const quic_ext_api *api = get != NULL ? get(major) : NULL;
+  if (api == NULL || api->size < sizeof(quic_ext_api)) {
+    VALUE quic = rb_const_get(rb_cObject, rb_intern("QUIC"));
+    VALUE version = rb_const_get(quic, rb_intern("VERSION"));
+    rb_raise(rb_eLoadError,
+             "http3 needs the quic gem's C function table for quic/ext.h "
+             "ABI major version %u (quic ~> 0.0.3), which quic %" PRIsVALUE
+             " does not provide",
+             (unsigned int)major, version);
+  }
+  return api;
+}
+
+/*
+ * call-seq:
+ *   HTTP3::Testing.load_quic_api(major) -> true
+ *
+ * Looks the quic gem's table up again for the given ABI major version, as
+ * loading http3 does, and raises LoadError if there is none. Internal, for
+ * testing the version check.
+ */
+static VALUE rb_http3_testing_load_quic_api(VALUE self, VALUE major) {
+  http3_load_quic_api(NUM2UINT(major));
+  return Qtrue;
+}
+
 RUBY_FUNC_EXPORTED void Init_http3(void) {
+  /* quic.so has to be loaded before its symbols can be resolved. */
+  rb_require("quic");
+  http3_quic_api = http3_load_quic_api(QUIC_EXT_ABI_MAJOR);
+
   /* The nghttp3 bindings live in HTTP3::Nghttp3. HTTP3 is also opened in
    * lib/http3.rb; both must stay modules. */
   VALUE rb_mHTTP3 = rb_define_module("HTTP3");
+  VALUE rb_mHTTP3Testing = rb_define_module_under(rb_mHTTP3, "Testing");
+  rb_define_singleton_method(rb_mHTTP3Testing, "load_quic_api",
+                             rb_http3_testing_load_quic_api, 1);
   rb_mNghttp3 = rb_define_module_under(rb_mHTTP3, "Nghttp3");
 
   /* Define compile-time version constants */

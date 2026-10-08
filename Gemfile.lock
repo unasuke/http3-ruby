@@ -3,6 +3,7 @@ PATH
   specs:
     http3 (0.0.1)
       mini_portile2 (~> 2.8)
+      quic (~> 0.0.3)
 
 GEM
   remote: https://rubygems.org/
@@ -31,6 +32,8 @@ GEM
     psych (5.3.1)
       date
       stringio
+    quic (0.0.3)
+      mini_portile2
     racc (1.8.1)
     rainbow (3.1.1)
     rake (13.3.1)

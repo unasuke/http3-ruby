@@ -35,6 +35,9 @@ Gem::Specification.new do |spec|
 
   # nghttp3 is downloaded and built from source via mini_portile2
   spec.add_dependency "mini_portile2", "~> 2.8"
+  # The QUIC layer, and the C function table (quic/ext.h) the extension
+  # drives it through
+  spec.add_dependency "quic", "~> 0.0.3"
 
   # For more information and examples about making a new gem, check out our
   # guide at: https://bundler.io/guides/creating_gem.html

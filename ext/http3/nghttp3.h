@@ -4,6 +4,10 @@
 #include "ruby.h"
 #include "ruby/st.h"
 #include <nghttp3/nghttp3.h>
+#include <quic/ext.h>
+
+/* The quic gem's C function table, looked up once by Init_http3. */
+extern const quic_ext_api *http3_quic_api;
 
 extern VALUE rb_mNghttp3;
 extern VALUE rb_cNghttp3Info;
