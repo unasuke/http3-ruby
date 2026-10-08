@@ -290,8 +290,8 @@ static int nghttp3_rb_acked_stream_data_callback(nghttp3_conn *conn,
                                                  uint64_t datalen,
                                                  void *conn_user_data,
                                                  void *stream_user_data) {
-  VALUE rb_conn = (VALUE)conn_user_data;
-  VALUE rb_callbacks = nghttp3_rb_get_callbacks(rb_conn);
+  ConnectionObj *obj = conn_user_data;
+  VALUE rb_callbacks = obj->callbacks;
 
   if (NIL_P(rb_callbacks))
     return 0;
@@ -313,8 +313,8 @@ static int nghttp3_rb_stream_close_callback(nghttp3_conn *conn,
                                             uint64_t app_error_code,
                                             void *conn_user_data,
                                             void *stream_user_data) {
-  VALUE rb_conn = (VALUE)conn_user_data;
-  VALUE rb_callbacks = nghttp3_rb_get_callbacks(rb_conn);
+  ConnectionObj *obj = conn_user_data;
+  VALUE rb_callbacks = obj->callbacks;
 
   if (NIL_P(rb_callbacks))
     return 0;
@@ -335,8 +335,8 @@ static int nghttp3_rb_recv_data_callback(nghttp3_conn *conn, int64_t stream_id,
                                          const uint8_t *data, size_t datalen,
                                          void *conn_user_data,
                                          void *stream_user_data) {
-  VALUE rb_conn = (VALUE)conn_user_data;
-  VALUE rb_callbacks = nghttp3_rb_get_callbacks(rb_conn);
+  ConnectionObj *obj = conn_user_data;
+  VALUE rb_callbacks = obj->callbacks;
 
   if (NIL_P(rb_callbacks))
     return 0;
@@ -359,8 +359,8 @@ static int nghttp3_rb_deferred_consume_callback(nghttp3_conn *conn,
                                                 size_t consumed,
                                                 void *conn_user_data,
                                                 void *stream_user_data) {
-  VALUE rb_conn = (VALUE)conn_user_data;
-  VALUE rb_callbacks = nghttp3_rb_get_callbacks(rb_conn);
+  ConnectionObj *obj = conn_user_data;
+  VALUE rb_callbacks = obj->callbacks;
 
   if (NIL_P(rb_callbacks))
     return 0;
@@ -381,8 +381,8 @@ static int nghttp3_rb_begin_headers_callback(nghttp3_conn *conn,
                                              int64_t stream_id,
                                              void *conn_user_data,
                                              void *stream_user_data) {
-  VALUE rb_conn = (VALUE)conn_user_data;
-  VALUE rb_callbacks = nghttp3_rb_get_callbacks(rb_conn);
+  ConnectionObj *obj = conn_user_data;
+  VALUE rb_callbacks = obj->callbacks;
 
   if (NIL_P(rb_callbacks))
     return 0;
@@ -405,8 +405,8 @@ static int nghttp3_rb_recv_header_callback(nghttp3_conn *conn,
                                            nghttp3_rcbuf *value, uint8_t flags,
                                            void *conn_user_data,
                                            void *stream_user_data) {
-  VALUE rb_conn = (VALUE)conn_user_data;
-  VALUE rb_callbacks = nghttp3_rb_get_callbacks(rb_conn);
+  ConnectionObj *obj = conn_user_data;
+  VALUE rb_callbacks = obj->callbacks;
 
   if (NIL_P(rb_callbacks))
     return 0;
@@ -433,8 +433,8 @@ static int nghttp3_rb_end_headers_callback(nghttp3_conn *conn,
                                            int64_t stream_id, int fin,
                                            void *conn_user_data,
                                            void *stream_user_data) {
-  VALUE rb_conn = (VALUE)conn_user_data;
-  VALUE rb_callbacks = nghttp3_rb_get_callbacks(rb_conn);
+  ConnectionObj *obj = conn_user_data;
+  VALUE rb_callbacks = obj->callbacks;
 
   if (NIL_P(rb_callbacks))
     return 0;
@@ -455,8 +455,8 @@ static int nghttp3_rb_begin_trailers_callback(nghttp3_conn *conn,
                                               int64_t stream_id,
                                               void *conn_user_data,
                                               void *stream_user_data) {
-  VALUE rb_conn = (VALUE)conn_user_data;
-  VALUE rb_callbacks = nghttp3_rb_get_callbacks(rb_conn);
+  ConnectionObj *obj = conn_user_data;
+  VALUE rb_callbacks = obj->callbacks;
 
   if (NIL_P(rb_callbacks))
     return 0;
@@ -479,8 +479,8 @@ static int nghttp3_rb_recv_trailer_callback(nghttp3_conn *conn,
                                             nghttp3_rcbuf *value, uint8_t flags,
                                             void *conn_user_data,
                                             void *stream_user_data) {
-  VALUE rb_conn = (VALUE)conn_user_data;
-  VALUE rb_callbacks = nghttp3_rb_get_callbacks(rb_conn);
+  ConnectionObj *obj = conn_user_data;
+  VALUE rb_callbacks = obj->callbacks;
 
   if (NIL_P(rb_callbacks))
     return 0;
@@ -507,8 +507,8 @@ static int nghttp3_rb_end_trailers_callback(nghttp3_conn *conn,
                                             int64_t stream_id, int fin,
                                             void *conn_user_data,
                                             void *stream_user_data) {
-  VALUE rb_conn = (VALUE)conn_user_data;
-  VALUE rb_callbacks = nghttp3_rb_get_callbacks(rb_conn);
+  ConnectionObj *obj = conn_user_data;
+  VALUE rb_callbacks = obj->callbacks;
 
   if (NIL_P(rb_callbacks))
     return 0;
@@ -530,8 +530,8 @@ static int nghttp3_rb_stop_sending_callback(nghttp3_conn *conn,
                                             uint64_t app_error_code,
                                             void *conn_user_data,
                                             void *stream_user_data) {
-  VALUE rb_conn = (VALUE)conn_user_data;
-  VALUE rb_callbacks = nghttp3_rb_get_callbacks(rb_conn);
+  ConnectionObj *obj = conn_user_data;
+  VALUE rb_callbacks = obj->callbacks;
 
   if (NIL_P(rb_callbacks))
     return 0;
@@ -551,8 +551,8 @@ static int nghttp3_rb_stop_sending_callback(nghttp3_conn *conn,
 static int nghttp3_rb_end_stream_callback(nghttp3_conn *conn, int64_t stream_id,
                                           void *conn_user_data,
                                           void *stream_user_data) {
-  VALUE rb_conn = (VALUE)conn_user_data;
-  VALUE rb_callbacks = nghttp3_rb_get_callbacks(rb_conn);
+  ConnectionObj *obj = conn_user_data;
+  VALUE rb_callbacks = obj->callbacks;
 
   if (NIL_P(rb_callbacks))
     return 0;
@@ -574,8 +574,8 @@ static int nghttp3_rb_reset_stream_callback(nghttp3_conn *conn,
                                             uint64_t app_error_code,
                                             void *conn_user_data,
                                             void *stream_user_data) {
-  VALUE rb_conn = (VALUE)conn_user_data;
-  VALUE rb_callbacks = nghttp3_rb_get_callbacks(rb_conn);
+  ConnectionObj *obj = conn_user_data;
+  VALUE rb_callbacks = obj->callbacks;
 
   if (NIL_P(rb_callbacks))
     return 0;
@@ -594,8 +594,8 @@ static int nghttp3_rb_reset_stream_callback(nghttp3_conn *conn,
 
 static int nghttp3_rb_shutdown_callback(nghttp3_conn *conn, int64_t id,
                                         void *conn_user_data) {
-  VALUE rb_conn = (VALUE)conn_user_data;
-  VALUE rb_callbacks = nghttp3_rb_get_callbacks(rb_conn);
+  ConnectionObj *obj = conn_user_data;
+  VALUE rb_callbacks = obj->callbacks;
 
   if (NIL_P(rb_callbacks))
     return 0;
@@ -615,8 +615,8 @@ static int nghttp3_rb_shutdown_callback(nghttp3_conn *conn, int64_t id,
 static int nghttp3_rb_recv_settings_callback(nghttp3_conn *conn,
                                              const nghttp3_settings *settings,
                                              void *conn_user_data) {
-  VALUE rb_conn = (VALUE)conn_user_data;
-  VALUE rb_callbacks = nghttp3_rb_get_callbacks(rb_conn);
+  ConnectionObj *obj = conn_user_data;
+  VALUE rb_callbacks = obj->callbacks;
 
   if (NIL_P(rb_callbacks))
     return 0;

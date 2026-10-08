@@ -41,6 +41,21 @@ extern const rb_data_type_t settings_data_type;
 /* TypedData type for Callbacks */
 extern const rb_data_type_t callbacks_data_type;
 
+/* The C side of an Nghttp3::Connection. nghttp3 gets a pointer to this
+ * struct as conn_user_data, never the Ruby object: GC.compact may move the
+ * object, and dcompact keeps self pointing at it. */
+typedef struct {
+  nghttp3_conn *conn;
+  VALUE self;
+  VALUE settings;            /* Prevent Settings from being GC'd */
+  VALUE callbacks;           /* Prevent Callbacks from being GC'd */
+  VALUE stream_data_readers; /* stream_id => Proc/String for body data */
+  VALUE stream_user_data;    /* stream_id => arbitrary user data */
+  VALUE pending_data;        /* stream_id => [String, ...] for ACK tracking */
+  int is_closed;
+  int is_server;
+} ConnectionObj;
+
 /* Helper functions */
 VALUE nghttp3_rb_error_class_for_code(int error_code);
 void nghttp3_rb_raise(int error_code, const char *fmt, ...);
@@ -52,7 +67,6 @@ nghttp3_settings *nghttp3_rb_get_settings(VALUE rb_settings);
 nghttp3_nv nghttp3_rb_nv_to_c(VALUE rb_nv);
 
 /* Callbacks helper */
-VALUE nghttp3_rb_get_callbacks(VALUE rb_conn);
 void nghttp3_rb_setup_callbacks(nghttp3_callbacks *callbacks);
 
 /* Init functions */

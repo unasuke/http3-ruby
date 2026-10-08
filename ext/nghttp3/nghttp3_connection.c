@@ -2,17 +2,6 @@
 
 VALUE rb_cNghttp3Connection;
 
-typedef struct {
-  nghttp3_conn *conn;
-  VALUE settings;            /* Prevent Settings from being GC'd */
-  VALUE callbacks;           /* Prevent Callbacks from being GC'd */
-  VALUE stream_data_readers; /* stream_id => Proc/String for body data */
-  VALUE stream_user_data;    /* stream_id => arbitrary user data */
-  VALUE pending_data;        /* stream_id => [String, ...] for ACK tracking */
-  int is_closed;
-  int is_server;
-} ConnectionObj;
-
 static void connection_mark(void *ptr) {
   ConnectionObj *obj = (ConnectionObj *)ptr;
   if (obj->settings != Qnil) {
@@ -45,6 +34,13 @@ static size_t connection_memsize(const void *ptr) {
   return sizeof(ConnectionObj);
 }
 
+/* self is the object wrapping this struct, so it is not marked, but
+ * GC.compact may still move it. Everything else is pinned by dmark. */
+static void connection_compact(void *ptr) {
+  ConnectionObj *obj = (ConnectionObj *)ptr;
+  obj->self = rb_gc_location(obj->self);
+}
+
 static const rb_data_type_t connection_data_type = {
     .wrap_struct_name = "nghttp3_conn_rb",
     .function =
@@ -52,6 +48,7 @@ static const rb_data_type_t connection_data_type = {
             .dmark = connection_mark,
             .dfree = connection_free,
             .dsize = connection_memsize,
+            .dcompact = connection_compact,
         },
     .flags = RUBY_TYPED_FREE_IMMEDIATELY,
 };
@@ -61,6 +58,7 @@ static VALUE connection_alloc(VALUE klass) {
   VALUE self =
       TypedData_Make_Struct(klass, ConnectionObj, &connection_data_type, obj);
   obj->conn = NULL;
+  obj->self = self;
   obj->settings = Qnil;
   obj->callbacks = Qnil;
   obj->stream_data_readers = rb_hash_new();
@@ -69,16 +67,6 @@ static VALUE connection_alloc(VALUE klass) {
   obj->is_closed = 0;
   obj->is_server = 0;
   return self;
-}
-
-/*
- * Returns the callbacks object associated with the connection.
- * For internal use by callback wrapper functions.
- */
-VALUE nghttp3_rb_get_callbacks(VALUE rb_conn) {
-  ConnectionObj *obj;
-  TypedData_Get_Struct(rb_conn, ConnectionObj, &connection_data_type, obj);
-  return obj->callbacks;
 }
 
 /*
@@ -120,8 +108,7 @@ static VALUE rb_nghttp3_connection_client_new(int argc, VALUE *argv,
     nghttp3_rb_setup_callbacks(&callbacks);
   }
 
-  rv = nghttp3_conn_client_new(&obj->conn, &callbacks, settings_ptr, NULL,
-                               (void *)self);
+  rv = nghttp3_conn_client_new(&obj->conn, &callbacks, settings_ptr, NULL, obj);
 
   if (rv != 0) {
     nghttp3_rb_raise(rv, "Failed to create client connection");
@@ -170,8 +157,7 @@ static VALUE rb_nghttp3_connection_server_new(int argc, VALUE *argv,
     nghttp3_rb_setup_callbacks(&callbacks);
   }
 
-  rv = nghttp3_conn_server_new(&obj->conn, &callbacks, settings_ptr, NULL,
-                               (void *)self);
+  rv = nghttp3_conn_server_new(&obj->conn, &callbacks, settings_ptr, NULL, obj);
 
   if (rv != 0) {
     nghttp3_rb_raise(rv, "Failed to create server connection");
@@ -624,12 +610,10 @@ static nghttp3_ssize read_data_callback(nghttp3_conn *conn, int64_t stream_id,
                                         nghttp3_vec *vec, size_t veccnt,
                                         uint32_t *pflags, void *conn_user_data,
                                         void *stream_user_data) {
-  VALUE rb_conn = (VALUE)conn_user_data;
-  ConnectionObj *obj;
+  ConnectionObj *obj = conn_user_data;
   VALUE readers, reader, result;
   VALUE rb_stream_id = LL2NUM(stream_id);
 
-  TypedData_Get_Struct(rb_conn, ConnectionObj, &connection_data_type, obj);
   readers = obj->stream_data_readers;
   reader = rb_hash_aref(readers, rb_stream_id);
 
