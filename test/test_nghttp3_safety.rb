@@ -34,6 +34,20 @@ class TestNghttp3Safety < Minitest::Test
     assert_raises(TypeError) { Nghttp3::Connection.server_new(nil, "callbacks") }
   end
 
+  # submit_* keeps a frozen copy, so changing the String afterwards does not
+  # change what is sent.
+  def test_body_is_copied_when_submitted
+    body = +"original body"
+    received = +""
+    callbacks = Nghttp3::Callbacks.new.on_recv_data { |_stream_id, data| received << data }
+    client = new_client
+    client.submit_request(REQUEST_STREAM, request_headers(method: "POST"), body: body)
+    body.replace("changed!")
+
+    transfer(client, new_server(callbacks))
+    assert_equal "original body", received
+  end
+
   # The server's callbacks find their connection through conn_user_data,
   # which must survive the server object moving.
   def test_callbacks_survive_gc_compaction

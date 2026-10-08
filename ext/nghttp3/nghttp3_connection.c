@@ -681,7 +681,7 @@ static VALUE read_data_body(VALUE arg) {
   }
 
   if (RB_TYPE_P(reader, T_STRING)) {
-    /* String: return all data at once */
+    /* The whole body at once: already a frozen copy, made by submit_*. */
     data = reader;
     rb_hash_delete(obj->stream_data_readers, rb_stream_id);
     *a->pflags |= NGHTTP3_DATA_FLAG_EOF;
@@ -700,9 +700,8 @@ static VALUE read_data_body(VALUE arg) {
       return Qnil;
     }
 
-    /* Result should be a String */
     StringValue(result);
-    data = result;
+    data = rb_str_new_frozen(result);
   }
 
   /* Keep data in pending_data until ACKed */
@@ -789,7 +788,10 @@ static VALUE rb_nghttp3_connection_submit_request(int argc, VALUE *argv,
 
   if (!NIL_P(rb_body)) {
     StringValue(rb_body);
-    rb_hash_aset(obj->stream_data_readers, LL2NUM(stream_id), rb_body);
+    /* A frozen copy, so that the application cannot change the bytes
+     * nghttp3 will read. */
+    rb_hash_aset(obj->stream_data_readers, LL2NUM(stream_id),
+                 rb_str_new_frozen(rb_body));
     has_body = 1;
   } else if (rb_block_given_p()) {
     VALUE block = rb_block_proc();
@@ -859,7 +861,10 @@ static VALUE rb_nghttp3_connection_submit_response(int argc, VALUE *argv,
 
   if (!NIL_P(rb_body)) {
     StringValue(rb_body);
-    rb_hash_aset(obj->stream_data_readers, LL2NUM(stream_id), rb_body);
+    /* A frozen copy, so that the application cannot change the bytes
+     * nghttp3 will read. */
+    rb_hash_aset(obj->stream_data_readers, LL2NUM(stream_id),
+                 rb_str_new_frozen(rb_body));
     has_body = 1;
   } else if (rb_block_given_p()) {
     VALUE block = rb_block_proc();
