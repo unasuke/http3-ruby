@@ -1,5 +1,7 @@
 #include "nghttp3.h"
 
+#include <time.h>
+
 VALUE rb_cNghttp3Connection;
 
 /* The body Strings handed to nghttp3 for one stream and not yet wholly
@@ -401,18 +403,25 @@ static VALUE rb_nghttp3_connection_client_p(VALUE self) {
   return obj->is_server ? Qfalse : Qtrue;
 }
 
+static nghttp3_tstamp monotonic_now(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (nghttp3_tstamp)ts.tv_sec * 1000000000ULL + (nghttp3_tstamp)ts.tv_nsec;
+}
+
 struct read_stream_args {
   ConnectionObj *obj;
   int64_t stream_id;
   VALUE data;
   int fin;
+  nghttp3_tstamp ts;
 };
 
 static VALUE read_stream_body(VALUE arg) {
   struct read_stream_args *a = (struct read_stream_args *)arg;
-  nghttp3_ssize rv = nghttp3_conn_read_stream(
+  nghttp3_ssize rv = nghttp3_conn_read_stream2(
       a->obj->conn, a->stream_id, (const uint8_t *)RSTRING_PTR(a->data),
-      (size_t)RSTRING_LEN(a->data), a->fin);
+      (size_t)RSTRING_LEN(a->data), a->fin, a->ts);
   connection_raise_pending(a->obj);
   if (rv < 0) {
     nghttp3_rb_raise((int)rv, "Failed to read stream");
@@ -427,16 +436,19 @@ static VALUE read_stream_unlock(VALUE arg) {
 
 /*
  * call-seq:
- *   connection.read_stream(stream_id, data, fin: false) -> Integer
+ *   connection.read_stream(stream_id, data, fin: false, ts: nil) -> Integer
  *
  * Reads data on a stream. This should be called when data is received from
  * the QUIC layer. Returns the number of bytes consumed (for flow control).
- * An exception raised by a callback comes out of here.
+ * ts is the current time in nanoseconds on any monotonic clock, used for
+ * nghttp3's rate limits; it defaults to CLOCK_MONOTONIC. An exception
+ * raised by a callback comes out of here.
  */
 static VALUE rb_nghttp3_connection_read_stream(int argc, VALUE *argv,
                                                VALUE self) {
   VALUE rb_stream_id, rb_data, rb_opts;
   VALUE rb_fin = Qfalse;
+  VALUE rb_ts = Qnil;
   ConnectionObj *obj;
 
   rb_scan_args(argc, argv, "2:", &rb_stream_id, &rb_data, &rb_opts);
@@ -446,6 +458,7 @@ static VALUE rb_nghttp3_connection_read_stream(int argc, VALUE *argv,
     if (!NIL_P(rb_fin_val)) {
       rb_fin = rb_fin_val;
     }
+    rb_ts = rb_hash_aref(rb_opts, ID2SYM(rb_intern("ts")));
   }
 
   TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
@@ -461,6 +474,7 @@ static VALUE rb_nghttp3_connection_read_stream(int argc, VALUE *argv,
   args.stream_id = NUM2LL(rb_stream_id);
   args.data = rb_data;
   args.fin = RTEST(rb_fin) ? 1 : 0;
+  args.ts = NIL_P(rb_ts) ? monotonic_now() : (nghttp3_tstamp)NUM2ULL(rb_ts);
 
   /* Callbacks run Ruby code, which must not change data under nghttp3. */
   rb_str_locktmp(rb_data);
@@ -1106,6 +1120,58 @@ static VALUE rb_nghttp3_connection_shutdown(VALUE self) {
 
 /*
  * call-seq:
+ *   connection.shutdown_stream_read(stream_id) -> self
+ *
+ * Tells the connection that no more data will be read on the stream, so
+ * that QPACK stops waiting on it.
+ */
+static VALUE rb_nghttp3_connection_shutdown_stream_read(VALUE self,
+                                                        VALUE rb_stream_id) {
+  ConnectionObj *obj;
+  int rv;
+
+  TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
+
+  if (obj->conn == NULL || obj->is_closed) {
+    rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
+  }
+
+  rv = nghttp3_conn_shutdown_stream_read(obj->conn, NUM2LL(rb_stream_id));
+  connection_raise_pending(obj);
+
+  if (rv != 0) {
+    nghttp3_rb_raise(rv, "Failed to shutdown stream read");
+  }
+
+  return self;
+}
+
+/*
+ * call-seq:
+ *   connection.set_max_client_streams_bidi(max_streams) -> self
+ *
+ * Tells a server connection the cumulative number of bidirectional streams
+ * the client may open, as QUIC's MAX_STREAMS allows. nghttp3 uses it for
+ * graceful shutdown.
+ */
+static VALUE
+rb_nghttp3_connection_set_max_client_streams_bidi(VALUE self,
+                                                  VALUE rb_max_streams) {
+  ConnectionObj *obj;
+
+  TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
+
+  if (obj->conn == NULL || obj->is_closed) {
+    rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
+  }
+
+  nghttp3_conn_set_max_client_streams_bidi(obj->conn, NUM2ULL(rb_max_streams));
+
+  return self;
+}
+
+/*
+ * call-seq:
  *   connection.pending_data(stream_id) -> Array
  *
  * The body Strings handed to nghttp3 on the stream that the peer has not
@@ -1210,6 +1276,10 @@ void Init_nghttp3_connection(void) {
                    rb_nghttp3_connection_shutdown_stream_write, 1);
   rb_define_method(rb_cNghttp3Connection, "resume_stream",
                    rb_nghttp3_connection_resume_stream, 1);
+  rb_define_method(rb_cNghttp3Connection, "shutdown_stream_read",
+                   rb_nghttp3_connection_shutdown_stream_read, 1);
+  rb_define_method(rb_cNghttp3Connection, "set_max_client_streams_bidi",
+                   rb_nghttp3_connection_set_max_client_streams_bidi, 1);
   rb_define_method(rb_cNghttp3Connection, "pending_data",
                    rb_nghttp3_connection_pending_data, 1);
 

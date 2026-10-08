@@ -26,9 +26,10 @@ module Nghttp3
 
     # Stream operations
 
-    # Reads data on a stream from the QUIC layer. An exception raised by a
-    # callback comes out of here.
-    def read_stream: (Integer stream_id, String data, ?fin: bool) -> Integer
+    # Reads data on a stream from the QUIC layer. ts is the time in
+    # nanoseconds on a monotonic clock (CLOCK_MONOTONIC by default). An
+    # exception raised by a callback comes out of here.
+    def read_stream: (Integer stream_id, String data, ?fin: bool, ?ts: Integer?) -> Integer
 
     # Gets stream data to send to the QUIC layer. An exception raised by a
     # body block comes out of here.
@@ -57,6 +58,13 @@ module Nghttp3
 
     # Resumes a stream that was blocked for input data
     def resume_stream: (Integer stream_id) -> self
+
+    # Tells the connection that no more data will be read on the stream
+    def shutdown_stream_read: (Integer stream_id) -> self
+
+    # Tells a server connection how many bidirectional streams the client
+    # may open in total
+    def set_max_client_streams_bidi: (Integer max_streams) -> self
 
     # The body Strings handed to nghttp3 that the peer has not acknowledged
     # in full yet, oldest first (a copy)

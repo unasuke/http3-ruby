@@ -93,6 +93,27 @@ class TestNghttp3Safety < Minitest::Test
     assert_equal "compact me", received
   end
 
+  def test_read_stream_takes_a_timestamp
+    client = new_client
+    client.submit_request(REQUEST_STREAM, request_headers)
+    server = new_server
+    while (out = client.writev_stream)
+      consumed = server.read_stream(out[:stream_id], out[:data], fin: out[:fin], ts: 42)
+      assert_kind_of Integer, consumed
+      client.add_write_offset(out[:stream_id], out[:data].bytesize)
+    end
+  end
+
+  def test_shutdown_stream_read_and_set_max_client_streams_bidi
+    client = new_client
+    client.submit_request(REQUEST_STREAM, request_headers)
+    server = new_server
+    transfer(client, server)
+
+    assert_same server, server.shutdown_stream_read(REQUEST_STREAM)
+    assert_same server, server.set_max_client_streams_bidi(100)
+  end
+
   private
 
   def new_client(callbacks = nil)
