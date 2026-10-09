@@ -5,6 +5,7 @@ require "http3"
 
 require "minitest/autorun"
 require "fileutils"
+require "logger"
 require "openssl"
 require "rbconfig"
 require "tmpdir"
@@ -24,11 +25,12 @@ module TestCertificates
     @credentials ||= generate_credentials
   end
 
-  # A new set in a new temporary directory, removed after the run.
-  def self.generate_credentials
+  # A new set under a CA of its own, in dir (a new temporary directory,
+  # removed after the run, when nil).
+  def self.generate_credentials(ca_common_name: "http3 test CA", dir: nil)
     now = Time.now
     ca_key = OpenSSL::PKey::EC.generate("prime256v1")
-    ca_name = OpenSSL::X509::Name.parse("/CN=http3 test CA")
+    ca_name = OpenSSL::X509::Name.parse("/CN=#{ca_common_name}")
     ca_cert = OpenSSL::X509::Certificate.new
     ca_cert.version = 2
     ca_cert.serial = 1
@@ -56,8 +58,10 @@ module TestCertificates
     cert.add_extension(factory.create_extension("extendedKeyUsage", "serverAuth"))
     cert.sign(ca_key, OpenSSL::Digest.new("SHA256"))
 
-    dir = Dir.mktmpdir("http3-test-")
-    Minitest.after_run { FileUtils.remove_entry(dir) }
+    if dir.nil?
+      dir = Dir.mktmpdir("http3-test-")
+      Minitest.after_run { FileUtils.remove_entry(dir) }
+    end
     credentials = Credentials.new(
       ca_file: File.join(dir, "ca.pem"),
       certificate_path: File.join(dir, "server.pem"),
@@ -70,11 +74,41 @@ module TestCertificates
   end
 end
 
-# HTTP3::Server in a process of its own, so that a test can watch its
-# memory without measuring itself.
+# HTTP3::Server in a child process, so that a test can send it signals and
+# watch its memory without measuring itself.
 module TestServerProcess
   START_TIMEOUT = 10
   STOP_TIMEOUT = 15
+
+  # Fork a child serving the Rack app the block builds (in the child) on
+  # 127.0.0.1 and an unused port; returns [pid, port]. The server logs to
+  # log_path.
+  def start_server(log_path:, **options, &build_app)
+    reader, writer = IO.pipe
+    pid = fork do
+      reader.close
+      server = HTTP3::Server.new(app: build_app.call, bind: "127.0.0.1:0", logger: Logger.new(log_path), **options)
+      Thread.new do
+        sleep 0.01 until server.local_address
+        writer.puts(server.local_address.ip_port)
+        writer.close
+      end
+      server.run
+      # Not exit: the parent's at_exit hooks (Minitest's included) must not
+      # run here.
+      exit!(0)
+    rescue Exception => e # rubocop:disable Lint/RescueException
+      warn e.full_message
+      exit!(1)
+    end
+    writer.close
+    raise "the server did not start" unless reader.wait_readable(START_TIMEOUT)
+
+    port = Integer(reader.gets, 10)
+    [pid, port]
+  ensure
+    reader&.close
+  end
 
   # Run the server script in a new Ruby process with args; returns
   # [pid, port] once the script has printed its port.

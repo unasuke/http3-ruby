@@ -35,6 +35,9 @@ module H3TestClient
     # @return [Hash{Integer => Request}] pending requests by stream ID
     attr_reader :pending_requests
 
+    # The stream ID the server's GOAWAY carried, or nil if none came
+    attr_reader :goaway_id
+
     # Create a new HTTP/3 client
     # @param settings [Settings, nil] settings to use (defaults to HTTP3::Nghttp3::Settings.default)
     def initialize(settings: nil)
@@ -190,6 +193,7 @@ module H3TestClient
         .on_recv_data { |stream_id, data| on_recv_data(stream_id, data) }
         .on_end_stream { |stream_id| on_end_stream(stream_id) }
         .on_stream_close { |stream_id, app_error_code| on_stream_close(stream_id, app_error_code) }
+        .on_shutdown { |id| @goaway_id = id }
     end
 
     def on_begin_headers(stream_id)
