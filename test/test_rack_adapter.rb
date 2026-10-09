@@ -1,0 +1,115 @@
+# frozen_string_literal: true
+
+require "test_helper"
+require "socket"
+
+# HTTP3::RackAdapter's conversions, without a connection.
+class TestRackAdapter < Minitest::Test
+  REMOTE = Addrinfo.udp("198.51.100.7", 51_234)
+
+  def test_env_from_pseudo_headers
+    env = env_for([[":path", "/a/b?x=1&y=2"], [":authority", "example.com:8443"]])
+    assert_equal "GET", env["REQUEST_METHOD"]
+    assert_equal "/a/b", env["PATH_INFO"]
+    assert_equal "x=1&y=2", env["QUERY_STRING"]
+    assert_equal "example.com", env["SERVER_NAME"]
+    assert_equal "8443", env["SERVER_PORT"]
+    assert_equal "example.com:8443", env["HTTP_HOST"]
+    assert_equal "https", env["rack.url_scheme"]
+    assert_equal "HTTP/3", env["SERVER_PROTOCOL"]
+    assert_equal "198.51.100.7", env["REMOTE_ADDR"]
+  end
+
+  def test_repeated_fields_are_joined_and_cookies_with_semicolons
+    env = env_for([["accept", "a"], ["accept", "b"], ["cookie", "x=1"], ["cookie", "y=2"],
+      ["content-type", "text/plain"]])
+    assert_equal "a, b", env["HTTP_ACCEPT"]
+    assert_equal "x=1; y=2", env["HTTP_COOKIE"]
+    assert_equal "text/plain", env["CONTENT_TYPE"]
+    refute env.key?("HTTP_CONTENT_TYPE")
+  end
+
+  # "x_forwarded_for" must not pass for "x-forwarded-for".
+  def test_fields_with_underscores_are_dropped
+    env = env_for([["x_forwarded_for", "203.0.113.9"], ["content_type", "text/evil"], ["x-real", "ok"]])
+    refute env.key?("HTTP_X_FORWARDED_FOR")
+    refute env.key?("HTTP_CONTENT_TYPE")
+    refute env.key?("CONTENT_TYPE")
+    assert_equal "ok", env["HTTP_X_REAL"]
+  end
+
+  def test_connection_specific_response_fields_are_dropped_and_arrays_split
+    response = respond([200, {"connection" => "close", "set-cookie" => ["a=1", "b=2"]}, ["x"]])
+    assert_equal [["set-cookie", "a=1"], ["set-cookie", "b=2"]], response.headers
+  end
+
+  def test_uppercase_response_field_names_are_refused_and_the_body_closed
+    body = ClosableBody.new
+    assert_raises(HTTP3::RackAdapter::InvalidResponse) { respond([200, {"Content-Type" => "text/plain"}, body]) }
+    assert body.closed
+  end
+
+  def test_head_and_204_have_no_body_and_close_it
+    body = ClosableBody.new
+    assert_nil respond([200, {}, body], method: "HEAD").body
+    assert body.closed
+    assert_nil respond([204, {}, ["ignored"]]).body
+  end
+
+  def test_body_kinds
+    assert_kind_of HTTP3::Body::Chunks, respond([200, {}, ["a", "b"]]).body
+    assert_kind_of HTTP3::Body::Chunks, respond([200, {}, ClosableBody.new]).body
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "file")
+      File.write(path, "content")
+      body = respond([200, {}, PathBody.new(path)]).body
+      assert_kind_of HTTP3::Body::File, body
+      assert_equal 7, body.length
+      body.io.close
+    end
+    assert_raises(HTTP3::RackAdapter::InvalidResponse) { respond([200, {}, ->(stream) {}]) }
+  end
+
+  ClosableBody = Struct.new(:closed) do
+    def each
+      yield "chunk"
+    end
+
+    def close
+      self.closed = true
+    end
+  end
+
+  PathBody = Struct.new(:to_path) do
+    def each
+      yield File.binread(to_path)
+    end
+  end
+
+  private
+
+  def request(headers, method: "GET")
+    HTTP3::Request.new(
+      stream_id: 0,
+      headers: [[":method", method], [":scheme", "https"], *headers.select { |name, _| name.start_with?(":") },
+        *headers.reject { |name, _| name.start_with?(":") }],
+      body: "".b
+    )
+  end
+
+  def env_for(headers)
+    env = nil
+    adapter = HTTP3::RackAdapter.new(lambda do |e|
+      env = e
+      [200, {}, []]
+    end)
+    headers = [[":path", "/"], [":authority", "localhost"], *headers] unless headers.assoc(":path")
+    adapter.call(request(headers), remote: REMOTE)
+    env
+  end
+
+  def respond(triple, method: "GET")
+    adapter = HTTP3::RackAdapter.new(->(_env) { triple })
+    adapter.call(request([[":path", "/"], [":authority", "localhost"]], method: method), remote: REMOTE)
+  end
+end
