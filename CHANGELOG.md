@@ -10,7 +10,7 @@
 ### Changed
 - The gem is now `http3` (`require "http3"`), and the top-level namespace is `HTTP3`. The nghttp3 bindings move from `Nghttp3` to `HTTP3::Nghttp3`. No `Nghttp3` alias is left behind. ([#3](https://github.com/unasuke/nghttp3-ruby/pull/3))
 - nghttp3 is no longer taken from the system. Version 1.13.1 is downloaded and built at install time with mini_portile2 and linked statically, so `libnghttp3-dev` is no longer needed. http3.so exports only `Init_http3`; the nghttp3 symbols stay hidden. ([#3](https://github.com/unasuke/nghttp3-ruby/pull/3))
-- Ruby 3.3 or later is required. ([#3](https://github.com/unasuke/nghttp3-ruby/pull/3))
+- Ruby 3.3 or later is required, and only Linux is supported. ([#3](https://github.com/unasuke/nghttp3-ruby/pull/3))
 - http3 depends on the quic gem (`~> 0.0.3`) and, when loaded, looks up the C function table it publishes in `quic/ext.h`. A quic gem without a compatible table makes `require "http3"` raise `LoadError` naming the ABI version needed and the quic version found. ([#4](https://github.com/unasuke/http3-ruby/pull/4))
 
 ### Removed
