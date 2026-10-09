@@ -1,0 +1,32 @@
+name: interop
+
+on:
+  schedule:
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+
+jobs:
+  curl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake libtool pkg-config build-essential libssl-dev
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1.321.0
+        with:
+          ruby-version: '4.0'
+          bundler-cache: true
+      - name: Cache vendored ports
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: tmp
+          key: ports-${{ runner.os }}-nghttp3-1.13.1-${{ hashFiles('ext/http3/extconf.rb') }}
+      - name: Compile
+        run: bundle exec rake compile
+      - name: curl --http3-only against the server
+        run: test/interop/curl.sh
