@@ -24,6 +24,10 @@
 - `Connection.client_new` and `.server_new` raise `TypeError` for callbacks that are not an `HTTP3::Nghttp3::Callbacks`, instead of crashing in the first callback. ([#2](https://github.com/unasuke/nghttp3-ruby/pull/2))
 - The GC could crash collecting an `HTTP3::Nghttp3::QPACK::Decoder`: freeing its stream contexts walked a Hash the GC might already have freed, and read the contexts' addresses wrongly from it. ([#2](https://github.com/unasuke/nghttp3-ruby/pull/2))
 
-## [0.1.0] - 2025-12-19
+## [0.0.2] - 2026-10-13
 
-- Initial release
+- The last release as the `nghttp3` gem: its description says that the gem is no longer maintained. The code is that of 0.0.1.
+
+## [0.0.1] - 2026-01-31
+
+- Initial release, as the `nghttp3` gem
