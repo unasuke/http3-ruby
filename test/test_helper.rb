@@ -4,3 +4,4 @@ $LOAD_PATH.unshift File.expand_path("../lib", __dir__)
 require "http3"
 
 require "minitest/autorun"
+require_relative "support/h3_client"
