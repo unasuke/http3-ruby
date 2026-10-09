@@ -1,8 +1,9 @@
 # Interoperability checks
 
 The fourth tier of the tests: http3-ruby against other HTTP/3 and QUIC
-implementations. They need containers, so `rake test` does not run them.
-`curl.sh` also runs weekly in CI (`.github/workflows/interop.yml`).
+implementations. They need containers or browsers, so `rake test` does not
+run them. `curl.sh` also runs weekly in CI (`.github/workflows/interop.yml`);
+the rest is manual.
 
 All of them use `server.rb`, which serves a directory with `Rack::Files`:
 
@@ -31,3 +32,53 @@ a 404. It uses docker, or podman when docker is missing
 ```sh
 test/interop/curl.sh
 ```
+
+## h3i
+
+[h3i](https://github.com/cloudflare/quiche/tree/master/h3i) sends hand-made
+HTTP/3 frames, for what a well-behaved client never does: oversized or
+malformed header sections, frames on the wrong stream, a request stream
+reset half way.
+
+```sh
+cargo install --git https://github.com/cloudflare/quiche h3i
+h3i 127.0.0.1:4433 --no-verify
+```
+
+Things worth checking: a header section over `max_field_section_size`
+(64 KiB) gets 431, a body over `max_request_body` (1 MiB) gets 413, and a
+protocol error closes only that connection (the server logs
+`connection_error` and keeps serving).
+
+## quic-interop-runner
+
+[quic-interop-runner](https://github.com/quic-interop/quic-interop-runner)
+runs the server role through its network simulator. `Dockerfile` builds the
+endpoint and `run_endpoint.sh` implements the `http3` test case; every other
+case uses the hq-interop ALPN, which HTTP3::Server does not speak, so it
+exits 127 (unsupported).
+
+```sh
+docker build -f test/interop/Dockerfile -t http3-ruby-interop .
+# In a quic-interop-runner checkout, add to implementations_quic.json:
+#   "http3-ruby": {"image": "http3-ruby-interop", "url": "https://github.com/unasuke/http3-ruby", "role": "server"}
+python3 run.py -s http3-ruby -c ngtcp2 -t http3
+```
+
+## Browsers
+
+Chrome, trusting the certificate by its public key:
+
+```sh
+spki=$(openssl x509 -in cert.pem -pubkey -noout | openssl pkey -pubin -outform der \
+  | openssl dgst -sha256 -binary | base64)
+google-chrome --user-data-dir=$(mktemp -d) --origin-to-force-quic-on=localhost:4433 \
+  --ignore-certificate-errors-spki-list="$spki" https://localhost:4433/
+```
+
+Firefox: in `about:config`, set `network.http.http3.alt-svc-mapping-for-testing`
+to `localhost;h3=":4433"` and `network.http.http3.disable_when_third_party_roots_found`
+to `false`, import `cert.pem` as an authority, then open
+`https://localhost:4433/`.
+
+In the developer tools, the Network panel's Protocol column should read h3.
