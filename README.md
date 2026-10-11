@@ -67,7 +67,8 @@ Other options, with their defaults:
 
 Response bodies may be files (`to_path`, sent 16 KiB at a time as the
 connection takes them), arrays or anything with `each`. Streaming bodies
-(`call`) are not supported and get 500.
+(`call`) are not supported and get 500, as do response headers whose names
+are not lowercase tokens or whose values contain NUL, CR or LF.
 
 ### Signals
 
