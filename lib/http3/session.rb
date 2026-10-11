@@ -36,7 +36,8 @@ module HTTP3
     end
 
     # Send response to request. Its body, if any, is kept until the stream
-    # closes.
+    # closes, but the IO of a Body::File is closed at once: the C part reads
+    # the file through a descriptor of its own.
     def respond(request, response)
       headers = [[":status", response.status.to_s], *response.headers]
       body = response.body
@@ -44,7 +45,13 @@ module HTTP3
       return if body.nil?
 
       @outgoing[request.stream_id] = Outgoing.new(request, body, false)
-      attach_file(request.stream_id, body.io, body.offset, body.length) if body.is_a?(Body::File)
+      return unless body.is_a?(Body::File)
+
+      begin
+        attach_file(request.stream_id, body.io, body.offset, body.length)
+      ensure
+        body.io.close
+      end
     end
 
     # Queue more of each Body::Chunks body until limit bytes wait unsent on

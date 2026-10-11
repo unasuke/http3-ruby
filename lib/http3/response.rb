@@ -8,7 +8,8 @@ module HTTP3
 
   module Body
     # length bytes of io from offset, read by the C part of the Session as
-    # the connection can take them. The Session closes io, and rack_body
+    # the connection can take them, through a descriptor of its own. The
+    # Session closes io once the C part has that descriptor, and rack_body,
     # unless it is nil, when the stream ends.
     File = Data.define(:io, :offset, :length, :rack_body)
 
