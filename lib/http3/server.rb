@@ -154,7 +154,7 @@ module HTTP3
         session.take_requests.each do |request, status|
           response = status ? Response.new(status: status, headers: [], body: nil) : call_app(conn, request)
           begin
-            session.respond(request, response)
+            session.respond(request, response) { |error| log_body_error(conn, request, error) }
           rescue Nghttp3::Error
             # The stream went away while the application ran.
             discard_body(response.body)
@@ -307,6 +307,11 @@ module HTTP3
       path = pseudo.fetch(":path", "")[/\A[^?]*/]
       log(:error, "app_error", remote: remote_of(conn), stream: request.stream_id, method: pseudo[":method"],
         path: path, **error_fields(error))
+    end
+
+    def log_body_error(conn, request, error)
+      log(:error, "body_error", remote: remote_of(conn), stream: request.stream_id, error: error.class,
+        message: error.message)
     end
 
     def log_body_close_error(stream_id, error)

@@ -12,7 +12,9 @@ module HTTP3
     # (413, 431) or nil for the application to answer it.
     def take_requests: () -> Array[[Request, Integer?]]
 
-    def respond: (Request request, Response response) -> void
+    # Send response. Yields the exception of a file body whose descriptor
+    # could not be duplicated; its stream is aborted.
+    def respond: (Request request, Response response) ?{ (SystemCallError error) -> void } -> void
 
     # Queue more of each Body::Chunks body, up to limit unsent bytes per
     # stream. Yields the request and exception of a body that raised.

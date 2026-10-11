@@ -37,7 +37,9 @@ module HTTP3
 
     # Send response to request. Its body, if any, is kept until the stream
     # closes, but the IO of a Body::File is closed at once: the C part reads
-    # the file through a descriptor of its own.
+    # the file through a descriptor of its own. When that descriptor cannot
+    # be had (EMFILE, say), the stream is aborted with H3_INTERNAL_ERROR and
+    # the block gets the exception.
     def respond(request, response)
       headers = [[":status", response.status.to_s], *response.headers]
       body = response.body
@@ -49,6 +51,9 @@ module HTTP3
 
       begin
         attach_file(request.stream_id, body.io, body.offset, body.length)
+      rescue SystemCallError => e
+        abort_stream(request.stream_id, Nghttp3::H3_INTERNAL_ERROR)
+        yield e if block_given?
       ensure
         body.io.close
       end
