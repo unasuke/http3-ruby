@@ -866,7 +866,9 @@ static VALUE rb_http3_session_push_eof(VALUE self, VALUE rb_id) {
  *   session.attach_file(stream_id, io, offset, length) -> self
  *
  * Send length bytes of io from offset as the whole response body. The
- * descriptor is duplicated, so io may be closed afterwards.
+ * descriptor is duplicated, so io may be closed afterwards. The duplicate
+ * is close-on-exec, as Ruby's own descriptors are, so that a process the
+ * application spawns does not inherit it.
  */
 static VALUE rb_http3_session_attach_file(VALUE self, VALUE rb_id, VALUE io,
                                           VALUE offset, VALUE length) {
@@ -880,10 +882,11 @@ static VALUE rb_http3_session_attach_file(VALUE self, VALUE rb_id, VALUE io,
   if (off < 0 || len < 0) {
     rb_raise(rb_eArgError, "offset and length must not be negative");
   }
-  int fd = dup(NUM2INT(rb_funcall(io, rb_intern("fileno"), 0)));
+  int fd = rb_cloexec_dup(NUM2INT(rb_funcall(io, rb_intern("fileno"), 0)));
   if (fd < 0) {
     rb_sys_fail("dup");
   }
+  rb_update_max_fd(fd);
   st->fd = fd;
   st->file_off = off;
   st->file_end = off + len;
