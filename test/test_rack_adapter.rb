@@ -49,6 +49,21 @@ class TestRackAdapter < Minitest::Test
     assert body.closed
   end
 
+  # nghttp3 would send these as they are: a value with CR or LF could
+  # become fields of its own behind a proxy, ":status" a pseudo-header.
+  def test_response_fields_http3_cannot_carry_are_refused
+    [":status", "x a", "x\r\nset-cookie", ""].each do |name|
+      assert_raises(HTTP3::RackAdapter::InvalidResponse, name.inspect) { respond([200, {name => "v"}, []]) }
+    end
+    ["a\r\nset-cookie: session=1", "a\nb", "a\0b", ["ok", "a\rb"]].each do |value|
+      error = assert_raises(HTTP3::RackAdapter::InvalidResponse, value.inspect) do
+        respond([200, {"x-a" => value}, []])
+      end
+      refute_match(/session=1/, error.message)
+    end
+    assert_equal [["x-a", "tab\tand space"]], respond([200, {"x-a" => "tab\tand space"}, []]).headers
+  end
+
   def test_head_and_204_have_no_body_and_close_it
     body = ClosableBody.new
     assert_nil respond([200, {}, body], method: "HEAD").body
