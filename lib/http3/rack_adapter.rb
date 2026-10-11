@@ -14,6 +14,13 @@ module HTTP3
     # 4.2).
     CONNECTION_FIELDS = %w[connection keep-alive transfer-encoding upgrade proxy-connection].freeze
 
+    # A response field name: a token (RFC 9110 section 5.6.2), lowercase.
+    FIELD_NAME = /\A[!#$%&'*+\-.^_`|~0-9a-z]+\z/
+
+    # What a field value must not hold (RFC 9114 section 4.2, and the Rack 3
+    # specification).
+    FORBIDDEN_IN_VALUE = /[\0\r\n]/
+
     def initialize(app)
       @app = app
     end
@@ -111,15 +118,25 @@ module HTTP3
     end
 
     # Rack 3 headers: lowercase names, each value a String or an Array of
-    # them, one field per element.
+    # them, one field per element. nghttp3 sends names and values as they
+    # are, so a name that is not a token (":status", say) or a value with
+    # NUL, CR or LF would reach the client, or a proxy that turns the
+    # response into HTTP/1.1, as fields the application never meant. The
+    # message leaves the value out, since it goes to the log.
     def header_pairs(headers)
       pairs = []
       headers.each do |name, value|
         name = name.to_s
         raise InvalidResponse, "header name #{name.inspect} has uppercase letters" if name.match?(/[A-Z]/)
+        raise InvalidResponse, "header name #{name.inspect} is not a token" unless name.match?(FIELD_NAME)
         next if CONNECTION_FIELDS.include?(name)
 
-        Array(value).each { |v| pairs << [name, v.to_s] }
+        Array(value).each do |v|
+          v = v.to_s
+          raise InvalidResponse, "header #{name} has NUL, CR or LF in its value" if v.match?(FORBIDDEN_IN_VALUE)
+
+          pairs << [name, v]
+        end
       end
       pairs
     end

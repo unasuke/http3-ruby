@@ -6,6 +6,8 @@ module HTTP3
     end
 
     CONNECTION_FIELDS: Array[String]
+    FIELD_NAME: Regexp
+    FORBIDDEN_IN_VALUE: Regexp
 
     def initialize: (untyped app) -> void
 
