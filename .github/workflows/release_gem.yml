@@ -1,0 +1,59 @@
+on:
+  workflow_dispatch:
+
+jobs:
+  release:
+    # By owner rather than by name, so that the job keeps running if the
+    # repository is renamed; forks skip it either way.
+    if: github.repository_owner == 'unasuke'
+    # The extension links the system's nghttp3. Ubuntu 24.04, which is still
+    # ubuntu-latest, ships libnghttp3 0.8.0, too old for it; 26.04 ships 1.12.0.
+    runs-on: ubuntu-26.04
+
+    environment:
+      name: rubygems.org
+      url: https://rubygems.org/gems/nghttp3
+
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install nghttp3
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libnghttp3-dev
+
+      - uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1.321.0
+        with:
+          ruby-version: ruby
+
+      # Deliberately without bundler-cache, which installs into ./vendor/bundle.
+      # vendor/ is not gitignored, so the untracked tree would trip
+      # release:guard_clean further down; BUNDLE_FROZEN keeps this install from
+      # rewriting Gemfile.lock, which would trip it too.
+      - name: Install host gems
+        run: BUNDLE_FROZEN=true bundle install
+
+      # Makes the build: :compile dependency of rake release a no-op, so that
+      # the build runs before release-gem asks for a trusted publishing API
+      # key, which expires 15 minutes after it is issued.
+      - name: Compile extension on host
+        run: bundle exec rake compile
+
+      # Tags from lib/nghttp3/version.rb, pushes the gem. The gem is source
+      # only; there is no precompiled platform gem to build or push alongside it.
+      - uses: rubygems/release-gem@7f9650160c1a4e7989fdc9855807bdbd421d8b6b # v1.4.1
+
+      - name: Create GitHub release
+        run: |
+          tag_name="$(git describe --tags --abbrev=0)"
+          gh release create "${tag_name}" --verify-tag --generate-notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
