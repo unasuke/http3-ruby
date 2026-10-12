@@ -241,33 +241,25 @@ static VALUE rb_nghttp3_qpack_encoder_get_num_blocked_streams(VALUE self) {
 
 typedef struct {
   nghttp3_qpack_decoder *decoder;
-  VALUE stream_contexts; /* Hash: stream_id => nghttp3_qpack_stream_context* */
+  /* stream_id => nghttp3_qpack_stream_context *, in a C st_table: dfree
+   * runs during GC, when a Ruby Hash may already be freed. */
+  st_table *stream_contexts;
   size_t hard_max_dtable_capacity;
   size_t max_blocked_streams;
 } DecoderObj;
 
-static void decoder_mark(void *ptr) {
-  DecoderObj *obj = (DecoderObj *)ptr;
-  if (obj->stream_contexts != Qnil) {
-    rb_gc_mark(obj->stream_contexts);
-  }
-}
-
-/* Callback to free stream contexts */
-static int free_stream_context_i(VALUE key, VALUE val, VALUE arg) {
-  nghttp3_qpack_stream_context *sctx = (nghttp3_qpack_stream_context *)val;
-  if (sctx != NULL) {
-    nghttp3_qpack_stream_context_del(sctx);
-  }
+static int free_stream_context_i(st_data_t key, st_data_t value,
+                                 st_data_t arg) {
+  nghttp3_qpack_stream_context_del((nghttp3_qpack_stream_context *)value);
   return ST_CONTINUE;
 }
 
 static void decoder_free(void *ptr) {
   DecoderObj *obj = (DecoderObj *)ptr;
 
-  /* Free all stream contexts */
-  if (!NIL_P(obj->stream_contexts)) {
-    rb_hash_foreach(obj->stream_contexts, free_stream_context_i, Qnil);
+  if (obj->stream_contexts != NULL) {
+    st_foreach(obj->stream_contexts, free_stream_context_i, 0);
+    st_free_table(obj->stream_contexts);
   }
 
   if (obj->decoder != NULL) {
@@ -277,13 +269,17 @@ static void decoder_free(void *ptr) {
   xfree(ptr);
 }
 
-static size_t decoder_memsize(const void *ptr) { return sizeof(DecoderObj); }
+static size_t decoder_memsize(const void *ptr) {
+  const DecoderObj *obj = (const DecoderObj *)ptr;
+  return sizeof(DecoderObj) +
+         (obj->stream_contexts != NULL ? st_memsize(obj->stream_contexts) : 0);
+}
 
 static const rb_data_type_t decoder_data_type = {
     .wrap_struct_name = "nghttp3_qpack_decoder_rb",
     .function =
         {
-            .dmark = decoder_mark,
+            .dmark = NULL,
             .dfree = decoder_free,
             .dsize = decoder_memsize,
         },
@@ -295,7 +291,7 @@ static VALUE decoder_alloc(VALUE klass) {
   VALUE self =
       TypedData_Make_Struct(klass, DecoderObj, &decoder_data_type, obj);
   obj->decoder = NULL;
-  obj->stream_contexts = Qnil;
+  obj->stream_contexts = st_init_numtable();
   obj->hard_max_dtable_capacity = 0;
   obj->max_blocked_streams = 0;
   return self;
@@ -320,7 +316,6 @@ static VALUE rb_nghttp3_qpack_decoder_initialize(VALUE self,
   max_blocked = NUM2SIZET(rb_max_blocked);
   obj->hard_max_dtable_capacity = max_capacity;
   obj->max_blocked_streams = max_blocked;
-  obj->stream_contexts = rb_hash_new();
 
   rv = nghttp3_qpack_decoder_new(&obj->decoder, max_capacity, max_blocked,
                                  nghttp3_mem_default());
@@ -337,18 +332,10 @@ static VALUE rb_nghttp3_qpack_decoder_initialize(VALUE self,
  */
 static nghttp3_qpack_stream_context *
 get_or_create_stream_context(DecoderObj *obj, int64_t stream_id) {
-  VALUE rb_stream_id = LL2NUM(stream_id);
-  VALUE existing;
+  st_data_t existing;
 
-  if (NIL_P(obj->stream_contexts)) {
-    return NULL;
-  }
-
-  existing = rb_hash_aref(obj->stream_contexts, rb_stream_id);
-
-  if (existing != Qnil && existing != Qfalse && existing != INT2FIX(0)) {
-    /* Return existing context */
-    return (nghttp3_qpack_stream_context *)NUM2ULL(existing);
+  if (st_lookup(obj->stream_contexts, (st_data_t)stream_id, &existing)) {
+    return (nghttp3_qpack_stream_context *)existing;
   }
 
   /* Create new context */
@@ -360,10 +347,19 @@ get_or_create_stream_context(DecoderObj *obj, int64_t stream_id) {
     return NULL;
   }
 
-  /* Store as Integer (pointer value) */
-  rb_hash_aset(obj->stream_contexts, rb_stream_id, ULL2NUM((uintptr_t)sctx));
+  st_insert(obj->stream_contexts, (st_data_t)stream_id, (st_data_t)sctx);
 
   return sctx;
+}
+
+/* Free the stream context for stream_id, if there is one. */
+static void delete_stream_context(DecoderObj *obj, int64_t stream_id) {
+  st_data_t key = (st_data_t)stream_id;
+  st_data_t value;
+
+  if (st_delete(obj->stream_contexts, &key, &value)) {
+    nghttp3_qpack_stream_context_del((nghttp3_qpack_stream_context *)value);
+  }
 }
 
 /*
@@ -451,17 +447,7 @@ static VALUE rb_nghttp3_qpack_decoder_decode(int argc, VALUE *argv,
     }
 
     if (flags & NGHTTP3_QPACK_DECODE_FLAG_FINAL) {
-      /* Remove stream context */
-      if (!NIL_P(obj->stream_contexts)) {
-        VALUE rb_sid = LL2NUM(stream_id);
-        VALUE ctx_val = rb_hash_aref(obj->stream_contexts, rb_sid);
-        if (!NIL_P(ctx_val)) {
-          nghttp3_qpack_stream_context *old_sctx =
-              (nghttp3_qpack_stream_context *)NUM2ULL(ctx_val);
-          nghttp3_qpack_stream_context_del(old_sctx);
-          rb_hash_delete(obj->stream_contexts, rb_sid);
-        }
-      }
+      delete_stream_context(obj, stream_id);
       break;
     }
 
@@ -568,17 +554,7 @@ static VALUE rb_nghttp3_qpack_decoder_cancel_stream(VALUE self,
 
   stream_id = NUM2LL(rb_stream_id);
 
-  /* Remove stream context */
-  if (!NIL_P(obj->stream_contexts)) {
-    VALUE rb_sid = LL2NUM(stream_id);
-    VALUE ctx_val = rb_hash_aref(obj->stream_contexts, rb_sid);
-    if (!NIL_P(ctx_val)) {
-      nghttp3_qpack_stream_context *sctx =
-          (nghttp3_qpack_stream_context *)NUM2ULL(ctx_val);
-      nghttp3_qpack_stream_context_del(sctx);
-      rb_hash_delete(obj->stream_contexts, rb_sid);
-    }
-  }
+  delete_stream_context(obj, stream_id);
 
   rv = nghttp3_qpack_decoder_cancel_stream(obj->decoder, stream_id);
 

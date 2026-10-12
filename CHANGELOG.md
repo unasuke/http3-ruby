@@ -10,6 +10,7 @@
 - A body String is copied and frozen when submitted, and pinned until acknowledged, so neither the application nor `GC.compact` can change the bytes nghttp3 still reads.
 - `GC.compact` could move a connection while nghttp3 held its address for callbacks. nghttp3 now gets a pointer to the C struct instead.
 - `Connection.client_new` and `.server_new` raise `TypeError` for callbacks that are not an `Nghttp3::Callbacks`, instead of crashing in the first callback.
+- The GC could crash collecting a `Nghttp3::QPACK::Decoder`: freeing its stream contexts walked a Hash the GC might already have freed, and read the contexts' addresses wrongly from it.
 
 ## [0.1.0] - 2025-12-19
 
