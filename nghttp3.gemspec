@@ -9,7 +9,7 @@ Gem::Specification.new do |spec|
   spec.email = ["yusuke1994525@gmail.com"]
 
   spec.summary = "[WIP] Ruby bindings for nghttp3, an HTTP/3 library"
-  spec.description = "[WIP] Ruby bindings for nghttp3, a C library implementing HTTP/3 mapping over QUIC and QPACK encoder/decoder."
+  spec.description = "This gem is no longer maintained. [WIP] Ruby bindings for nghttp3, a C library implementing HTTP/3 mapping over QUIC and QPACK encoder/decoder."
   spec.homepage = "https://github.com/unasuke/nghttp3"
   spec.license = "MIT"
   spec.required_ruby_version = ">= 3.2.0"
