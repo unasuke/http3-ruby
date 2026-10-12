@@ -63,19 +63,23 @@ class TestServerSignals < Minitest::Test
   end
 
   # GOAWAY reaches the client before the connection closes, and the server
-  # exits once nothing is under way.
+  # exits once nothing is under way. The client keeps pumping until then:
+  # the server counts the request stream as under way until the client
+  # acknowledges the end of the response, and that acknowledgement may
+  # still be waiting for its delay to pass when GOAWAY arrives.
   def test_sigterm_sends_goaway_and_exits
     client = connect(@old.ca_file)
     assert_equal "ok", get(client, "/").body
 
     Process.kill("TERM", @pid)
+    status = nil
     begin
-      client.pump_until { client.client.goaway_id }
+      client.pump_until(timeout: STOP_TIMEOUT) { status = Process.wait2(@pid, Process::WNOHANG)&.last }
     rescue QUIC::Error::Closed
       client.feed
     end
     refute_nil client.client.goaway_id
-    assert_predicate wait_server(@pid), :success?
+    assert_predicate status || wait_server(@pid), :success?
     @pid = nil
   end
 
