@@ -30,6 +30,15 @@ append_cflags("-DNGHTTP3_STATICLIB")
 abort "nghttp3/nghttp3.h not found" unless have_header("nghttp3/nghttp3.h")
 abort "libnghttp3 not linkable" unless have_func("nghttp3_version", "nghttp3/nghttp3.h")
 
+# The quic gem's C function table, through which HTTP3::Session drives a
+# QUIC connection. The header ships in the quic gem; the table itself is
+# looked up at load time with rb_ext_resolve_symbol (Ruby 3.3 or later).
+require "quic/ext_include"
+append_cppflags("-I#{QUIC::EXT_INCLUDE_DIR}")
+abort "quic/ext.h not found (the quic gem 0.0.3 or later provides it)" unless have_header("quic/ext.h")
+abort "rb_ext_resolve_symbol not found (Ruby 3.3 or later is required)" unless
+  have_func("rb_ext_resolve_symbol", "ruby.h")
+
 # Makes all symbols private by default to avoid unintended conflict
 # with other gems. To explicitly export symbols you can use RUBY_FUNC_EXPORTED
 # selectively, or entirely remove this flag.
