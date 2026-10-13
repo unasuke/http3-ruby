@@ -109,6 +109,19 @@ class TestNghttp3QPACK < Minitest::Test
     # Should not raise
   end
 
+  # The GC frees the stream contexts of a Decoder it collects, here for
+  # field sections only begun. A child process does this, so that a crash
+  # fails this test alone.
+  def test_decoder_holding_stream_contexts_is_collected
+    pid = fork do
+      100.times { Nghttp3::QPACK::Decoder.new(4096, 100).decode(0, "\x00".b) }
+      GC.start
+      exit!(0)
+    end
+    _, status = Process.wait2(pid)
+    assert_predicate status, :success?
+  end
+
   # ============== Roundtrip tests ==============
 
   def test_encode_decode_roundtrip_static_table_only
