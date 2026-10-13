@@ -5,6 +5,7 @@
 - `HTTP3::Session`, HTTP/3 on one `QUIC::Connection::Server` through the quic gem's C function table; `HTTP3::RackAdapter`; and `HTTP3::Request`, `HTTP3::Response` and `HTTP3::Body`, the data passed between them. ([#5](https://github.com/unasuke/http3-ruby/pull/5))
 - `HTTP3::Nghttp3::Connection#read_stream` takes `ts:`, the time in nanoseconds for nghttp3's rate limits (CLOCK_MONOTONIC by default), and now calls `nghttp3_conn_read_stream2`. ([#2](https://github.com/unasuke/nghttp3-ruby/pull/2))
 - `HTTP3::Nghttp3::Connection#shutdown_stream_read`, `#set_max_client_streams_bidi` and `#pending_data`. ([#2](https://github.com/unasuke/nghttp3-ruby/pull/2))
+- Tests of `HTTP3::RackAdapter`, of `HTTP3::Session` over a QUIC loopback connection, and of `HTTP3::Server` serving files and dynamic bodies and handling signals. An HTTP/3 interop check fetches from the server with curl in a container (`test/interop/curl.sh`), weekly in CI; `test/interop/README.md` describes the checks run by hand. ([#6](https://github.com/unasuke/http3-ruby/pull/6))
 
 ### Changed
 - The gem is now `http3` (`require "http3"`), and the top-level namespace is `HTTP3`. The nghttp3 bindings move from `Nghttp3` to `HTTP3::Nghttp3`. No `Nghttp3` alias is left behind. ([#3](https://github.com/unasuke/nghttp3-ruby/pull/3))
