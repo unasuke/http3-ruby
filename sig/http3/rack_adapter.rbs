@@ -1,0 +1,18 @@
+module HTTP3
+  # Calls a Rack 3 application for a Request and turns its answer into a
+  # Response.
+  class RackAdapter
+    class InvalidResponse < StandardError
+    end
+
+    CONNECTION_FIELDS: Array[String]
+    FIELD_NAME: Regexp
+    FORBIDDEN_IN_VALUE: Regexp
+
+    def initialize: (untyped app) -> void
+
+    # Raises what the application raises, and InvalidResponse for an
+    # answer that cannot be sent; the Rack body is closed either way.
+    def call: (Request request, remote: Addrinfo) -> Response
+  end
+end

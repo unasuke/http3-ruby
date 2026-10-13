@@ -1,0 +1,32 @@
+module HTTP3
+  # An HTTP/3 server for a Rack 3 application on one UDP address. #run
+  # serves until SIGTERM or SIGINT, then drains; SIGHUP reloads the
+  # certificate and key.
+  class Server
+    ALPN: Array[String]
+    SIGNALS: Hash[String, String]
+    RECV_SIZE: Integer
+    RECV_BATCH: Integer
+
+    # The address #run bound; nil until then.
+    attr_reader local_address: Addrinfo?
+
+    def initialize: (
+      app: untyped,
+      bind: String,
+      certificate_path: String | _ToPath,
+      private_key_path: String | _ToPath,
+      ?transport_params: QUIC::TransportParams?,
+      ?settings: QUIC::Settings?,
+      ?qlog_dir: (String | _ToPath)?,
+      ?max_connections: Integer,
+      ?max_request_body: Integer,
+      ?max_field_section_size: Integer,
+      ?send_buffer_size: Integer,
+      ?shutdown_timeout: Numeric,
+      ?logger: Logger
+    ) -> void
+
+    def run: () -> nil
+  end
+end

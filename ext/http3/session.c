@@ -67,7 +67,7 @@ typedef struct {
   uint64_t unsent;  /* bytes queued but not handed to nghttp3 yet */
   uint64_t acked;   /* bytes the peer has acknowledged */
   uint64_t shifted; /* bytes of the chunks already dropped */
-  int fd;           /* a file body (#attach_file), or -1 */
+  int fd;           /* a file body (#attach_file) not read in full yet, or -1 */
   off_t file_off, file_end;
   bool eof;     /* nothing follows the queued chunks */
   bool blocked; /* read_data returned NGHTTP3_ERR_WOULDBLOCK */
@@ -129,6 +129,15 @@ static int h3_stream_push(h3_stream *st, const uint8_t *base, size_t len,
   st->chunks[st->nchunks++] = (h3_chunk){base, len, str};
   st->unsent += len;
   return 0;
+}
+
+/* The whole file body has been read: let go of its descriptor now rather
+ * than when the stream closes, which waits for the peer to acknowledge
+ * every byte. */
+static void h3_stream_end_file(h3_stream *st) {
+  close(st->fd);
+  st->fd = -1;
+  st->eof = true;
 }
 
 /* Drop the chunks at the front the peer has acknowledged to their end. A
@@ -400,7 +409,7 @@ static nghttp3_ssize h3_read_data_cb(nghttp3_conn *conn, int64_t id,
     }
     st->file_off += n;
     if (st->file_off >= st->file_end) {
-      st->eof = true;
+      h3_stream_end_file(st);
     }
   }
 
@@ -868,7 +877,8 @@ static VALUE rb_http3_session_push_eof(VALUE self, VALUE rb_id) {
  * Send length bytes of io from offset as the whole response body. The
  * descriptor is duplicated, so io may be closed afterwards. The duplicate
  * is close-on-exec, as Ruby's own descriptors are, so that a process the
- * application spawns does not inherit it.
+ * application spawns does not inherit it, and is closed as soon as the
+ * whole length has been read.
  */
 static VALUE rb_http3_session_attach_file(VALUE self, VALUE rb_id, VALUE io,
                                           VALUE offset, VALUE length) {
@@ -891,7 +901,7 @@ static VALUE rb_http3_session_attach_file(VALUE self, VALUE rb_id, VALUE io,
   st->file_off = off;
   st->file_end = off + len;
   if (len == 0) {
-    st->eof = true;
+    h3_stream_end_file(st);
   }
   h3_stream_wake(s, st);
   return self;
