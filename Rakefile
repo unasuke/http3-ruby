@@ -11,10 +11,10 @@ require "rake/extensiontask"
 
 task build: :compile
 
-GEMSPEC = Gem::Specification.load("nghttp3.gemspec")
+GEMSPEC = Gem::Specification.load("http3.gemspec")
 
-Rake::ExtensionTask.new("nghttp3", GEMSPEC) do |ext|
-  ext.lib_dir = "lib/nghttp3"
+Rake::ExtensionTask.new("http3", GEMSPEC) do |ext|
+  ext.lib_dir = "lib/http3"
 end
 
 task default: %i[clobber compile test standard]

@@ -1,0 +1,48 @@
+module HTTP3
+  module Nghttp3
+    module QPACK
+      class Encoder
+        # Creates a new QPACK encoder
+        def initialize: (Integer max_dtable_capacity) -> void
+
+        # Encodes headers for a given stream
+        def encode: (Integer stream_id, Array[NV] headers) -> { prefix: String, data: String, encoder_stream: String }
+
+        # Reads decoder stream data
+        def read_decoder: (String data) -> Integer
+
+        # Sets the maximum dynamic table capacity
+        def max_dtable_capacity=: (Integer capacity) -> Integer
+
+        # Sets the maximum number of blocked streams
+        def max_blocked_streams=: (Integer num) -> Integer
+
+        # Returns the number of currently blocked streams
+        def num_blocked_streams: () -> Integer
+      end
+
+      class Decoder
+        # Creates a new QPACK decoder
+        def initialize: (Integer max_dtable_capacity, Integer max_blocked_streams) -> void
+
+        # Decodes headers from a stream
+        def decode: (Integer stream_id, String data, ?fin: bool) -> { headers: Array[{ name: String, value: String, token: Integer }]?, blocked: bool, consumed: Integer }
+
+        # Reads encoder stream data
+        def read_encoder: (String data) -> Integer
+
+        # Returns data to be sent on the decoder stream
+        def decoder_stream_data: () -> String
+
+        # Cancels decoding for the given stream
+        def cancel_stream: (Integer stream_id) -> void
+
+        # Sets the maximum dynamic table capacity
+        def max_dtable_capacity=: (Integer capacity) -> Integer
+
+        # Returns the current insert count
+        def insert_count: () -> Integer
+      end
+    end
+  end
+end

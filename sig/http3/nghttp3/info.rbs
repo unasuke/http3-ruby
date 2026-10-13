@@ -1,0 +1,9 @@
+module HTTP3
+  module Nghttp3
+    class Info
+      def age: () -> Integer
+      def version_num: () -> Integer
+      def version_str: () -> String
+    end
+  end
+end

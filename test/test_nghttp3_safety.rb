@@ -11,7 +11,7 @@ class TestNghttp3Safety < Minitest::Test
   REQUEST_STREAM = 0
 
   def test_exception_in_a_callback_comes_out_of_read_stream
-    callbacks = Nghttp3::Callbacks.new.on_begin_headers { |_stream_id| raise "boom" }
+    callbacks = HTTP3::Nghttp3::Callbacks.new.on_begin_headers { |_stream_id| raise "boom" }
     client = new_client
     client.submit_request(REQUEST_STREAM, request_headers)
     server = new_server(callbacks)
@@ -31,8 +31,8 @@ class TestNghttp3Safety < Minitest::Test
   end
 
   def test_callbacks_must_be_a_callbacks_object
-    assert_raises(TypeError) { Nghttp3::Connection.client_new(nil, Object.new) }
-    assert_raises(TypeError) { Nghttp3::Connection.server_new(nil, "callbacks") }
+    assert_raises(TypeError) { HTTP3::Nghttp3::Connection.client_new(nil, Object.new) }
+    assert_raises(TypeError) { HTTP3::Nghttp3::Connection.server_new(nil, "callbacks") }
   end
 
   # nghttp3 reports acknowledged body bytes only. A String goes once the
@@ -56,7 +56,7 @@ class TestNghttp3Safety < Minitest::Test
   def test_body_is_copied_when_submitted
     body = +"original body"
     received = +""
-    callbacks = Nghttp3::Callbacks.new.on_recv_data { |_stream_id, data| received << data }
+    callbacks = HTTP3::Nghttp3::Callbacks.new.on_recv_data { |_stream_id, data| received << data }
     client = new_client
     client.submit_request(REQUEST_STREAM, request_headers(method: "POST"), body: body)
     body.replace("changed!")
@@ -73,7 +73,7 @@ class TestNghttp3Safety < Minitest::Test
   def test_body_and_callbacks_survive_gc_compaction
     headers = []
     received = +""
-    callbacks = Nghttp3::Callbacks.new
+    callbacks = HTTP3::Nghttp3::Callbacks.new
       .on_recv_header { |_stream_id, name, value, _flags| headers << [name, value] }
       .on_recv_data { |_stream_id, data| received << data }
     client = new_client
@@ -117,14 +117,14 @@ class TestNghttp3Safety < Minitest::Test
   private
 
   def new_client(callbacks = nil)
-    Nghttp3::Connection.client_new(nil, callbacks).tap do |conn|
+    HTTP3::Nghttp3::Connection.client_new(nil, callbacks).tap do |conn|
       conn.bind_control_stream(2)
       conn.bind_qpack_streams(6, 10)
     end
   end
 
   def new_server(callbacks = nil)
-    Nghttp3::Connection.server_new(nil, callbacks).tap do |conn|
+    HTTP3::Nghttp3::Connection.server_new(nil, callbacks).tap do |conn|
       conn.bind_control_stream(3)
       conn.bind_qpack_streams(7, 11)
     end
@@ -132,10 +132,10 @@ class TestNghttp3Safety < Minitest::Test
 
   def request_headers(method: "GET")
     [
-      Nghttp3::NV.new(":method", method),
-      Nghttp3::NV.new(":path", "/"),
-      Nghttp3::NV.new(":scheme", "https"),
-      Nghttp3::NV.new(":authority", "example.com")
+      HTTP3::Nghttp3::NV.new(":method", method),
+      HTTP3::Nghttp3::NV.new(":path", "/"),
+      HTTP3::Nghttp3::NV.new(":scheme", "https"),
+      HTTP3::Nghttp3::NV.new(":authority", "example.com")
     ]
   end
 

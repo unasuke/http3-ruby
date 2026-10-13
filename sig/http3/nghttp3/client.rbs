@@ -1,0 +1,40 @@
+module HTTP3
+  module Nghttp3
+    class Client
+      attr_reader connection: Connection
+      attr_reader settings: Settings
+      attr_reader responses: Hash[Integer, Response]
+      attr_reader pending_requests: Hash[Integer, Request]
+
+      def initialize: (?settings: Settings?) -> void
+
+      def bind_streams: (control: Integer, qpack_encoder: Integer, qpack_decoder: Integer) -> self
+      def streams_bound?: () -> bool
+
+      def submit: (Request request) -> Integer
+
+      def get: (String url, ?headers: Hash[String, String]) -> Integer
+      def post: (String url, ?body: String?, ?headers: Hash[String, String]) -> Integer
+      def put: (String url, ?body: String?, ?headers: Hash[String, String]) -> Integer
+      def delete: (String url, ?headers: Hash[String, String]) -> Integer
+      def head: (String url, ?headers: Hash[String, String]) -> Integer
+
+      def pump_writes: () { (Integer stream_id, String data, bool fin) -> Integer? } -> self
+      def read_stream: (Integer stream_id, String data, ?fin: bool) -> Integer
+      def add_ack_offset: (Integer stream_id, Integer n) -> self
+
+      def close: () -> nil
+      def closed?: () -> bool
+
+      private
+
+      def setup_callbacks: () -> Callbacks
+      def on_begin_headers: (Integer stream_id) -> void
+      def on_recv_header: (Integer stream_id, String name, String value, Integer flags) -> void
+      def on_end_headers: (Integer stream_id, bool fin) -> void
+      def on_recv_data: (Integer stream_id, String data) -> void
+      def on_end_stream: (Integer stream_id) -> void
+      def on_stream_close: (Integer stream_id, Integer app_error_code) -> void
+    end
+  end
+end

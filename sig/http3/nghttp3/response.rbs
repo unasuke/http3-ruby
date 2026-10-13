@@ -1,0 +1,36 @@
+module HTTP3
+  module Nghttp3
+    class Response
+      attr_reader stream_id: Integer
+      attr_accessor status: Integer?
+      attr_reader headers: Headers
+      attr_accessor body: String?
+
+      def initialize: (
+        stream_id: Integer,
+        ?status: Integer?,
+        ?headers: Hash[String, String]? | Headers?,
+        ?body: String?
+      ) -> void
+
+      def to_nv_array: () -> Array[NV]
+
+      def write_headers: (?Hash[String, String] extra_headers) -> self
+      def headers_sent?: () -> bool
+
+      def write: (String | _ToS chunk) -> self
+      def body_chunks: () -> Array[String]
+      def body_from_chunks: () -> String
+
+      def finish: () -> self
+      def finished?: () -> bool
+
+      def body?: () -> bool
+      def effective_body: () -> String?
+
+      def append_body: (String data) -> self
+
+      def inspect: () -> String
+    end
+  end
+end
