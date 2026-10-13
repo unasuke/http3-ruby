@@ -8,9 +8,11 @@ Gem::Specification.new do |spec|
   spec.authors = ["Yusuke Nakamura"]
   spec.email = ["yusuke1994525@gmail.com"]
 
-  spec.summary = "[WIP] An HTTP/3 server for Ruby, built on nghttp3 and the quic gem"
-  spec.description = "[WIP] HTTP/3 for Ruby: Ruby bindings for nghttp3 (HTTP/3 mapping over QUIC and QPACK), " \
-    "built at install time and linked statically via mini_portile2."
+  spec.summary = "An HTTP/3 server for Ruby, built on nghttp3 and the quic gem"
+  spec.description = "An HTTP/3 server for Rack 3 applications, " \
+    "built on the quic gem and nghttp3 (HTTP/3 and QPACK). " \
+    "nghttp3 is built at install time and linked statically, " \
+    "and its Ruby bindings are available as HTTP3::Nghttp3."
   spec.homepage = "https://github.com/unasuke/http3-ruby"
   spec.license = "MIT"
   spec.required_ruby_version = ">= 3.3.0"
