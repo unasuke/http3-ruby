@@ -67,18 +67,39 @@ python3 run.py -s http3-ruby -c ngtcp2 -t http3
 
 ## Browsers
 
-Chrome, trusting the certificate by its public key:
+`Rack::Files` serves no index for `/`, so open a file under `--root`, such
+as `index.html`.
+
+Chrome, forced onto QUIC for the origin and trusting the certificate by its
+public key. Open 127.0.0.1, not localhost: Chrome looks localhost up as ::1
+first, where a server bound to 127.0.0.1 does not answer, and fails with
+`ERR_QUIC_HANDSHAKE_FAILED`.
 
 ```sh
 spki=$(openssl x509 -in cert.pem -pubkey -noout | openssl pkey -pubin -outform der \
   | openssl dgst -sha256 -binary | base64)
-google-chrome --user-data-dir=$(mktemp -d) --origin-to-force-quic-on=localhost:4433 \
-  --ignore-certificate-errors-spki-list="$spki" https://localhost:4433/
+google-chrome --user-data-dir=$(mktemp -d) --origin-to-force-quic-on=127.0.0.1:4433 \
+  --ignore-certificate-errors-spki-list="$spki" https://127.0.0.1:4433/index.html
 ```
 
-Firefox: in `about:config`, set `network.http.http3.alt-svc-mapping-for-testing`
-to `localhost;h3=":4433"` and `network.http.http3.disable_when_third_party_roots_found`
-to `false`, import `cert.pem` as an authority, then open
-`https://localhost:4433/`.
+Without `--origin-to-force-quic-on`, Chrome stays on TCP even when Alt-Svc
+offers HTTP/3: the SPKI list does not cover QUIC connections found through
+Alt-Svc, and their handshake rejects the certificate as unknown.
+
+Firefox moves to HTTP/3 only after a response over TCP carries Alt-Svc.
+`openssl s_server -HTTP` sends a file as a whole HTTP response, so it can
+send one on the same port over TCP, next to `server.rb`:
+
+```sh
+mkdir tcp
+printf 'HTTP/1.1 200 OK\r\nAlt-Svc: h3=":4433"\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nAlt-Svc sent\n' \
+  > tcp/alt-svc
+cd tcp && openssl s_server -accept 127.0.0.1:4433 -cert ../cert.pem -key ../key.pem -HTTP -quiet
+```
+
+In `about:config`, set `network.http.http3.disable_when_third_party_roots_found`
+to `false` and import `cert.pem` as an authority. Then open
+`https://localhost:4433/alt-svc`, which comes over TCP, and after it a file
+such as `https://localhost:4433/index.html`, which comes over HTTP/3.
 
 In the developer tools, the Network panel's Protocol column should read h3.
