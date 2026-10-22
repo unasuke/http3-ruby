@@ -1,6 +1,6 @@
 # quic-interop-runner's docker-compose.yml with the stand-in simulator
-# (sim/Dockerfile) in place of the ns-3 one. Copy it into the runner's clone
-# and point COMPOSE_FILE at it (README.md).
+# (sim/Dockerfile) in place of the ns-3 one. run_interop_runner.sh copies it
+# into the runner's clone and runs the runner on it.
 #
 # The rest follows the runner's compose: the client on leftnet, the server
 # on rightnet, the simulator at .2 on both, as the endpoints' setup.sh

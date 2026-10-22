@@ -58,26 +58,37 @@ builds the endpoint and `run_endpoint.sh` implements the `http3` test case;
 every other case uses the hq-interop ALPN, which HTTP3::Server does not
 speak, so it exits 127 (unsupported).
 
-`quic-interop-runner.yml` is the runner's compose with a stand-in for its
-ns-3 network simulator, which passes no packets under rootless podman. The
-stand-in (`sim/`) forwards between the client's and the server's networks
-with plain Linux routing, with no emulated delay, bandwidth or loss, and
-captures both sides, as the simulator does, for the runner's checks.
+`run_interop_runner.sh` runs the runner on `quic-interop-runner.yml`, the
+runner's compose with a stand-in for its ns-3 network simulator, which
+passes no packets under rootless podman. The stand-in (`sim/`) forwards
+between the client's and the server's networks with plain Linux routing,
+with no emulated delay, bandwidth or loss, and captures both sides, as the
+simulator does, for the runner's checks.
 
 ```sh
 docker build -f test/interop/Dockerfile -t http3-ruby-interop .
-docker build -t http3-ruby-interop-sim test/interop/sim
 git clone https://github.com/quic-interop/quic-interop-runner tmp/quic-interop-runner
 python3 -m venv tmp/quic-interop-runner/.venv
 tmp/quic-interop-runner/.venv/bin/pip install -r tmp/quic-interop-runner/requirements.txt
-cp test/interop/quic-interop-runner.yml tmp/quic-interop-runner/docker-compose.http3-ruby.yml
 # Add to tmp/quic-interop-runner/implementations_quic.json:
 #   "http3-ruby": {"image": "http3-ruby-interop", "url": "https://github.com/unasuke/http3-ruby", "role": "server"}
-cd tmp/quic-interop-runner
-COMPOSE_FILE=docker-compose.http3-ruby.yml .venv/bin/python run.py -s http3-ruby -c ngtcp2,quic-go -t http3
+PYTHON=$PWD/tmp/quic-interop-runner/.venv/bin/python \
+  test/interop/run_interop_runner.sh -s http3-ruby -c ngtcp2,quic-go -t http3
 ```
 
 The runner checks the pcaps with tshark, which has to be installed.
+
+The runner brings the compose up again and again but never takes it down,
+so a network it made outlives it, and one on the same addresses
+(193.167.x.x, which `trace.py` fixes) stops the next run from making its
+own, whichever checkout or compose left it. The script makes the networks
+afresh: before the run it removes the networks on 193.167.x.x with the
+stopped containers on them and those named `sim`, `client` and `server`,
+and after the run it removes its own the same way. A container still
+running is left alone, and the run does not start. `RUNNER_DIR` points it
+at another clone of the runner. Under podman, it also keeps a container of
+its own up through the run, so that podman never has to stop the network
+helper pasta mid-run, which Ubuntu's AppArmor profile for pasta refuses.
 
 ## Browsers
 
