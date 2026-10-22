@@ -1,5 +1,11 @@
 ## [Unreleased]
 
+### Added
+- quic-interop-runner's http3 test case runs against http3-ruby with `test/interop/run_interop_runner.sh`. The runner's ns-3 network simulator passes no packets under rootless podman, so the script runs the runner on `test/interop/quic-interop-runner.yml`, its compose with a stand-in (`test/interop/sim/`) that forwards with plain Linux routing; it makes the networks afresh before and after each run. CI runs it against the clients of ngtcp2, quic-go, quiche, neqo, aioquic, picoquic, lsquic, s2n-quic and quinn. ([#10](https://github.com/unasuke/http3-ruby/pull/10))
+
+### Changed
+- The interop checks in CI, curl and quic-interop-runner, run on every push to main as well as weekly. ([#10](https://github.com/unasuke/http3-ruby/pull/10))
+
 ### Fixed
 - The browser steps of `test/interop/README.md` work as written. Chrome opens 127.0.0.1, since it looks localhost up as ::1 first. Firefox gets Alt-Svc over TCP from `openssl s_server` on the same port, since `network.http.http3.alt-svc-mapping-for-testing` alone still left it connecting over TCP, where nothing listened. ([#9](https://github.com/unasuke/http3-ruby/pull/9))
 
