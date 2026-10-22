@@ -2,8 +2,9 @@
 
 The fourth tier of the tests: http3-ruby against other HTTP/3 and QUIC
 implementations. They need containers or browsers, so `rake test` does not
-run them. `curl.sh` and quic-interop-runner's http3 test case also run
-weekly in CI (`.github/workflows/interop.yml`); the rest is manual.
+run them. `curl.sh` and quic-interop-runner's http3 test case also run in CI
+(`.github/workflows/interop.yml`), on every push to main and weekly; the
+rest is manual.
 
 All of them use `server.rb`, which serves a directory with `Rack::Files`:
 
