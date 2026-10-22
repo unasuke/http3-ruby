@@ -53,17 +53,31 @@ protocol error closes only that connection (the server logs
 ## quic-interop-runner
 
 [quic-interop-runner](https://github.com/quic-interop/quic-interop-runner)
-runs the server role through its network simulator. `Dockerfile` builds the
-endpoint and `run_endpoint.sh` implements the `http3` test case; every other
-case uses the hq-interop ALPN, which HTTP3::Server does not speak, so it
-exits 127 (unsupported).
+runs the server role against other implementations' clients. `Dockerfile`
+builds the endpoint and `run_endpoint.sh` implements the `http3` test case;
+every other case uses the hq-interop ALPN, which HTTP3::Server does not
+speak, so it exits 127 (unsupported).
+
+`quic-interop-runner.yml` is the runner's compose with a stand-in for its
+ns-3 network simulator, which passes no packets under rootless podman. The
+stand-in (`sim/`) forwards between the client's and the server's networks
+with plain Linux routing, with no emulated delay, bandwidth or loss, and
+captures both sides, as the simulator does, for the runner's checks.
 
 ```sh
 docker build -f test/interop/Dockerfile -t http3-ruby-interop .
-# In a quic-interop-runner checkout, add to implementations_quic.json:
+docker build -t http3-ruby-interop-sim test/interop/sim
+git clone https://github.com/quic-interop/quic-interop-runner tmp/quic-interop-runner
+python3 -m venv tmp/quic-interop-runner/.venv
+tmp/quic-interop-runner/.venv/bin/pip install -r tmp/quic-interop-runner/requirements.txt
+cp test/interop/quic-interop-runner.yml tmp/quic-interop-runner/docker-compose.http3-ruby.yml
+# Add to tmp/quic-interop-runner/implementations_quic.json:
 #   "http3-ruby": {"image": "http3-ruby-interop", "url": "https://github.com/unasuke/http3-ruby", "role": "server"}
-python3 run.py -s http3-ruby -c ngtcp2 -t http3
+cd tmp/quic-interop-runner
+COMPOSE_FILE=docker-compose.http3-ruby.yml .venv/bin/python run.py -s http3-ruby -c ngtcp2,quic-go -t http3
 ```
+
+The runner checks the pcaps with tshark, which has to be installed.
 
 ## Browsers
 
