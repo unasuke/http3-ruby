@@ -30,3 +30,74 @@ jobs:
         run: bundle exec rake compile
       - name: curl --http3-only against the server
         run: test/interop/curl.sh
+
+  quic-interop-runner:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Outside the repository, so that it is not in the endpoint's build
+      # context. run_interop_runner.sh reads RUNNER_DIR too.
+      - name: Place the runner's clone
+        run: echo "RUNNER_DIR=$RUNNER_TEMP/quic-interop-runner" >> "$GITHUB_ENV"
+      # The runner's trace checks need Wireshark 4.5.0 or later; Ubuntu
+      # 24.04 ships 4.2. The PPA is the one the runner's own CI uses.
+      - name: Install tshark
+        run: |
+          sudo add-apt-repository -y ppa:wireshark-dev/nightly
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tshark
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Build the endpoint
+        run: docker build -f test/interop/Dockerfile -t http3-ruby-interop .
+      - name: Clone quic-interop-runner
+        run: git clone --depth 1 https://github.com/quic-interop/quic-interop-runner "$RUNNER_DIR"
+      - name: Install the runner's dependencies
+        run: python -m pip install -r "$RUNNER_DIR/requirements.txt"
+      - name: Add http3-ruby to the runner's implementations
+        run: |
+          python - <<'PY'
+          import json, os, pathlib
+          p = pathlib.Path(os.environ["RUNNER_DIR"], "implementations_quic.json")
+          impls = json.loads(p.read_text())
+          impls["http3-ruby"] = {
+              "image": "http3-ruby-interop",
+              "url": "https://github.com/unasuke/http3-ruby",
+              "role": "server",
+          }
+          p.write_text(json.dumps(impls, indent=2))
+          PY
+      # The clients that implement the http3 test case (msquic's does not).
+      # --log-dir avoids the default name, whose colons upload-artifact
+      # rejects.
+      - name: Run the http3 test case
+        run: >-
+          test/interop/run_interop_runner.sh -s http3-ruby
+          -c ngtcp2,quic-go,quiche,neqo,aioquic,picoquic,lsquic,s2n-quic,quinn
+          -t http3 --log-dir logs -j result.json -d
+      # The runner exits 0 whatever the results are: each pair has to have
+      # succeeded.
+      - name: Check that every pair succeeded
+        working-directory: ${{ env.RUNNER_DIR }}
+        run: |
+          python - <<'PY'
+          import json, sys
+          out = json.load(open("result.json"))
+          failed = []
+          for client, results in zip(out["clients"], out["results"]):
+              for result in results:
+                  print(f"{client}: {result['name']} {result['result']}")
+                  if result["result"] != "succeeded":
+                      failed.append(f"{client} {result['name']}")
+          sys.exit(f"not succeeded: {failed}" if failed else 0)
+          PY
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: quic-interop-runner-logs
+          path: ${{ env.RUNNER_DIR }}/logs
+          retention-days: 7
