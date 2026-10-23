@@ -47,6 +47,7 @@ module H3TestClient
       @stream_manager = StreamManager.new(is_server: false)
       @pending_requests = {}
       @responses = {}
+      @open_bodies = {}
       @streams_bound = false
     end
 
@@ -77,16 +78,32 @@ module H3TestClient
 
     # Submit a request
     # @param request [Request] the request to submit
+    # @param fin [Boolean] false to leave the request open after its body,
+    #   until #finish_body
     # @return [Integer] the stream ID for this request
-    def submit(request)
+    def submit(request, fin: true)
       raise HTTP3::Nghttp3::InvalidStateError, "Streams not bound. Call bind_streams first." unless @streams_bound
 
       stream_id = @stream_manager.allocate_bidi_stream_id
       @pending_requests[stream_id] = request
       @responses[stream_id] = Response.new(stream_id: stream_id)
 
-      @connection.submit_request(stream_id, request.to_nv_array, body: request.body)
+      if fin
+        @connection.submit_request(stream_id, request.to_nv_array, body: request.body)
+      else
+        pieces = @open_bodies[stream_id] = request.body? ? [request.body] : []
+        @connection.submit_request(stream_id, request.to_nv_array) { next_piece(pieces) }
+      end
       stream_id
+    end
+
+    # End the body of a request submitted with fin: false.
+    # @param stream_id [Integer] the request's stream ID
+    # @return [self]
+    def finish_body(stream_id)
+      @open_bodies.fetch(stream_id) << :eof
+      @connection.resume_stream(stream_id)
+      self
     end
 
     # Convenience method for GET request
@@ -184,6 +201,16 @@ module H3TestClient
     end
 
     private
+
+    # The body block of a request left open: the queued pieces in order,
+    # :wouldblock until #finish_body queues :eof, then nil (FIN).
+    def next_piece(pieces)
+      case pieces.first
+      when nil then :wouldblock
+      when :eof then nil
+      else pieces.shift
+      end
+    end
 
     def setup_callbacks
       HTTP3::Nghttp3::Callbacks.new
