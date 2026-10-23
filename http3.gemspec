@@ -39,7 +39,7 @@ Gem::Specification.new do |spec|
   spec.add_dependency "mini_portile2", "~> 2.8"
   # The QUIC layer, and the C function table (quic/ext.h) the extension
   # drives it through
-  spec.add_dependency "quic", "~> 0.0.3"
+  spec.add_dependency "quic", "~> 0.0.5"
   # HTTP3::Server serves Rack 3 applications
   spec.add_dependency "rack", ">= 3.0"
   # Not a default gem from Ruby 4.0 on

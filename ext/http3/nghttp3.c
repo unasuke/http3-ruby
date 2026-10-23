@@ -174,7 +174,7 @@ static const quic_ext_api *http3_load_quic_api(uint32_t major) {
     VALUE version = rb_const_get(quic, rb_intern("VERSION"));
     rb_raise(rb_eLoadError,
              "http3 needs the quic gem's C function table for quic/ext.h "
-             "ABI major version %u (quic ~> 0.0.3), which quic %" PRIsVALUE
+             "ABI major version %u (quic ~> 0.0.5), which quic %" PRIsVALUE
              " does not provide",
              (unsigned int)major, version);
   }

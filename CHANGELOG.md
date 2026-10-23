@@ -5,6 +5,7 @@
 
 ### Changed
 - The interop checks in CI, curl and quic-interop-runner, run on every push to main as well as weekly. ([#10](https://github.com/unasuke/http3-ruby/pull/10))
+- http3 depends on quic `~> 0.0.5`. A client on that quic keeps its connection when the server stops reading a request it is still sending, and closes the qlog file of a connection once the connection ends. ([#11](https://github.com/unasuke/http3-ruby/pull/11))
 
 ### Fixed
 - The browser steps of `test/interop/README.md` work as written. Chrome opens 127.0.0.1, since it looks localhost up as ::1 first. Firefox gets Alt-Svc over TCP from `openssl s_server` on the same port, since `network.http.http3.alt-svc-mapping-for-testing` alone still left it connecting over TCP, where nothing listened. ([#9](https://github.com/unasuke/http3-ruby/pull/9))

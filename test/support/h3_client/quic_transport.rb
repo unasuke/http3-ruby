@@ -111,6 +111,10 @@ module H3TestClient
     # QUIC::Stream#write waits until the peer's window has room for all of
     # the data, which may never happen for more than the window holds, so
     # write it piece by piece. FIN goes with the last piece.
+    #
+    # The server may answer a request before reading all of it and stop
+    # reading (STOP_SENDING); QUIC then raises StreamClosed, and what is
+    # left of the stream is dropped.
     def write(stream, data, fin)
       return stream.write("".b, fin: true) if data.empty? && fin
 
@@ -120,6 +124,8 @@ module H3TestClient
         offset += piece.bytesize
         stream.write(piece, fin: fin && offset >= data.bytesize)
       end
+    rescue QUIC::Error::StreamClosed
+      nil
     end
 
     # The server lets the client open another request stream once one
