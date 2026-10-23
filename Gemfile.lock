@@ -4,7 +4,7 @@ PATH
     http3 (0.0.3)
       logger
       mini_portile2 (~> 2.8)
-      quic (~> 0.0.3)
+      quic (~> 0.0.5)
       rack (>= 3.0)
 
 GEM
@@ -35,7 +35,7 @@ GEM
     psych (5.3.1)
       date
       stringio
-    quic (0.0.3)
+    quic (0.0.5)
       mini_portile2
     racc (1.8.1)
     rack (3.2.7)
