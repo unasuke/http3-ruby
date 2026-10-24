@@ -3,17 +3,21 @@ module HTTP3
   # on_* methods are called by the C part with the parts of each request.
   class Session
     # Take over quic_conn's streams. Requests over max_request_body bytes of
-    # body get 413, over max_field_section_size bytes of headers 431.
+    # body get 413, over max_field_section_size bytes of headers 431, as
+    # soon as they pass the limit; the rest of them is not read.
     def self.attach: (QUIC::Connection::Server quic_conn, max_request_body: Integer, max_field_section_size: Integer) -> Session
 
     def self._attach: (QUIC::Connection::Server quic_conn, Integer max_field_section_size) -> Session
 
     # Finished requests, each with the status to answer it with directly
-    # (413, 431) or nil for the application to answer it.
+    # (413, 431) or nil for the application to answer it. One answered
+    # directly comes out as soon as it is refused, with neither headers nor
+    # body.
     def take_requests: () -> Array[[Request, Integer?]]
 
     # Send response. Yields the exception of a file body whose descriptor
-    # could not be duplicated; its stream is aborted.
+    # could not be duplicated; its stream is aborted. Raises
+    # Nghttp3::InvalidStateError for a request already answered.
     def respond: (Request request, Response response) ?{ (SystemCallError error) -> void } -> void
 
     # Queue more of each Body::Chunks body, up to limit unsent bytes per
@@ -40,6 +44,9 @@ module HTTP3
 
     # The C part.
     def submit_response: (Integer stream_id, Array[[String, String]] headers, bool has_body) -> self
+    # Read no more of the request on stream_id (STOP_SENDING with
+    # H3_NO_ERROR); for one answered before it has arrived in full.
+    def stop_reading: (Integer stream_id) -> self
     def push_chunk: (Integer stream_id, String str) -> self
     def push_eof: (Integer stream_id) -> self
     def attach_file: (Integer stream_id, IO io, Integer offset, Integer length) -> self

@@ -10,16 +10,16 @@ module HTTP3
   # requests, answers them, keeps the bodies flowing and lets go of what
   # the streams no longer need.
   class Session
-    # A request still coming in. reject is the status to answer with
-    # instead of calling the application (413, 431), or nil.
-    Incoming = Struct.new(:pseudo, :fields, :body, :reject)
+    # A request still coming in.
+    Incoming = Struct.new(:pseudo, :fields, :body)
 
     # A response whose body is being sent.
     Outgoing = Struct.new(:request, :body, :done)
 
     # Take over quic_conn's streams. A request body over max_request_body
     # bytes is answered with 413, a header section over
-    # max_field_section_size bytes (RFC 9114 section 4.2.2) with 431.
+    # max_field_section_size bytes (RFC 9114 section 4.2.2) with 431, as
+    # soon as the request passes the limit; the rest of it is not read.
     def self.attach(quic_conn, max_request_body:, max_field_section_size:)
       session = _attach(quic_conn, max_field_section_size)
       session.send(:setup, max_request_body)
@@ -28,7 +28,9 @@ module HTTP3
 
     # The requests received in full since the last call, each as
     # [request, status]: status is nil for the application to answer the
-    # request, or the status to answer it with directly.
+    # request, or the status to answer it with directly. A request answered
+    # directly comes out as soon as it is refused, before the rest of it
+    # has arrived, with neither headers nor body.
     def take_requests
       done = @done
       @done = []
@@ -39,20 +41,27 @@ module HTTP3
     # closes, but the IO of a Body::File is closed at once: the C part reads
     # the file through a descriptor of its own. When that descriptor cannot
     # be had (EMFILE, say), the stream is aborted with H3_INTERNAL_ERROR and
-    # the block gets the exception.
+    # the block gets the exception. A request is answered once: nghttp3
+    # would send a second response after the first, so it raises
+    # Nghttp3::InvalidStateError.
     def respond(request, response)
+      id = request.stream_id
+      raise Nghttp3::InvalidStateError, "stream #{id} has been answered" if @answered[id]
+
+      stop_reading(id) if @rejected[id]
       headers = [[":status", response.status.to_s], *response.headers]
       body = response.body
-      submit_response(request.stream_id, headers, !body.nil?)
+      submit_response(id, headers, !body.nil?)
+      @answered[id] = true
       return if body.nil?
 
-      @outgoing[request.stream_id] = Outgoing.new(request, body, false)
+      @outgoing[id] = Outgoing.new(request, body, false)
       return unless body.is_a?(Body::File)
 
       begin
-        attach_file(request.stream_id, body.io, body.offset, body.length)
+        attach_file(id, body.io, body.offset, body.length)
       rescue SystemCallError => e
-        abort_stream(request.stream_id, Nghttp3::H3_INTERNAL_ERROR)
+        abort_stream(id, Nghttp3::H3_INTERNAL_ERROR)
         yield e if block_given?
       ensure
         body.io.close
@@ -100,17 +109,21 @@ module HTTP3
 
     def on_begin_headers(id)
       @open[id] = true
-      @incoming[id] = Incoming.new([], [], "".b, nil)
+      @incoming[id] = Incoming.new([], [], "".b)
     end
 
     def on_header(id, name, value)
       request = @incoming[id] or return
+      return if @rejected[id]
+
       (name.start_with?(":") ? request.pseudo : request.fields) << [name, value]
     end
 
     def on_fields_too_large(id)
       request = @incoming[id] or return
-      request.reject = 431
+      return if @rejected[id]
+
+      reject(id, request, 431)
     end
 
     def on_end_headers(id)
@@ -118,20 +131,21 @@ module HTTP3
 
     def on_data(id, bytes)
       request = @incoming[id] or return
-      return if request.reject
+      return if @rejected[id]
 
       if request.body.bytesize + bytes.bytesize > @max_request_body
-        request.reject = 413
-        request.body = "".b
+        reject(id, request, 413)
       else
         request.body << bytes
       end
     end
 
     def on_end_stream(id)
+      return if @rejected[id]
+
       request = @incoming.delete(id) or return
       headers = request.pseudo + request.fields
-      @done << [Request.new(stream_id: id, headers: headers, body: request.body), request.reject]
+      @done << [Request.new(stream_id: id, headers: headers, body: request.body), nil]
     end
 
     private
@@ -142,6 +156,23 @@ module HTTP3
       @done = []
       @outgoing = {}
       @open = {}
+      @rejected = {}
+      @answered = {}
+    end
+
+    # Answer the request on id with status, at once, instead of passing it
+    # on: what has come of it is dropped, and #respond stops reading the
+    # rest. Its Incoming stays in @incoming, emptied, until the stream
+    # closes, and the callbacks still to come for it are ignored. 431 may
+    # come before all of the pseudo-headers, so the request goes out
+    # without any headers. A refusal is not logged: only failures are, and
+    # a flood of refusals would flood the log.
+    def reject(id, request, status)
+      request.pseudo.clear
+      request.fields.clear
+      request.body = "".b
+      @rejected[id] = true
+      @done << [Request.new(stream_id: id, headers: [], body: "".b), status]
     end
 
     def fill_body(out, limit)
@@ -176,6 +207,8 @@ module HTTP3
     def release(id)
       @open.delete(id)
       @incoming.delete(id)
+      @rejected.delete(id)
+      @answered.delete(id)
       @done.reject! { |request, _| request.stream_id == id }
       out = @outgoing.delete(id) or return
 

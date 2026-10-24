@@ -468,8 +468,12 @@ static int h3_handshake_completed(void *ud) {
     s->h3 = NULL;
     return -1;
   }
-  nghttp3_conn_set_max_client_streams_bidi(
-      s->h3, http3_quic_api->local_max_streams_bidi(s->qc));
+  uint64_t max_streams = http3_quic_api->local_max_streams_bidi(s->qc);
+  nghttp3_conn_set_max_client_streams_bidi(s->h3, max_streams);
+  /* Every request #stop_reading gives up on leaves a Stream Cancellation on
+   * the QPACK decoder stream, and nghttp3 fails the connection once that
+   * stream holds more than max(this, 100) * 20 bytes. */
+  nghttp3_conn_set_max_concurrent_streams(s->h3, (size_t)max_streams);
 
   int64_t ctrl, enc, dec;
   if (http3_quic_api->open_uni_stream(s->qc, &ctrl) != 0 ||
@@ -830,6 +834,51 @@ static VALUE rb_http3_session_submit_response(VALUE self, VALUE rb_id,
   return self;
 }
 
+/* rb_id as the id of a request stream: 0..2**62-1 and client-initiated
+ * bidirectional. nghttp3 asserts the range. */
+static int64_t h3_request_stream_id(VALUE rb_id) {
+  int64_t id = NUM2LL(rb_id);
+  if (id < 0 || (uint64_t)id > H3_VARINT_MAX) {
+    rb_raise(rb_eArgError, "stream_id must be 0..2**62-1 (got %" PRIsVALUE ")",
+             rb_id);
+  }
+  if ((id & 3) != 0) {
+    rb_raise(rb_eArgError,
+             "stream_id %" PRIsVALUE
+             " is not a client-initiated bidirectional stream",
+             rb_id);
+  }
+  return id;
+}
+
+/*
+ * call-seq:
+ *   session.stop_reading(stream_id) -> self
+ *
+ * Read no more of the request on stream_id, which is being answered
+ * before all of it has arrived: nghttp3 drops what still comes, and the
+ * client gets STOP_SENDING with H3_NO_ERROR. RFC 9114 section 4.1 lets a
+ * server send a complete response before the request is complete and
+ * then ask the client to stop sending it, with H3_NO_ERROR.
+ */
+static VALUE rb_http3_session_stop_reading(VALUE self, VALUE rb_id) {
+  h3_session *s = h3_session_get_open(self);
+  int64_t id = h3_request_stream_id(rb_id);
+  int rv = nghttp3_conn_shutdown_stream_read(s->h3, id);
+  if (rv != 0) {
+    nghttp3_rb_raise(rv, "Failed to stop reading the stream");
+  }
+  if (http3_quic_api->shutdown_stream_read(s->qc, id, NGHTTP3_H3_NO_ERROR) !=
+      0) {
+    rb_raise(rb_eNghttp3Error, "cannot send STOP_SENDING on stream %" PRIsVALUE,
+             rb_id);
+  }
+  /* No end_headers will come to drop the count of a section cut short. */
+  st_data_t key = (st_data_t)id;
+  st_delete(s->field_sizes, &key, NULL);
+  return self;
+}
+
 /*
  * call-seq:
  *   session.push_chunk(stream_id, str) -> self
@@ -999,6 +1048,8 @@ void Init_http3_session(VALUE rb_mHTTP3) {
                              rb_http3_session_s_attach, 2);
   rb_define_method(rb_cHTTP3Session, "submit_response",
                    rb_http3_session_submit_response, 3);
+  rb_define_method(rb_cHTTP3Session, "stop_reading",
+                   rb_http3_session_stop_reading, 1);
   rb_define_method(rb_cHTTP3Session, "push_chunk", rb_http3_session_push_chunk,
                    2);
   rb_define_method(rb_cHTTP3Session, "push_eof", rb_http3_session_push_eof, 1);

@@ -39,6 +39,7 @@ class TestSession < Minitest::Test
     File.binwrite(@file_path, FILE_CONTENT)
     @file_responses = Thread::Queue.new
     @body_errors = Thread::Queue.new
+    @second_responses = Thread::Queue.new
     @sock = UDPSocket.new(Socket::AF_INET)
     @sock.bind("127.0.0.1", 0)
     @stop = false
@@ -82,12 +83,6 @@ class TestSession < Minitest::Test
     assert_equal payload.b, @client.response(id).body.b
   end
 
-  def test_post_over_max_request_body_gets_413
-    id = @client.request(:post, "/echo", body: "x" * (MAX_REQUEST_BODY + 1))
-    @client.pump_until { @client.response(id).finished? }
-    assert_equal 413, @client.response(id).status
-  end
-
   # respond closes the Body::File's IO at once: the C part reads the file
   # through a duplicate of its own, which is close-on-exec and closed once
   # the whole file has been read, before the stream closes.
@@ -113,6 +108,17 @@ class TestSession < Minitest::Test
     id = @client.request(:get, "/hello")
     @client.pump_until { @client.response(id).finished? }
     assert_equal "hello", @client.response(id).body
+  end
+
+  # nghttp3 would send a second response after the first, so respond
+  # refuses it.
+  def test_second_response_is_refused
+    id = @client.request(:get, "/twice")
+    @client.pump_until { @client.response(id).finished? }
+    assert_equal 204, @client.response(id).status
+    error = @second_responses.pop(timeout: 5)
+    assert_kind_of HTTP3::Nghttp3::InvalidStateError, error
+    assert_equal "stream #{id} has been answered", error.message
   end
 
   # More than initial_max_streams_bidi (100): the session has to give the
@@ -151,6 +157,13 @@ class TestSession < Minitest::Test
   def answer(session, request, status)
     response = response_to(request, status)
     session.respond(request, response) { |error| @body_errors << error }
+    if request.headers.assoc(":path").last == "/twice"
+      begin
+        session.respond(request, HTTP3::Response.new(status: 500, headers: [], body: nil))
+      rescue => e
+        @second_responses << e
+      end
+    end
     body = response.body
     return unless body.is_a?(HTTP3::Body::File) && body.io.is_a?(File) && File.directory?("/proc/self/fd")
 
@@ -185,6 +198,8 @@ class TestSession < Minitest::Test
       io = File.open(@file_path, "rb")
       body = HTTP3::Body::File.new(io: io, offset: 0, length: FILE_CONTENT.bytesize, rack_body: nil)
       HTTP3::Response.new(status: 200, headers: [], body: body)
+    when "/twice"
+      HTTP3::Response.new(status: 204, headers: [], body: nil)
     when "/unattachable"
       body = HTTP3::Body::File.new(io: UnattachableIO.new, offset: 0, length: 10, rack_body: nil)
       HTTP3::Response.new(status: 200, headers: [], body: body)

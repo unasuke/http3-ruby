@@ -65,6 +65,10 @@ Other options, with their defaults:
 | `settings:` | `QUIC::Settings.default` | QUIC settings (the ALPN is always `h3`) |
 | `logger:` | `Logger.new($stderr)` | Where failures are logged |
 
+A request gets 413 or 431 as soon as it passes the limit, without waiting for
+the rest of it, and the server reads no more of it (STOP_SENDING with
+H3_NO_ERROR).
+
 Response bodies may be files (`to_path`, sent 16 KiB at a time as the
 connection takes them), arrays or anything with `each`. Streaming bodies
 (`call`) are not supported and get 500, as do response headers whose names
