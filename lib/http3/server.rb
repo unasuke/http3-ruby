@@ -42,11 +42,19 @@ module HTTP3
     # certificate_path is a PEM chain, leaf first; private_key_path a PEM key
     # without passphrase. qlog_dir writes one qlog file per connection.
     # max_request_body and max_field_section_size (bytes) bound a request's
-    # body (413 beyond) and header section (431 beyond); send_buffer_size
+    # body (413 beyond) and header section (431 beyond).
+    # max_connection_request_buffer bounds the bytes the requests of a
+    # connection hold before they reach the application, and
+    # max_total_request_buffer those of every connection; a request that
+    # would pass either gets 503. They have to leave room for a request at
+    # the other two limits, or ArgumentError is raised. send_buffer_size
     # bounds the bytes of a response body queued but unsent per stream.
     def initialize(app:, bind:, certificate_path:, private_key_path:, transport_params: nil, settings: nil,
       qlog_dir: nil, max_connections: 1024, max_request_body: 1_048_576, max_field_section_size: 65_536,
+      max_connection_request_buffer: 4_194_304, max_total_request_buffer: 67_108_864,
       send_buffer_size: 65_536, shutdown_timeout: 30, logger: Logger.new($stderr))
+      check_request_limits(max_request_body, max_field_section_size, max_connection_request_buffer,
+        max_total_request_buffer)
       @adapter = RackAdapter.new(app)
       @bind_address = parse_bind(bind)
       @certificate_path = certificate_path
@@ -60,6 +68,8 @@ module HTTP3
       @max_connections = max_connections
       @max_request_body = max_request_body
       @max_field_section_size = max_field_section_size
+      @max_connection_request_buffer = max_connection_request_buffer
+      @max_total_request_buffer = max_total_request_buffer
       @send_buffer_size = send_buffer_size
       @shutdown_timeout = shutdown_timeout
       @logger = logger
@@ -77,6 +87,7 @@ module HTTP3
       )
       @sessions = {}
       @remotes = {}
+      @request_buffer = Session.shared_buffer(@max_total_request_buffer)
       @blocked_send = nil
       @phase = :serving
       @drain_deadline = nil
@@ -143,7 +154,8 @@ module HTTP3
         next if conn.nil? || @sessions.key?(conn)
 
         @sessions[conn] = Session.attach(
-          conn, max_request_body: @max_request_body, max_field_section_size: @max_field_section_size
+          conn, max_request_body: @max_request_body, max_field_section_size: @max_field_section_size,
+          max_connection_request_buffer: @max_connection_request_buffer, shared_buffer: @request_buffer
         )
         @remotes[conn] = sender
       end
@@ -280,6 +292,34 @@ module HTTP3
 
     def restore_traps(previous)
       previous.each { |name, handler| Signal.trap(name, handler || "DEFAULT") }
+    end
+
+    # Raise ArgumentError for the first request limit found wrong: each has
+    # to be an Integer in range, and the buffers have to let a request at
+    # max_request_body and max_field_section_size through on a server with
+    # nothing else under way.
+    def check_request_limits(max_request_body, max_field_section_size, max_connection_request_buffer,
+      max_total_request_buffer)
+      unless max_request_body.is_a?(Integer) && max_request_body >= 0
+        raise ArgumentError, "max_request_body must be an Integer of 0 or more (got #{max_request_body.inspect})"
+      end
+      # The range Session._attach takes, which would otherwise raise only
+      # on the first connection.
+      unless max_field_section_size.is_a?(Integer) && (1...2**62).cover?(max_field_section_size)
+        raise ArgumentError, "max_field_section_size must be 1..2**62-1 (got #{max_field_section_size.inspect})"
+      end
+      {max_connection_request_buffer:, max_total_request_buffer:}.each do |name, value|
+        raise ArgumentError, "#{name} must be a positive Integer (got #{value.inspect})" unless value.is_a?(Integer) && value.positive?
+      end
+      request = max_request_body + max_field_section_size
+      if max_connection_request_buffer < request
+        raise ArgumentError, "max_connection_request_buffer (#{max_connection_request_buffer}) must be at least " \
+          "max_request_body + max_field_section_size (#{request})"
+      end
+      if max_total_request_buffer < max_connection_request_buffer
+        raise ArgumentError, "max_total_request_buffer (#{max_total_request_buffer}) must be at least " \
+          "max_connection_request_buffer (#{max_connection_request_buffer})"
+      end
     end
 
     def parse_bind(bind)

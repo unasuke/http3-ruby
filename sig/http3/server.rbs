@@ -22,6 +22,8 @@ module HTTP3
       ?max_connections: Integer,
       ?max_request_body: Integer,
       ?max_field_section_size: Integer,
+      ?max_connection_request_buffer: Integer,
+      ?max_total_request_buffer: Integer,
       ?send_buffer_size: Integer,
       ?shutdown_timeout: Numeric,
       ?logger: Logger

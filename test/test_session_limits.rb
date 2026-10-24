@@ -11,6 +11,8 @@ class TestSessionLimits < Minitest::Test
 
   MAX_REQUEST_BODY = 4_000
   MAX_FIELD_SECTION_SIZE = 1_000
+  # Room for one request at both limits above, not for two.
+  MAX_CONNECTION_REQUEST_BUFFER = 5_000
 
   def setup
     # Generated here, before the server thread could race the main thread
@@ -67,6 +69,46 @@ class TestSessionLimits < Minitest::Test
     assert_equal MAX_REQUEST_BODY, @client.response(id).body.bytesize
   end
 
+  # A request held open takes most of the connection's buffer; the next
+  # one gets 503 once its body would pass it. The first one still
+  # completes.
+  def test_503_over_the_connection_buffer
+    held = @client.request(:post, "/echo", body: "x" * MAX_REQUEST_BODY, fin: false)
+    pump_for(0.2)
+    id = @client.request(:post, "/echo", body: "y" * 1_000, fin: false)
+    @client.pump_until { @client.response(id).finished? }
+    assert_equal 503, @client.response(id).status
+    assert_empty @client.response(id).headers.to_h
+    @client.pump_until { @client.closed?(id) }
+
+    @client.finish(held)
+    @client.pump_until { @client.response(held).finished? }
+    assert_equal 200, @client.response(held).status
+    assert_equal MAX_REQUEST_BODY, @client.response(held).body.bytesize
+  end
+
+  # Header fields count too: 503 can come while they arrive.
+  def test_503_while_the_headers_come_in
+    @client.request(:post, "/echo", body: "x" * MAX_REQUEST_BODY, fin: false)
+    pump_for(0.2)
+    id = @client.request(:get, "/hello", headers: {"x-large" => "x" * 750}, fin: false)
+    @client.pump_until { @client.response(id).finished? }
+    assert_equal 503, @client.response(id).status
+  end
+
+  # A request the client gives up on gives its bytes back: a request at
+  # the limits gets through after it.
+  def test_cancel_gives_the_bytes_back
+    held = @client.request(:post, "/echo", body: "x" * MAX_REQUEST_BODY, fin: false)
+    pump_for(0.2)
+    @client.cancel(held)
+    @client.pump_until { @client.closed?(held) }
+
+    id = @client.request(:post, "/echo", body: "x" * MAX_REQUEST_BODY)
+    @client.pump_until { @client.response(id).finished? }
+    assert_equal 200, @client.response(id).status
+  end
+
   private
 
   # Pump for a while, giving the server the chance to answer early.
@@ -91,7 +133,8 @@ class TestSessionLimits < Minitest::Test
       settings: QUIC::Settings.default.with(alpn: ["h3"])
     )
     session = HTTP3::Session.attach(
-      conn, max_request_body: MAX_REQUEST_BODY, max_field_section_size: MAX_FIELD_SECTION_SIZE
+      conn, max_request_body: MAX_REQUEST_BODY, max_field_section_size: MAX_FIELD_SECTION_SIZE,
+      max_connection_request_buffer: MAX_CONNECTION_REQUEST_BUFFER, shared_buffer: HTTP3::Session.shared_buffer(1_000_000)
     )
     until @stop
       conn.pump_once(timeout: 0.002)

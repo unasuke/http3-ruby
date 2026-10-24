@@ -16,24 +16,72 @@ module HTTP3
     # A response whose body is being sent.
     Outgoing = Struct.new(:request, :body, :done)
 
+    # What a field counts for besides its name and value, as RFC 9114
+    # section 4.2.2 counts it, and as the C part does for 431.
+    FIELD_OVERHEAD = 32
+
+    # Bytes the requests coming in may hold: a connection's, and through
+    # parent the server's. Only the server's I/O loop, one thread, calls
+    # it, so it takes no lock.
+    class Budget
+      attr_reader :limit, :used
+
+      def initialize(limit, parent: nil)
+        @limit = limit
+        @used = 0
+        @parent = parent
+      end
+
+      # Count n bytes and return true if they fit both here and in the
+      # parent; count nothing and return false if not.
+      def reserve(n)
+        return false if @used + n > @limit
+        return false if @parent && !@parent.reserve(n)
+
+        @used += n
+        true
+      end
+
+      def release(n)
+        @used -= n
+        @parent&.release(n)
+      end
+    end
+    private_constant :Budget
+
     # Take over quic_conn's streams. A request body over max_request_body
     # bytes is answered with 413, a header section over
     # max_field_section_size bytes (RFC 9114 section 4.2.2) with 431, as
     # soon as the request passes the limit; the rest of it is not read.
-    def self.attach(quic_conn, max_request_body:, max_field_section_size:)
+    #
+    # The requests not yet handed out (#take_requests) may hold
+    # max_connection_request_buffer bytes in all, header fields counted as
+    # for 431 and bodies by their bytes, and those of every Session given
+    # the same shared_buffer (Session.shared_buffer) its limit; a request
+    # that would pass either is answered with 503.
+    def self.attach(quic_conn, max_request_body:, max_field_section_size:,
+      max_connection_request_buffer: 4_194_304, shared_buffer: nil)
       session = _attach(quic_conn, max_field_section_size)
-      session.send(:setup, max_request_body)
+      session.send(:setup, max_request_body, Budget.new(max_connection_request_buffer, parent: shared_buffer))
       session
+    end
+
+    # A limit of limit bytes for the requests coming in on every Session
+    # given it as attach's shared_buffer.
+    def self.shared_buffer(limit)
+      Budget.new(limit)
     end
 
     # The requests received in full since the last call, each as
     # [request, status]: status is nil for the application to answer the
     # request, or the status to answer it with directly. A request answered
     # directly comes out as soon as it is refused, before the rest of it
-    # has arrived, with neither headers nor body.
+    # has arrived, with neither headers nor body. The bytes they held no
+    # longer count for the limits.
     def take_requests
       done = @done
       @done = []
+      done.each { |request, _| release_held(request.stream_id) }
       done
     end
 
@@ -115,6 +163,7 @@ module HTTP3
     def on_header(id, name, value)
       request = @incoming[id] or return
       return if @rejected[id]
+      return reject(id, request, 503) unless hold(id, name.bytesize + value.bytesize + FIELD_OVERHEAD)
 
       (name.start_with?(":") ? request.pseudo : request.fields) << [name, value]
     end
@@ -135,6 +184,8 @@ module HTTP3
 
       if request.body.bytesize + bytes.bytesize > @max_request_body
         reject(id, request, 413)
+      elsif !hold(id, bytes.bytesize)
+        reject(id, request, 503)
       else
         request.body << bytes
       end
@@ -150,8 +201,10 @@ module HTTP3
 
     private
 
-    def setup(max_request_body)
+    def setup(max_request_body, budget)
       @max_request_body = max_request_body
+      @budget = budget
+      @held = {}
       @incoming = {}
       @done = []
       @outgoing = {}
@@ -160,17 +213,33 @@ module HTTP3
       @answered = {}
     end
 
+    # Count n more bytes for the request on id, if the budget has room.
+    def hold(id, n)
+      return false unless @budget.reserve(n)
+
+      @held[id] = @held.fetch(id, 0) + n
+      true
+    end
+
+    # The request on id holds nothing any more. Calling it again does
+    # nothing.
+    def release_held(id)
+      n = @held.delete(id) or return
+      @budget.release(n)
+    end
+
     # Answer the request on id with status, at once, instead of passing it
-    # on: what has come of it is dropped, and #respond stops reading the
-    # rest. Its Incoming stays in @incoming, emptied, until the stream
-    # closes, and the callbacks still to come for it are ignored. 431 may
-    # come before all of the pseudo-headers, so the request goes out
-    # without any headers. A refusal is not logged: only failures are, and
-    # a flood of refusals would flood the log.
+    # on: what has come of it is dropped, with the bytes it held, and
+    # #respond stops reading the rest. Its Incoming stays in @incoming,
+    # emptied, until the stream closes, and the callbacks still to come for
+    # it are ignored. 431 may come before all of the pseudo-headers, so the
+    # request goes out without any headers. A refusal is not logged: only
+    # failures are, and a flood of refusals would flood the log.
     def reject(id, request, status)
       request.pseudo.clear
       request.fields.clear
       request.body = "".b
+      release_held(id)
       @rejected[id] = true
       @done << [Request.new(stream_id: id, headers: [], body: "".b), status]
     end
@@ -207,6 +276,7 @@ module HTTP3
     def release(id)
       @open.delete(id)
       @incoming.delete(id)
+      release_held(id)
       @rejected.delete(id)
       @answered.delete(id)
       @done.reject! { |request, _| request.stream_id == id }

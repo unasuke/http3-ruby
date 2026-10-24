@@ -58,6 +58,8 @@ Other options, with their defaults:
 | `max_connections:` | `1024` | Connections at once; more are refused with CONNECTION_REFUSED |
 | `max_request_body:` | `1_048_576` | Bytes of request body; more gets 413 |
 | `max_field_section_size:` | `65_536` | Bytes of request headers (RFC 9114 §4.2.2); more gets 431 |
+| `max_connection_request_buffer:` | `4_194_304` | Bytes a connection's requests may hold before they reach the application (headers counted as RFC 9114 §4.2.2 does, and bodies); more gets 503 |
+| `max_total_request_buffer:` | `67_108_864` | The same over all connections; more gets 503 |
 | `send_buffer_size:` | `65_536` | Bytes of a response body queued but unsent per stream |
 | `shutdown_timeout:` | `30` | Seconds a graceful stop waits for the requests under way |
 | `qlog_dir:` | `nil` | Directory for one qlog file per connection |
@@ -65,9 +67,15 @@ Other options, with their defaults:
 | `settings:` | `QUIC::Settings.default` | QUIC settings (the ALPN is always `h3`) |
 | `logger:` | `Logger.new($stderr)` | Where failures are logged |
 
-A request gets 413 or 431 as soon as it passes the limit, without waiting for
-the rest of it, and the server reads no more of it (STOP_SENDING with
-H3_NO_ERROR).
+`max_connection_request_buffer:` has to be at least `max_request_body:` plus
+`max_field_section_size:`, and `max_total_request_buffer:` at least
+`max_connection_request_buffer:`, so that a request within the limits never
+gets 503 from an idle server; otherwise `HTTP3::Server.new` raises
+`ArgumentError`.
+
+A request gets 413, 431 or 503 as soon as it passes a limit, without waiting
+for the rest of it, and the server reads no more of it (STOP_SENDING with
+H3_NO_ERROR). The 503 has neither headers nor body.
 
 Response bodies may be files (`to_path`, sent 16 KiB at a time as the
 connection takes them), arrays or anything with `each`. Streaming bodies
