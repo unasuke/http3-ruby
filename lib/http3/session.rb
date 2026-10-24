@@ -143,8 +143,13 @@ module HTTP3
 
     # Let go of the streams nghttp3 closed: their requests are dropped and
     # their bodies closed. The block gets (stream_id, exception) for a body
-    # whose close raised.
+    # whose close raised. First, the requests the client reset before their
+    # end (#on_reset) get our side of their streams reset too, with
+    # H3_REQUEST_INCOMPLETE as RFC 9114 section 4.1 says, so that the
+    # streams close.
     def release_closed(&block)
+      @incomplete.each { |id| abort_stream(id, Nghttp3::H3_REQUEST_INCOMPLETE) }
+      @incomplete.clear
       take_closed.each { |id| release(id, &block) }
     end
 
@@ -199,6 +204,18 @@ module HTTP3
       @done << [Request.new(stream_id: id, headers: headers, body: request.body), nil]
     end
 
+    # The client reset its side of the stream. A request it had not
+    # finished is dropped with the bytes it held, and #release_closed
+    # resets our side; one received in full, or refused, is answered as it
+    # would have been. Inside a callback, so it calls no C.
+    def on_reset(id)
+      return unless @incoming.key?(id) && !@rejected[id]
+
+      @incoming.delete(id)
+      release_held(id)
+      @incomplete << id
+    end
+
     private
 
     def setup(max_request_body, budget)
@@ -211,6 +228,7 @@ module HTTP3
       @open = {}
       @rejected = {}
       @answered = {}
+      @incomplete = []
     end
 
     # Count n more bytes for the request on id, if the budget has room.

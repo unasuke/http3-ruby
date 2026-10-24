@@ -42,7 +42,9 @@ module HTTP3
     # True while a request stream is open.
     def busy?: () -> bool
 
-    # Let go of closed streams; yields a body close that raised.
+    # Let go of closed streams; yields a body close that raised. Resets our
+    # side of the requests the client reset before their end
+    # (H3_REQUEST_INCOMPLETE).
     def release_closed: () ?{ (Integer stream_id, Exception error) -> void } -> void
 
     # Close every body still held.
@@ -54,6 +56,8 @@ module HTTP3
     def on_end_headers: (Integer id) -> void
     def on_data: (Integer id, String bytes) -> void
     def on_end_stream: (Integer id) -> void
+    # The client reset its side of the stream.
+    def on_reset: (Integer id) -> void
 
     # The C part.
     def submit_response: (Integer stream_id, Array[[String, String]] headers, bool has_body) -> self

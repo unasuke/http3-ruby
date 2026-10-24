@@ -21,6 +21,8 @@ class TestSessionLimits < Minitest::Test
     @sock = UDPSocket.new(Socket::AF_INET)
     @sock.bind("127.0.0.1", 0)
     @stop = false
+    # [stream_id, app_error_code] of each Session#abort_stream
+    @aborts = Thread::Queue.new
     @server = Thread.new do
       Thread.current.report_on_exception = false
       serve
@@ -109,6 +111,23 @@ class TestSessionLimits < Minitest::Test
     assert_equal 200, @client.response(id).status
   end
 
+  # A request the client resets before its end without STOP_SENDING: the
+  # server resets its side too, with H3_REQUEST_INCOMPLETE (RFC 9114
+  # section 4.1), so that the stream closes, and the bytes come back.
+  # quic gives the client no error code of a reset, so the server records
+  # the one it sent.
+  def test_reset_before_the_end_closes_the_stream
+    held = @client.request(:post, "/echo", body: "x" * MAX_REQUEST_BODY, fin: false)
+    pump_for(0.2)
+    @client.cancel(held, stop_sending: false)
+    @client.pump_until { @client.closed?(held) }
+    assert_equal [held, HTTP3::Nghttp3::H3_REQUEST_INCOMPLETE], @aborts.pop(timeout: 5)
+
+    id = @client.request(:post, "/echo", body: "x" * MAX_REQUEST_BODY)
+    @client.pump_until { @client.response(id).finished? }
+    assert_equal 200, @client.response(id).status
+  end
+
   private
 
   # Pump for a while, giving the server the chance to answer early.
@@ -136,6 +155,11 @@ class TestSessionLimits < Minitest::Test
       conn, max_request_body: MAX_REQUEST_BODY, max_field_section_size: MAX_FIELD_SECTION_SIZE,
       max_connection_request_buffer: MAX_CONNECTION_REQUEST_BUFFER, shared_buffer: HTTP3::Session.shared_buffer(1_000_000)
     )
+    aborts = @aborts
+    session.define_singleton_method(:abort_stream) do |id, code|
+      aborts << [id, code]
+      super(id, code)
+    end
     until @stop
       conn.pump_once(timeout: 0.002)
       session.take_requests.each { |request, status| session.respond(request, response_to(request, status)) }

@@ -28,7 +28,7 @@
 VALUE rb_cHTTP3Session;
 
 static ID id_on_begin_headers, id_on_header, id_on_end_headers, id_on_data,
-    id_on_end_stream, id_on_fields_too_large;
+    id_on_end_stream, id_on_fields_too_large, id_on_reset;
 
 /* What h3_session.field_sizes holds for a request whose header section has
  * gone over max_field_section_size. */
@@ -593,9 +593,16 @@ static int h3_stream_stop_sending(void *ud, int64_t id,
   return h3_shutdown_stream_read(ud, id);
 }
 
+/* The client reset its side of the stream. The Ruby part answers a request
+ * cut short by it (#on_reset). */
 static int h3_stream_reset(void *ud, int64_t id, uint64_t final_size,
                            uint64_t app_error_code) {
-  return h3_shutdown_stream_read(ud, id);
+  h3_session *s = ud;
+  int rv = h3_shutdown_stream_read(s, id);
+  if (rv != 0 || s->h3 == NULL) {
+    return rv;
+  }
+  return h3_call_ruby(s, id_on_reset, id, 0, NULL);
 }
 
 static int h3_stream_close(void *ud, int64_t id, int has_code,
@@ -1041,6 +1048,7 @@ void Init_http3_session(VALUE rb_mHTTP3) {
   id_on_data = rb_intern("on_data");
   id_on_end_stream = rb_intern("on_end_stream");
   id_on_fields_too_large = rb_intern("on_fields_too_large");
+  id_on_reset = rb_intern("on_reset");
 
   rb_cHTTP3Session = rb_define_class_under(rb_mHTTP3, "Session", rb_cObject);
   rb_undef_alloc_func(rb_cHTTP3Session);
