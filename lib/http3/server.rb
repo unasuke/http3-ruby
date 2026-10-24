@@ -153,11 +153,24 @@ module HTTP3
         conn = @endpoint.read_pkt(data, remote: sender.to_sockaddr)
         next if conn.nil? || @sessions.key?(conn)
 
-        @sessions[conn] = Session.attach(
-          conn, max_request_body: @max_request_body, max_field_section_size: @max_field_section_size,
-          max_connection_request_buffer: @max_connection_request_buffer, shared_buffer: @request_buffer
-        )
-        @remotes[conn] = sender
+        attach_session(conn, sender)
+      end
+    end
+
+    # Serve a new connection. One whose Session cannot be set up is logged
+    # and closed, and the loop goes on with the others.
+    def attach_session(conn, sender)
+      @sessions[conn] = Session.attach(
+        conn, max_request_body: @max_request_body, max_field_section_size: @max_field_section_size,
+        max_connection_request_buffer: @max_connection_request_buffer, shared_buffer: @request_buffer
+      )
+      @remotes[conn] = sender
+    rescue => e
+      log(:error, "session_error", remote: format_remote(sender), **error_fields(e))
+      begin
+        conn.close(error_code: Nghttp3::H3_INTERNAL_ERROR)
+      rescue QUIC::Error
+        nil
       end
     end
 
@@ -378,6 +391,10 @@ module HTTP3
 
     def remote_of(conn)
       address = @remotes[conn] or return "-"
+      format_remote(address)
+    end
+
+    def format_remote(address)
       host = address.ipv6? ? "[#{address.ip_address}]" : address.ip_address
       "#{host}:#{address.ip_port}"
     end
