@@ -51,6 +51,28 @@ Things worth checking: a header section over `max_field_section_size`
 protocol error closes only that connection (the server logs
 `connection_error` and keeps serving).
 
+## Requests held open
+
+`hold_requests.rb` checks that clients holding requests open cannot make the
+server use up its memory. It starts `server.rb` on a temporary directory and
+certificate, opens 20 connections, and on each sends 100 requests whose
+1,000,000-byte bodies never end (no FIN). With its default limits the server
+holds no more than 4 MiB of them per connection (`max_connection_request_buffer`)
+and 64 MiB in all (`max_total_request_buffer`), and answers the rest with 503
+at once.
+
+```sh
+bundle exec ruby test/interop/hold_requests.rb [--connections 20] [--streams 100] \
+  [--bytes 1_000_000] [--timeout 120]
+```
+
+It prints the server's resident set size before and after, and how the
+requests were answered: with the defaults, 67 held open and 1933 with 503.
+It exits non-zero unless some request got 503, the server is still running,
+and a GET on a new connection gets 200 afterwards, or when it takes more than
+`--timeout` seconds. The resident set size should grow by about 64 MiB, not by
+the 2 GB sent; it varies from run to run, so the script checks no threshold.
+
 ## quic-interop-runner
 
 [quic-interop-runner](https://github.com/quic-interop/quic-interop-runner)
