@@ -12,6 +12,11 @@ class TestSessionFailures < Minitest::Test
 
   TIMEOUT = 10
 
+  # What the child reports once the Session has let go of a failed
+  # connection.
+  FAILED = "shutdown_notice returned self; " \
+    "submit_response raised InvalidStateError: the HTTP/3 connection has failed"
+
   # A client that lets the server open two unidirectional streams, fewer
   # than the three HTTP/3 needs (RFC 9114 section 6.2): the server cannot
   # set HTTP/3 up, and what the Session is asked afterwards must not reach
@@ -28,7 +33,23 @@ class TestSessionFailures < Minitest::Test
       client.bind(sock).run
       client
     end
-    assert_match(/\Ashutdown_notice returned self; submit_response raised InvalidStateError: /, outcome)
+    assert_equal FAILED, outcome
+  end
+
+  # A second control stream is H3_STREAM_CREATION_ERROR (RFC 9114 section
+  # 6.2.1), which nghttp3 reports from read_stream. nghttp3 allows nothing
+  # but deleting the connection after that, so the Session lets go of it.
+  def test_connection_nghttp3_reported_an_error_on
+    outcome = serve_in_child do |port|
+      client = H3TestClient::QuicTransport.connect(port, ca_file: credentials.ca_file)
+      # The client's own control stream, written by nghttp3 when pumped,
+      client.pump
+      # and another: a stream type of 0x00 (control), then SETTINGS with no
+      # settings.
+      client.quic.open_uni_stream.write("\x00\x04\x00".b)
+      client.quic
+    end
+    assert_equal FAILED, outcome
   end
 
   private

@@ -77,7 +77,8 @@ typedef struct {
   VALUE self;      /* the object wrapping this struct; dcompact follows it */
   VALUE quic_conn; /* the QUIC::Connection::Server */
   quic_ext_conn *qc;
-  nghttp3_conn *h3;  /* made on handshake_completed */
+  nghttp3_conn *h3;  /* made on handshake_completed, deleted by h3_fail */
+  bool failed;       /* h3_fail has been called: h3 is gone for good */
   st_table *streams; /* stream_id => h3_stream * */
   VALUE pending_exc; /* an exception the Ruby part raised in a callback */
   VALUE closed_ids;  /* ids of the streams nghttp3 closed, for #take_closed */
@@ -437,10 +438,43 @@ static const nghttp3_data_reader h3_data_reader = {.read_data =
 
 /* Stream handler (quic -> glue). ud is the h3_session. */
 
+/* The HTTP/3 connection has failed: the QUIC connection is to close with
+ * app_error_code, and the nghttp3 connection goes, since nghttp3 allows
+ * nothing but nghttp3_conn_del once it has returned an error. From then on
+ * the handler fails every read and write, so that the QUIC connection
+ * closes even when the failure came from a call the Ruby part made. Never
+ * called while nghttp3 is running. */
+static int h3_fail_with(h3_session *s, uint64_t app_error_code) {
+  http3_quic_api->set_application_error(s->qc, app_error_code);
+  if (s->h3 != NULL) {
+    nghttp3_conn_del(s->h3);
+    s->h3 = NULL;
+  }
+  s->failed = true;
+  return -1;
+}
+
+/* A failure inside nghttp3, with the HTTP/3 error code it stands for. */
+static int h3_fail(h3_session *s, int64_t rv) {
+  return h3_fail_with(s, nghttp3_err_infer_quic_app_error_code((int)rv));
+}
+
+/* Raise for rv, which a call the Ruby part made into nghttp3 returned. A
+ * fatal error fails the connection first. */
+static void h3_raise(h3_session *s, int rv, const char *message) {
+  if (nghttp3_err_is_fatal(rv) || rv == NGHTTP3_ERR_QPACK_FATAL) {
+    h3_fail(s, rv);
+  }
+  nghttp3_rb_raise(rv, message);
+}
+
 /* Make the nghttp3 connection and its three unidirectional streams, as
  * ngtcp2's examples/server.cc does once the handshake is done. */
 static int h3_handshake_completed(void *ud) {
   h3_session *s = ud;
+  if (s->failed) {
+    return -1;
+  }
   if (s->h3 != NULL) {
     return 0;
   }
@@ -466,7 +500,7 @@ static int h3_handshake_completed(void *ud) {
 
   if (nghttp3_conn_server_new(&s->h3, &callbacks, &settings, NULL, s) != 0) {
     s->h3 = NULL;
-    return -1;
+    return h3_fail_with(s, NGHTTP3_H3_INTERNAL_ERROR);
   }
   uint64_t max_streams = http3_quic_api->local_max_streams_bidi(s->qc);
   nghttp3_conn_set_max_client_streams_bidi(s->h3, max_streams);
@@ -485,29 +519,20 @@ static int h3_handshake_completed(void *ud) {
     /* nghttp3 asserts the streams are bound before most calls, so the half
      * made connection must go. A client has to let the server open three
      * unidirectional streams (RFC 9114 section 6.2). */
-    http3_quic_api->set_application_error(
-        s->qc, rv == QUIC_EXT_ERR_STREAM_ID_BLOCKED
-                   ? NGHTTP3_H3_GENERAL_PROTOCOL_ERROR
-                   : NGHTTP3_H3_INTERNAL_ERROR);
-    nghttp3_conn_del(s->h3);
-    s->h3 = NULL;
-    return -1;
+    return h3_fail_with(s, rv == QUIC_EXT_ERR_STREAM_ID_BLOCKED
+                               ? NGHTTP3_H3_GENERAL_PROTOCOL_ERROR
+                               : NGHTTP3_H3_INTERNAL_ERROR);
   }
   return 0;
-}
-
-/* A failure inside nghttp3 closes the QUIC connection with the HTTP/3 error
- * code it stands for. */
-static int h3_fail(h3_session *s, int64_t rv) {
-  http3_quic_api->set_application_error(
-      s->qc, nghttp3_err_infer_quic_app_error_code((int)rv));
-  return -1;
 }
 
 static int h3_recv_stream_data(void *ud, int64_t id, const uint8_t *data,
                                size_t len, int fin, uint64_t ts,
                                size_t *consumed) {
   h3_session *s = ud;
+  if (s->failed) {
+    return -1;
+  }
   if (s->h3 == NULL) {
     /* Nothing can arrive on a stream before the handshake; drop it. */
     *consumed = len;
@@ -527,6 +552,9 @@ static int h3_next_stream_data(void *ud, int64_t *id, int *fin,
   *id = -1;
   *fin = 0;
   *nvecs = 0;
+  if (s->failed) {
+    return -1;
+  }
   if (s->h3 == NULL) {
     return 0;
   }
@@ -720,6 +748,9 @@ static h3_session *h3_session_get(VALUE self) {
 
 static h3_session *h3_session_get_open(VALUE self) {
   h3_session *s = h3_session_get(self);
+  if (s->failed) {
+    rb_raise(rb_eNghttp3InvalidStateError, "the HTTP/3 connection has failed");
+  }
   if (s->h3 == NULL) {
     rb_raise(rb_eNghttp3InvalidStateError,
              "the HTTP/3 connection is not set up yet (handshake pending)");
@@ -745,7 +776,7 @@ static void h3_stream_wake(h3_session *s, h3_stream *st) {
   st->blocked = false;
   int rv = nghttp3_conn_resume_stream(s->h3, st->id);
   if (rv != 0) {
-    nghttp3_rb_raise(rv, "Failed to resume stream");
+    h3_raise(s, rv, "Failed to resume stream");
   }
 }
 
@@ -846,7 +877,7 @@ static VALUE rb_http3_session_submit_response(VALUE self, VALUE rb_id,
       st_delete(s->streams, &key, NULL);
       h3_stream_free(st);
     }
-    nghttp3_rb_raise(rv, "Failed to submit response");
+    h3_raise(s, rv, "Failed to submit response");
   }
   return self;
 }
@@ -883,7 +914,7 @@ static VALUE rb_http3_session_stop_reading(VALUE self, VALUE rb_id) {
   int64_t id = h3_request_stream_id(rb_id);
   int rv = nghttp3_conn_shutdown_stream_read(s->h3, id);
   if (rv != 0) {
-    nghttp3_rb_raise(rv, "Failed to stop reading the stream");
+    h3_raise(s, rv, "Failed to stop reading the stream");
   }
   if (http3_quic_api->shutdown_stream_read(s->qc, id, NGHTTP3_H3_NO_ERROR) !=
       0) {
@@ -1026,7 +1057,7 @@ static VALUE rb_http3_session_shutdown_notice(VALUE self) {
   }
   int rv = nghttp3_conn_submit_shutdown_notice(s->h3);
   if (rv != 0) {
-    nghttp3_rb_raise(rv, "Failed to submit shutdown notice");
+    h3_raise(s, rv, "Failed to submit shutdown notice");
   }
   return self;
 }
