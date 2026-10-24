@@ -103,7 +103,10 @@ module HTTP3
       @answered[id] = true
       return if body.nil?
 
-      @outgoing[id] = Outgoing.new(request, body, false)
+      # Only the pseudo-headers stay, for the log, while the body is sent:
+      # the request body would otherwise be held all along, uncounted.
+      pseudo = request.headers.select { |name, _| name.start_with?(":") }
+      @outgoing[id] = Outgoing.new(Request.new(stream_id: id, headers: pseudo, body: "".b), body, false)
       return unless body.is_a?(Body::File)
 
       begin
@@ -119,7 +122,8 @@ module HTTP3
     # Queue more of each Body::Chunks body until limit bytes wait unsent on
     # its stream. A body whose enum raises is the application failing after
     # its headers went out: the stream is aborted with H3_INTERNAL_ERROR and
-    # the block gets (request, exception).
+    # the block gets (request, exception). That request has only the
+    # pseudo-headers, and no body.
     def fill_bodies(limit)
       @outgoing.each_value do |out|
         next if out.done || !out.body.is_a?(Body::Chunks)

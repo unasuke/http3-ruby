@@ -34,7 +34,8 @@ module HTTP3
     def respond: (Request request, Response response) ?{ (SystemCallError error) -> void } -> void
 
     # Queue more of each Body::Chunks body, up to limit unsent bytes per
-    # stream. Yields the request and exception of a body that raised.
+    # stream. Yields the request (its pseudo-headers only, without body) and
+    # exception of a body that raised.
     def fill_bodies: (Integer limit) ?{ (Request request, Exception error) -> void } -> void
 
     def wants_fill?: (Integer limit) -> bool

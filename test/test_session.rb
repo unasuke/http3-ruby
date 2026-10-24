@@ -40,6 +40,7 @@ class TestSession < Minitest::Test
     @file_responses = Thread::Queue.new
     @body_errors = Thread::Queue.new
     @second_responses = Thread::Queue.new
+    @fill_errors = Thread::Queue.new
     @sock = UDPSocket.new(Socket::AF_INET)
     @sock.bind("127.0.0.1", 0)
     @stop = false
@@ -110,6 +111,19 @@ class TestSession < Minitest::Test
     assert_equal "hello", @client.response(id).body
   end
 
+  # A body that fails after its headers went out: fill_bodies hands the
+  # request over with its pseudo-headers only, since the request body is
+  # let go once the response begins.
+  def test_failing_body_gets_the_request_without_its_body
+    id = @client.request(:post, "/fails", body: "payload", headers: {"x-field" => "value"})
+    @client.pump_until { @client.aborted?(id) }
+    request, error = @fill_errors.pop(timeout: 5)
+    assert_equal "body failed", error.message
+    assert_equal id, request.stream_id
+    assert_equal [":method", ":scheme", ":authority", ":path"], request.headers.map(&:first)
+    assert_empty request.body
+  end
+
   # nghttp3 would send a second response after the first, so respond
   # refuses it.
   def test_second_response_is_refused
@@ -146,7 +160,7 @@ class TestSession < Minitest::Test
     until @stop
       conn.pump_once(timeout: 0.002)
       session.take_requests.each { |request, status| answer(session, request, status) }
-      session.fill_bodies(65_536)
+      session.fill_bodies(65_536) { |request, error| @fill_errors << [request, error] }
       session.release_closed
       error = session.take_error and raise error
     end
@@ -198,6 +212,12 @@ class TestSession < Minitest::Test
       io = File.open(@file_path, "rb")
       body = HTTP3::Body::File.new(io: io, offset: 0, length: FILE_CONTENT.bytesize, rack_body: nil)
       HTTP3::Response.new(status: 200, headers: [], body: body)
+    when "/fails"
+      enum = Enumerator.new do |y|
+        y << "first"
+        raise "body failed"
+      end
+      HTTP3::Response.new(status: 200, headers: [], body: HTTP3::Body::Chunks.new(enum: enum, rack_body: nil))
     when "/twice"
       HTTP3::Response.new(status: 204, headers: [], body: nil)
     when "/unattachable"
