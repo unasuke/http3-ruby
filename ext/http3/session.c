@@ -476,11 +476,21 @@ static int h3_handshake_completed(void *ud) {
   nghttp3_conn_set_max_concurrent_streams(s->h3, (size_t)max_streams);
 
   int64_t ctrl, enc, dec;
-  if (http3_quic_api->open_uni_stream(s->qc, &ctrl) != 0 ||
-      http3_quic_api->open_uni_stream(s->qc, &enc) != 0 ||
-      http3_quic_api->open_uni_stream(s->qc, &dec) != 0 ||
+  int rv = 0;
+  if ((rv = http3_quic_api->open_uni_stream(s->qc, &ctrl)) != 0 ||
+      (rv = http3_quic_api->open_uni_stream(s->qc, &enc)) != 0 ||
+      (rv = http3_quic_api->open_uni_stream(s->qc, &dec)) != 0 ||
       nghttp3_conn_bind_control_stream(s->h3, ctrl) != 0 ||
       nghttp3_conn_bind_qpack_streams(s->h3, enc, dec) != 0) {
+    /* nghttp3 asserts the streams are bound before most calls, so the half
+     * made connection must go. A client has to let the server open three
+     * unidirectional streams (RFC 9114 section 6.2). */
+    http3_quic_api->set_application_error(
+        s->qc, rv == QUIC_EXT_ERR_STREAM_ID_BLOCKED
+                   ? NGHTTP3_H3_GENERAL_PROTOCOL_ERROR
+                   : NGHTTP3_H3_INTERNAL_ERROR);
+    nghttp3_conn_del(s->h3);
+    s->h3 = NULL;
     return -1;
   }
   return 0;
