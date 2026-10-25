@@ -91,6 +91,7 @@ static VALUE rb_nghttp3_qpack_encoder_encode(VALUE self, VALUE rb_stream_id,
   EncoderObj *obj;
   int64_t stream_id;
   nghttp3_nv *nva;
+  VALUE nva_buf;
   size_t nvlen, i;
   nghttp3_buf pbuf, rbuf, ebuf;
   int rv;
@@ -106,8 +107,9 @@ static VALUE rb_nghttp3_qpack_encoder_encode(VALUE self, VALUE rb_stream_id,
   Check_Type(rb_headers, T_ARRAY);
   nvlen = RARRAY_LEN(rb_headers);
 
-  /* Allocate and convert headers */
-  nva = ALLOCA_N(nghttp3_nv, nvlen);
+  /* Allocate and convert headers, on the heap: a Ruby thread's machine
+   * stack is too small for a long list. */
+  nva = ALLOCV_N(nghttp3_nv, nva_buf, nvlen);
   for (i = 0; i < nvlen; i++) {
     VALUE rb_nv = rb_ary_entry(rb_headers, i);
     nva[i] = nghttp3_rb_nv_to_c(rb_nv);
@@ -120,6 +122,7 @@ static VALUE rb_nghttp3_qpack_encoder_encode(VALUE self, VALUE rb_stream_id,
 
   rv = nghttp3_qpack_encoder_encode(obj->encoder, &pbuf, &rbuf, &ebuf,
                                     stream_id, nva, nvlen);
+  ALLOCV_END(nva_buf);
 
   if (rv != 0) {
     nghttp3_buf_free(&pbuf, nghttp3_mem_default());

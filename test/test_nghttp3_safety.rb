@@ -112,6 +112,17 @@ class TestNghttp3Safety < Minitest::Test
     assert_equal headers, received
   end
 
+  # A Ruby thread's machine stack is small: 100,000 fields, 40 bytes each
+  # as nghttp3_nv, would overflow it were they put there.
+  def test_many_fields_in_a_thread
+    headers = request_headers + Array.new(100_000) { |i| HTTP3::Nghttp3::NV.new("x-field", i.to_s) }
+    encoded = Thread.new do
+      new_client.submit_request(REQUEST_STREAM, headers)
+      HTTP3::Nghttp3::QPACK::Encoder.new(0).encode(REQUEST_STREAM, headers)
+    end.value
+    refute_empty encoded[:data]
+  end
+
   def test_read_stream_takes_a_timestamp
     client = new_client
     client.submit_request(REQUEST_STREAM, request_headers)

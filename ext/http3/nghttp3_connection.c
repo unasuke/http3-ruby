@@ -849,6 +849,7 @@ static VALUE rb_nghttp3_connection_submit_request(int argc, VALUE *argv,
   ConnectionObj *obj;
   int64_t stream_id;
   nghttp3_nv *nva;
+  VALUE nva_buf;
   size_t nvlen, i;
   int rv;
   int has_body = 0;
@@ -870,8 +871,9 @@ static VALUE rb_nghttp3_connection_submit_request(int argc, VALUE *argv,
   Check_Type(rb_headers, T_ARRAY);
   nvlen = RARRAY_LEN(rb_headers);
 
-  /* Allocate and convert headers */
-  nva = ALLOCA_N(nghttp3_nv, nvlen);
+  /* Allocate and convert headers, on the heap: a Ruby thread's machine
+   * stack is too small for a long list. */
+  nva = ALLOCV_N(nghttp3_nv, nva_buf, nvlen);
   for (i = 0; i < nvlen; i++) {
     VALUE rb_nv = rb_ary_entry(rb_headers, i);
     nva[i] = nghttp3_rb_nv_to_c(rb_nv);
@@ -898,6 +900,7 @@ static VALUE rb_nghttp3_connection_submit_request(int argc, VALUE *argv,
 
   rv = nghttp3_conn_submit_request(obj->conn, stream_id, nva, nvlen,
                                    has_body ? &data_reader : NULL, NULL);
+  ALLOCV_END(nva_buf);
   connection_raise_pending(obj);
 
   if (rv != 0) {
@@ -922,6 +925,7 @@ static VALUE rb_nghttp3_connection_submit_response(int argc, VALUE *argv,
   ConnectionObj *obj;
   int64_t stream_id;
   nghttp3_nv *nva;
+  VALUE nva_buf;
   size_t nvlen, i;
   int rv;
   int has_body = 0;
@@ -943,8 +947,8 @@ static VALUE rb_nghttp3_connection_submit_response(int argc, VALUE *argv,
   Check_Type(rb_headers, T_ARRAY);
   nvlen = RARRAY_LEN(rb_headers);
 
-  /* Allocate and convert headers */
-  nva = ALLOCA_N(nghttp3_nv, nvlen);
+  /* Allocate and convert headers, on the heap, as submit_request does. */
+  nva = ALLOCV_N(nghttp3_nv, nva_buf, nvlen);
   for (i = 0; i < nvlen; i++) {
     VALUE rb_nv = rb_ary_entry(rb_headers, i);
     nva[i] = nghttp3_rb_nv_to_c(rb_nv);
@@ -971,6 +975,7 @@ static VALUE rb_nghttp3_connection_submit_response(int argc, VALUE *argv,
 
   rv = nghttp3_conn_submit_response(obj->conn, stream_id, nva, nvlen,
                                     has_body ? &data_reader : NULL);
+  ALLOCV_END(nva_buf);
   connection_raise_pending(obj);
 
   if (rv != 0) {
@@ -993,6 +998,7 @@ static VALUE rb_nghttp3_connection_submit_info(VALUE self, VALUE rb_stream_id,
   ConnectionObj *obj;
   int64_t stream_id;
   nghttp3_nv *nva;
+  VALUE nva_buf;
   size_t nvlen, i;
   int rv;
 
@@ -1006,13 +1012,14 @@ static VALUE rb_nghttp3_connection_submit_info(VALUE self, VALUE rb_stream_id,
   Check_Type(rb_headers, T_ARRAY);
   nvlen = RARRAY_LEN(rb_headers);
 
-  nva = ALLOCA_N(nghttp3_nv, nvlen);
+  nva = ALLOCV_N(nghttp3_nv, nva_buf, nvlen);
   for (i = 0; i < nvlen; i++) {
     VALUE rb_nv = rb_ary_entry(rb_headers, i);
     nva[i] = nghttp3_rb_nv_to_c(rb_nv);
   }
 
   rv = nghttp3_conn_submit_info(obj->conn, stream_id, nva, nvlen);
+  ALLOCV_END(nva_buf);
   connection_raise_pending(obj);
 
   if (rv != 0) {
@@ -1036,6 +1043,7 @@ static VALUE rb_nghttp3_connection_submit_trailers(VALUE self,
   ConnectionObj *obj;
   int64_t stream_id;
   nghttp3_nv *nva;
+  VALUE nva_buf;
   size_t nvlen, i;
   int rv;
 
@@ -1049,13 +1057,14 @@ static VALUE rb_nghttp3_connection_submit_trailers(VALUE self,
   Check_Type(rb_trailers, T_ARRAY);
   nvlen = RARRAY_LEN(rb_trailers);
 
-  nva = ALLOCA_N(nghttp3_nv, nvlen);
+  nva = ALLOCV_N(nghttp3_nv, nva_buf, nvlen);
   for (i = 0; i < nvlen; i++) {
     VALUE rb_nv = rb_ary_entry(rb_trailers, i);
     nva[i] = nghttp3_rb_nv_to_c(rb_nv);
   }
 
   rv = nghttp3_conn_submit_trailers(obj->conn, stream_id, nva, nvlen);
+  ALLOCV_END(nva_buf);
   connection_raise_pending(obj);
 
   if (rv != 0) {
