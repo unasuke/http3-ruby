@@ -39,19 +39,26 @@ module H3TestClient
       @client.bind_streams(control: control.id, qpack_encoder: encoder.id, qpack_decoder: decoder.id)
     end
 
-    # Send a request (:get, :head or :post) and return its stream ID.
-    def request(method, path, body: nil, headers: {})
+    # Send a request (:get, :head or :post) and return its stream ID. With
+    # fin: false the request stays open after its body, until #finish.
+    def request(method, path, body: nil, headers: {}, fin: true)
       stream = open_request_stream
       url = "https://127.0.0.1#{path}"
-      id = case method
-      when :get then @client.get(url, headers: headers)
-      when :head then @client.head(url, headers: headers)
-      when :post then @client.post(url, body: body, headers: headers)
+      request = case method
+      when :get then Request.get(url, headers: headers)
+      when :head then Request.head(url, headers: headers)
+      when :post then Request.post(url, body: body, headers: headers)
       else raise ArgumentError, "unknown method #{method.inspect}"
       end
+      id = @client.submit(request, fin: fin)
       raise "stream IDs out of step: QUIC #{stream.id}, HTTP/3 #{id}" unless id == stream.id
 
       id
+    end
+
+    # End a request sent with fin: false.
+    def finish(id)
+      @client.finish_body(id)
     end
 
     def response(id)
@@ -63,6 +70,25 @@ module H3TestClient
     def aborted?(id)
       stream = @streams[id]
       !stream.nil? && stream.closed? && !response(id).finished?
+    end
+
+    # True once the request stream has closed in both directions, and
+    # everything sent on it has been acknowledged. A request the server
+    # stopped reading closes once its response has arrived and the reset
+    # of the client's side, which the server's STOP_SENDING brings about,
+    # has been acknowledged.
+    def closed?(id)
+      @streams.fetch(id).closed?
+    end
+
+    # Give up on a request: RESET_STREAM with H3_REQUEST_CANCELLED and, with
+    # stop_sending, STOP_SENDING too, so that the server stops sending the
+    # response.
+    def cancel(id, stop_sending: true)
+      stream = @streams.fetch(id)
+      @client.connection.shutdown_stream_write(id)
+      stream.reset(HTTP3::Nghttp3::H3_REQUEST_CANCELLED)
+      stream.close_read if stop_sending
     end
 
     # Pump until the block returns true; raises after timeout seconds.

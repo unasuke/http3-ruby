@@ -1,0 +1,120 @@
+# frozen_string_literal: true
+
+require "test_helper"
+
+# The limits HTTP3::Server puts on requests still coming in, over every
+# connection, with HTTP3::Server in a child process, and the checks of the
+# options that set them.
+class TestServerLimits < Minitest::Test
+  include TestCertificates
+  include TestServerProcess
+
+  LIMITS = {
+    max_request_body: 4_000,
+    max_field_section_size: 1_000,
+    max_connection_request_buffer: 5_000,
+    # Room for one request at the limits above, not for two.
+    max_total_request_buffer: 8_000
+  }.freeze
+
+  def setup
+    @dir = Dir.mktmpdir("http3-limits-")
+    @clients = []
+    @pid, @port = start_server(
+      log_path: File.join(@dir, "server.log"),
+      certificate_path: credentials.certificate_path, private_key_path: credentials.private_key_path, **LIMITS
+    ) { ->(env) { [200, {}, [env["rack.input"].read.bytesize.to_s]] } }
+  end
+
+  def teardown
+    @clients.each(&:close)
+    stop_server(@pid) if @pid
+    FileUtils.remove_entry(@dir)
+  end
+
+  # A request held open on one connection leaves too little of the
+  # server's buffer for one on another, though that connection's own
+  # buffer has room.
+  def test_connections_share_the_total_buffer
+    first = connect
+    held = first.request(:post, "/", body: "x" * 4_000, fin: false)
+    pump_for(first, 0.2)
+
+    second = connect
+    id = second.request(:post, "/", body: "y" * 4_000, fin: false)
+    second.pump_until { second.response(id).finished? }
+    assert_equal 503, second.response(id).status
+
+    first.finish(held)
+    first.pump_until { first.response(held).finished? }
+    assert_equal "4000", first.response(held).body
+  end
+
+  # Once a connection with a request held open has closed, what it held
+  # is free for the others.
+  def test_closing_a_connection_gives_its_bytes_back
+    first = connect
+    first.request(:post, "/", body: "x" * 4_000, fin: false)
+    pump_for(first, 0.2)
+    second = connect
+    assert_equal 503, post(second, "y" * 4_000).status
+
+    first.close
+    response = eventually(timeout: 5) { post(second, "y" * 4_000).tap { |r| raise "still 503" if r.status == 503 } }
+    assert_equal 200, response.status
+    assert_equal "4000", response.body
+  end
+
+  def test_request_limits_are_checked
+    {
+      {max_request_body: 1.5} => "max_request_body must be an Integer of 0 or more (got 1.5)",
+      {max_field_section_size: 0} => "max_field_section_size must be 1..2**62-1 (got 0)",
+      {max_connection_request_buffer: 0} => "max_connection_request_buffer must be a positive Integer (got 0)",
+      {max_total_request_buffer: nil} => "max_total_request_buffer must be a positive Integer (got nil)",
+      {max_request_body: 4_000, max_field_section_size: 1_000, max_connection_request_buffer: 4_000} =>
+        "max_connection_request_buffer (4000) must be at least max_request_body + max_field_section_size (5000)",
+      {max_total_request_buffer: 1_000} =>
+        "max_total_request_buffer (1000) must be at least max_connection_request_buffer (4194304)"
+    }.each do |options, message|
+      error = assert_raises(ArgumentError, options.inspect) do
+        HTTP3::Server.new(
+          app: ->(_env) {}, bind: "127.0.0.1:0",
+          certificate_path: credentials.certificate_path, private_key_path: credentials.private_key_path, **options
+        )
+      end
+      assert_equal message, error.message
+    end
+  end
+
+  private
+
+  def connect
+    H3TestClient::QuicTransport.connect(@port, ca_file: credentials.ca_file).tap { |client| @clients << client }
+  end
+
+  def post(client, body)
+    id = client.request(:post, "/", body: body)
+    client.pump_until { client.response(id).finished? }
+    client.response(id)
+  end
+
+  # Pump for a while, so that the server gets what the client sent.
+  def pump_for(client, seconds)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + seconds
+    client.pump while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+  end
+
+  # Retry the block until it succeeds; the server lets go of a closed
+  # connection on a later turn.
+  def eventually(timeout:)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+    begin
+      yield
+    rescue
+      raise if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+
+      sleep 0.05
+      retry
+    end
+  end
+end

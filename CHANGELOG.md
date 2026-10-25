@@ -2,13 +2,25 @@
 
 ### Added
 - quic-interop-runner's http3 test case runs against http3-ruby with `test/interop/run_interop_runner.sh`. The runner's ns-3 network simulator passes no packets under rootless podman, so the script runs the runner on `test/interop/quic-interop-runner.yml`, its compose with a stand-in (`test/interop/sim/`) that forwards with plain Linux routing; it makes the networks afresh before and after each run. CI runs it against the clients of ngtcp2, quic-go, quiche, neqo, aioquic, picoquic, lsquic, s2n-quic and quinn. ([#10](https://github.com/unasuke/http3-ruby/pull/10))
+- `HTTP3::Server` takes `max_connection_request_buffer` (4 MiB) and `max_total_request_buffer` (64 MiB): the bytes that requests not yet passed to the application may hold on one connection and over all connections, header fields counted as RFC 9114 §4.2.2 counts them. A request that would pass either is answered with 503, with neither headers nor body. `HTTP3::Session.attach` takes the same limits as `max_connection_request_buffer:` and `shared_buffer:`, made with `HTTP3::Session.shared_buffer(limit)`. ([#12](https://github.com/unasuke/http3-ruby/pull/12))
+- `test/interop/hold_requests.rb`, a check run by hand that requests held open cannot exhaust the server's memory: 20 connections of 100 requests, none of them ever finished, then a GET on a new connection. ([#12](https://github.com/unasuke/http3-ruby/pull/12))
 
 ### Changed
 - The interop checks in CI, curl and quic-interop-runner, run on every push to main as well as weekly. ([#10](https://github.com/unasuke/http3-ruby/pull/10))
 - http3 depends on quic `~> 0.0.5`. A client on that quic keeps its connection when the server stops reading a request it is still sending, and closes the qlog file of a connection once the connection ends. ([#11](https://github.com/unasuke/http3-ruby/pull/11))
+- 413 and 431 are answered as soon as the request passes the limit, before the rest of it arrives. The server does not read the rest: `HTTP3::Session#stop_reading` sends STOP_SENDING with H3_NO_ERROR, as RFC 9114 §4.1 allows. ([#12](https://github.com/unasuke/http3-ruby/pull/12))
+- `HTTP3::Session#take_requests` hands out a request it refuses (413, 431 or 503) as soon as it is refused, with neither headers nor body. ([#12](https://github.com/unasuke/http3-ruby/pull/12))
+- `HTTP3::Session#respond` raises `HTTP3::Nghttp3::InvalidStateError` for a request already answered, instead of sending a second response. ([#12](https://github.com/unasuke/http3-ruby/pull/12))
+- The request that `HTTP3::Session#fill_bodies` passes to its block has only the pseudo-header fields, and no body: a response being sent no longer keeps the body of its request. ([#12](https://github.com/unasuke/http3-ruby/pull/12))
+- `HTTP3::Server.new` raises `ArgumentError` for request limits that are not Integers in range, and for a `max_connection_request_buffer` smaller than `max_request_body + max_field_section_size` or a `max_total_request_buffer` smaller than `max_connection_request_buffer`, which would answer a request within both limits with 503 on an idle server. ([#12](https://github.com/unasuke/http3-ruby/pull/12))
 
 ### Fixed
 - The browser steps of `test/interop/README.md` work as written. Chrome opens 127.0.0.1, since it looks localhost up as ::1 first. Firefox gets Alt-Svc over TCP from `openssl s_server` on the same port, since `network.http.http3.alt-svc-mapping-for-testing` alone still left it connecting over TCP, where nothing listened. ([#9](https://github.com/unasuke/http3-ruby/pull/9))
+- A client that never finished its requests could make the server hold `max_request_body` on every stream of every connection: about 100 MiB per connection, and 100 GiB in all, with the defaults. The new buffer limits bound it. ([#12](https://github.com/unasuke/http3-ruby/pull/12))
+- A request the client resets before sending it in full gets the server's side of its stream reset with H3_REQUEST_INCOMPLETE (RFC 9114 §4.1), so that the stream closes. Before, it stayed open, holding what had come of the request, until the connection ended. ([#12](https://github.com/unasuke/http3-ruby/pull/12))
+- A client that allows fewer than three unidirectional streams no longer aborts the server process on nghttp3's assertions: its connection is closed with H3_GENERAL_PROTOCOL_ERROR. ([#12](https://github.com/unasuke/http3-ruby/pull/12))
+- Once nghttp3 reports an error on a connection, `HTTP3::Session` deletes the nghttp3 connection and the QUIC connection closes. Before, calls made later in the same turn still went into the failed nghttp3 connection. ([#12](https://github.com/unasuke/http3-ruby/pull/12))
+- An exception from `HTTP3::Session.attach` no longer stops `HTTP3::Server#run`. It is logged as `session_error` and closes that connection only. ([#12](https://github.com/unasuke/http3-ruby/pull/12))
 
 ## [0.0.3] - 2026-10-13
 

@@ -2,22 +2,40 @@ module HTTP3
   # HTTP/3 on one QUIC connection, driven by HTTP3::Server's I/O loop. The
   # on_* methods are called by the C part with the parts of each request.
   class Session
+    # What .shared_buffer returns, to be passed to .attach as it is.
+    type shared_buffer = Object
+
+    # What a field counts for besides its name and value (RFC 9114 section
+    # 4.2.2).
+    FIELD_OVERHEAD: Integer
+
     # Take over quic_conn's streams. Requests over max_request_body bytes of
-    # body get 413, over max_field_section_size bytes of headers 431.
-    def self.attach: (QUIC::Connection::Server quic_conn, max_request_body: Integer, max_field_section_size: Integer) -> Session
+    # body get 413, over max_field_section_size bytes of headers 431, as
+    # soon as they pass the limit; the rest of them is not read. Requests
+    # not yet taken may hold max_connection_request_buffer bytes, and those
+    # of every Session sharing shared_buffer its limit; more gets 503.
+    def self.attach: (QUIC::Connection::Server quic_conn, max_request_body: Integer, max_field_section_size: Integer,
+                      ?max_connection_request_buffer: Integer, ?shared_buffer: shared_buffer?) -> Session
+
+    # A limit of limit bytes for the requests of every Session given it.
+    def self.shared_buffer: (Integer limit) -> shared_buffer
 
     def self._attach: (QUIC::Connection::Server quic_conn, Integer max_field_section_size) -> Session
 
     # Finished requests, each with the status to answer it with directly
-    # (413, 431) or nil for the application to answer it.
+    # (413, 431) or nil for the application to answer it. One answered
+    # directly comes out as soon as it is refused, with neither headers nor
+    # body.
     def take_requests: () -> Array[[Request, Integer?]]
 
     # Send response. Yields the exception of a file body whose descriptor
-    # could not be duplicated; its stream is aborted.
+    # could not be duplicated; its stream is aborted. Raises
+    # Nghttp3::InvalidStateError for a request already answered.
     def respond: (Request request, Response response) ?{ (SystemCallError error) -> void } -> void
 
     # Queue more of each Body::Chunks body, up to limit unsent bytes per
-    # stream. Yields the request and exception of a body that raised.
+    # stream. Yields the request (its pseudo-headers only, without body) and
+    # exception of a body that raised.
     def fill_bodies: (Integer limit) ?{ (Request request, Exception error) -> void } -> void
 
     def wants_fill?: (Integer limit) -> bool
@@ -25,7 +43,9 @@ module HTTP3
     # True while a request stream is open.
     def busy?: () -> bool
 
-    # Let go of closed streams; yields a body close that raised.
+    # Let go of closed streams; yields a body close that raised. Resets our
+    # side of the requests the client reset before their end
+    # (H3_REQUEST_INCOMPLETE).
     def release_closed: () ?{ (Integer stream_id, Exception error) -> void } -> void
 
     # Close every body still held.
@@ -37,9 +57,14 @@ module HTTP3
     def on_end_headers: (Integer id) -> void
     def on_data: (Integer id, String bytes) -> void
     def on_end_stream: (Integer id) -> void
+    # The client reset its side of the stream.
+    def on_reset: (Integer id) -> void
 
     # The C part.
     def submit_response: (Integer stream_id, Array[[String, String]] headers, bool has_body) -> self
+    # Read no more of the request on stream_id (STOP_SENDING with
+    # H3_NO_ERROR); for one answered before it has arrived in full.
+    def stop_reading: (Integer stream_id) -> self
     def push_chunk: (Integer stream_id, String str) -> self
     def push_eof: (Integer stream_id) -> self
     def attach_file: (Integer stream_id, IO io, Integer offset, Integer length) -> self
