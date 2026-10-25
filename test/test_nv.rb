@@ -27,6 +27,16 @@ class TestNghttp3NV < Minitest::Test
     assert_equal HTTP3::Nghttp3::NV_FLAG_NEVER_INDEX, nv.flags
   end
 
+  # nghttp3_nv's flags is a uint8_t.
+  def test_nv_flags_must_be_an_integer_of_0_to_255
+    error = assert_raises(ArgumentError) { HTTP3::Nghttp3::NV.new("a", "b", flags: "x") }
+    assert_equal 'flags must be an Integer of 0..255 (got "x")', error.message
+    assert_raises(ArgumentError) { HTTP3::Nghttp3::NV.new("a", "b", flags: -1) }
+    assert_raises(ArgumentError) { HTTP3::Nghttp3::NV.new("a", "b", flags: 256) }
+    assert_raises(ArgumentError) { HTTP3::Nghttp3::NV.new("a", "b", flags: 1.0) }
+    assert_equal 255, HTTP3::Nghttp3::NV.new("a", "b", flags: 255).flags
+  end
+
   def test_nv_name_is_frozen
     nv = HTTP3::Nghttp3::NV.new("content-type", "text/html")
     assert nv.name.frozen?

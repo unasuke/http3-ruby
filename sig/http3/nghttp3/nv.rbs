@@ -1,6 +1,10 @@
 module HTTP3
   module Nghttp3
     class NV
+      # flags is an Integer of 0..255, the NV_FLAG_* constants or-ed
+      # together; anything else raises ArgumentError. NV_FLAG_NO_COPY_NAME
+      # and NV_FLAG_NO_COPY_VALUE are ignored, and nghttp3 copies the name
+      # and value all the same.
       def initialize: (String name, String value, ?flags: Integer) -> void
 
       def name: () -> String

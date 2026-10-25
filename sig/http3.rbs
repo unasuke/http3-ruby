@@ -26,6 +26,9 @@ module HTTP3
     # NV flag constants
     NV_FLAG_NONE: Integer
     NV_FLAG_NEVER_INDEX: Integer
+    # Ignored: nghttp3 always copies the name and value. It would otherwise
+    # read them when writev_stream sends them, and nothing keeps the Strings
+    # alive, or in place, until then.
     NV_FLAG_NO_COPY_NAME: Integer
     NV_FLAG_NO_COPY_VALUE: Integer
     NV_FLAG_TRY_INDEX: Integer

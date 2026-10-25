@@ -93,6 +93,25 @@ class TestNghttp3Safety < Minitest::Test
     assert_equal "compact me", received
   end
 
+  # Told not to copy, nghttp3 would read the names and values only when
+  # writev_stream sends them, after the NVs are gone and their Strings
+  # freed or moved. The flags are ignored, so the right headers arrive.
+  def test_no_copy_flags_are_ignored
+    headers = [[":method", "GET"], [":path", "/" + "p" * 200], [":scheme", "https"], [":authority", "example.com"]]
+    received = []
+    callbacks = HTTP3::Nghttp3::Callbacks.new.on_recv_header { |_stream_id, name, value, _flags| received << [name, value] }
+    client = new_client
+    flags = HTTP3::Nghttp3::NV_FLAG_NO_COPY_NAME | HTTP3::Nghttp3::NV_FLAG_NO_COPY_VALUE
+    client.submit_request(REQUEST_STREAM, headers.map { |name, value| HTTP3::Nghttp3::NV.new(name, value, flags: flags) })
+
+    GC.start
+    GC.verify_compaction_references(expand_heap: true, toward: :empty)
+    Array.new(100_000) { "x" * 200 }
+
+    transfer(client, new_server(callbacks))
+    assert_equal headers, received
+  end
+
   def test_read_stream_takes_a_timestamp
     client = new_client
     client.submit_request(REQUEST_STREAM, request_headers)
