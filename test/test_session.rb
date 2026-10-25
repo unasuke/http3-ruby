@@ -135,6 +135,17 @@ class TestSession < Minitest::Test
     assert_equal "stream #{id} has been answered", error.message
   end
 
+  # submit_response converts every field before it takes a pointer into
+  # any: a GC that compacts the heap inside a name's to_str moves nothing
+  # nghttp3 is about to copy.
+  def test_header_whose_to_str_compacts_the_heap
+    id = @client.request(:get, "/compacting")
+    @client.pump_until { @client.response(id).finished? }
+    assert_equal 200, @client.response(id).status
+    assert_equal "before", @client.response(id).headers["x-before"]
+    assert_equal "after", @client.response(id).headers["x-after"]
+  end
+
   # More than initial_max_streams_bidi (100): the session has to give the
   # client new streams as the old ones close.
   def test_250_requests_in_a_row_on_one_connection
@@ -220,6 +231,17 @@ class TestSession < Minitest::Test
       HTTP3::Response.new(status: 200, headers: [], body: HTTP3::Body::Chunks.new(enum: enum, rack_body: nil))
     when "/twice"
       HTTP3::Response.new(status: 204, headers: [], body: nil)
+    when "/compacting"
+      name = Object.new
+      def name.to_str
+        GC.start
+        GC.verify_compaction_references(expand_heap: true, toward: :empty)
+        # Over the slots the moved objects left.
+        Array.new(100_000) { "y" * 8 }
+        "x-after"
+      end
+      # Strings made here, as the field values of an application are.
+      HTTP3::Response.new(status: 200, headers: [[+"x-before", +"before"], [name, +"after"]], body: nil)
     when "/unattachable"
       body = HTTP3::Body::File.new(io: UnattachableIO.new, offset: 0, length: 10, rack_body: nil)
       HTTP3::Response.new(status: 200, headers: [], body: body)

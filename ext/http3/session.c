@@ -758,12 +758,20 @@ static h3_session *h3_session_get_open(VALUE self) {
   return s;
 }
 
+NORETURN(static void h3_raise_no_body(VALUE rb_id));
+static void h3_raise_no_body(VALUE rb_id) {
+  rb_raise(rb_eNghttp3StreamNotFoundError,
+           "no response body is open on stream %" PRIsVALUE, rb_id);
+}
+
+/* The body of stream rb_id. Ruby code that runs once it is found may make
+ * the connection go on and close the stream, so convert everything else
+ * first. */
 static h3_stream *h3_session_stream(VALUE self, VALUE rb_id) {
   h3_session *s = h3_session_get(self);
   h3_stream *st = h3_stream_find(s, NUM2LL(rb_id));
   if (st == NULL) {
-    rb_raise(rb_eNghttp3StreamNotFoundError,
-             "no response body is open on stream %" PRIsVALUE, rb_id);
+    h3_raise_no_body(rb_id);
   }
   return st;
 }
@@ -835,15 +843,19 @@ static VALUE rb_http3_session_s_attach(VALUE klass, VALUE quic_conn,
  */
 static VALUE rb_http3_session_submit_response(VALUE self, VALUE rb_id,
                                               VALUE headers, VALUE has_body) {
-  h3_session *s = h3_session_get_open(self);
   int64_t id = NUM2LL(rb_id);
   Check_Type(headers, T_ARRAY);
 
-  long nvlen = RARRAY_LEN(headers);
-  VALUE tmp;
-  nghttp3_nv *nva = ALLOCV_N(nghttp3_nv, tmp, nvlen);
+  /* Every field is converted before a pointer into any is taken: to_ary and
+   * to_str may run Ruby code, which could change or drop the Strings taken
+   * so far, or start a GC that moves them. It goes over a copy of headers,
+   * which that code cannot shrink under it, and keeps the Strings in
+   * strings, two per field. */
+  VALUE fields = rb_ary_dup(headers);
+  long nvlen = RARRAY_LEN(fields);
+  VALUE strings = rb_ary_new_capa(nvlen * 2);
   for (long i = 0; i < nvlen; i++) {
-    VALUE pair = rb_check_array_type(RARRAY_AREF(headers, i));
+    VALUE pair = rb_check_array_type(RARRAY_AREF(fields, i));
     if (NIL_P(pair) || RARRAY_LEN(pair) != 2) {
       rb_raise(rb_eArgError, "headers must be [name, value] pairs");
     }
@@ -851,13 +863,16 @@ static VALUE rb_http3_session_submit_response(VALUE self, VALUE rb_id,
     VALUE value = RARRAY_AREF(pair, 1);
     StringValue(name);
     StringValue(value);
-    nva[i] = (nghttp3_nv){.name = (const uint8_t *)RSTRING_PTR(name),
-                          .value = (const uint8_t *)RSTRING_PTR(value),
-                          .namelen = (size_t)RSTRING_LEN(name),
-                          .valuelen = (size_t)RSTRING_LEN(value),
-                          .flags = NGHTTP3_NV_FLAG_NONE};
+    rb_ary_push(strings, name);
+    rb_ary_push(strings, value);
   }
 
+  /* Then the connection, which that code may have failed, and every
+   * allocation; then the pointers, and nghttp3 copies the names and values
+   * before anything else can run. */
+  h3_session *s = h3_session_get_open(self);
+  VALUE tmp;
+  nghttp3_nv *nva = ALLOCV_N(nghttp3_nv, tmp, nvlen);
   h3_stream *st = NULL;
   if (RTEST(has_body) && h3_stream_find(s, id) == NULL) {
     st = ZALLOC(h3_stream);
@@ -865,12 +880,20 @@ static VALUE rb_http3_session_submit_response(VALUE self, VALUE rb_id,
     st->fd = -1;
     st_insert(s->streams, (st_data_t)id, (st_data_t)st);
   }
+  for (long i = 0; i < nvlen; i++) {
+    VALUE name = RARRAY_AREF(strings, 2 * i);
+    VALUE value = RARRAY_AREF(strings, 2 * i + 1);
+    nva[i] = (nghttp3_nv){.name = (const uint8_t *)RSTRING_PTR(name),
+                          .value = (const uint8_t *)RSTRING_PTR(value),
+                          .namelen = (size_t)RSTRING_LEN(name),
+                          .valuelen = (size_t)RSTRING_LEN(value),
+                          .flags = NGHTTP3_NV_FLAG_NONE};
+  }
 
-  /* nghttp3 copies the header names and values. */
   int rv = nghttp3_conn_submit_response(
       s->h3, id, nva, (size_t)nvlen, RTEST(has_body) ? &h3_data_reader : NULL);
   ALLOCV_END(tmp);
-  RB_GC_GUARD(headers);
+  RB_GC_GUARD(strings);
   if (rv != 0) {
     if (st != NULL) {
       st_data_t key = (st_data_t)id;
@@ -935,15 +958,15 @@ static VALUE rb_http3_session_stop_reading(VALUE self, VALUE rb_id) {
  */
 static VALUE rb_http3_session_push_chunk(VALUE self, VALUE rb_id, VALUE str) {
   h3_session *s = h3_session_get(self);
-  h3_stream *st = h3_session_stream(self, rb_id);
   StringValue(str);
+  VALUE copy = rb_str_new_frozen(str);
+  h3_stream *st = h3_session_stream(self, rb_id);
   if (st->eof) {
     rb_raise(rb_eNghttp3InvalidStateError, "the body has ended");
   }
-  if (RSTRING_LEN(str) == 0) {
+  if (RSTRING_LEN(copy) == 0) {
     return self;
   }
-  VALUE copy = rb_str_new_frozen(str);
   if (h3_stream_push(st, (const uint8_t *)RSTRING_PTR(copy),
                      (size_t)RSTRING_LEN(copy), copy) != 0) {
     rb_raise(rb_eNoMemError, "failed to queue a body chunk");
@@ -980,10 +1003,8 @@ static VALUE rb_http3_session_push_eof(VALUE self, VALUE rb_id) {
 static VALUE rb_http3_session_attach_file(VALUE self, VALUE rb_id, VALUE io,
                                           VALUE offset, VALUE length) {
   h3_session *s = h3_session_get(self);
-  h3_stream *st = h3_session_stream(self, rb_id);
-  if (st->fd >= 0 || st->eof || st->nchunks > 0) {
-    rb_raise(rb_eNghttp3InvalidStateError, "the body is already given");
-  }
+  /* The arguments first, as #push_chunk does: io.fileno is Ruby code. */
+  int64_t id = NUM2LL(rb_id);
   off_t off = NUM2OFFT(offset);
   off_t len = NUM2OFFT(length);
   if (off < 0 || len < 0) {
@@ -994,6 +1015,15 @@ static VALUE rb_http3_session_attach_file(VALUE self, VALUE rb_id, VALUE io,
     rb_sys_fail("dup");
   }
   rb_update_max_fd(fd);
+  h3_stream *st = h3_stream_find(s, id);
+  if (st == NULL) {
+    close(fd);
+    h3_raise_no_body(rb_id);
+  }
+  if (st->fd >= 0 || st->eof || st->nchunks > 0) {
+    close(fd);
+    rb_raise(rb_eNghttp3InvalidStateError, "the body is already given");
+  }
   st->fd = fd;
   st->file_off = off;
   st->file_end = off + len;
