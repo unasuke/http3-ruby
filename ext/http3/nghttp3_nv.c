@@ -11,27 +11,40 @@ VALUE rb_cNghttp3NV;
 #define NV_FLAGS_NO_COPY                                                       \
   (NGHTTP3_NV_FLAG_NO_COPY_NAME | NGHTTP3_NV_FLAG_NO_COPY_VALUE)
 
-/*
- * Converts a Ruby NV object to a C nghttp3_nv structure.
- * Note: The returned structure contains pointers to Ruby string data,
- * so the Ruby strings must remain valid while the structure is in use.
- */
-nghttp3_nv nghttp3_rb_nv_to_c(VALUE rb_nv) {
-  nghttp3_nv nv;
-  VALUE name = rb_iv_get(rb_nv, "@name");
-  VALUE value = rb_iv_get(rb_nv, "@value");
-  VALUE flags = rb_iv_get(rb_nv, "@flags");
+static ID id_iv_name, id_iv_value, id_iv_flags;
 
-  StringValue(name);
-  StringValue(value);
+/* The instance variables are read as they are, and to_str is not called:
+ * Ruby code could change the Strings already taken, or start a GC that
+ * moves them. rb_obj_is_kind_of and rb_ivar_get call no methods. */
+long nghttp3_rb_nva_fill(VALUE headers, nghttp3_nv *nva, long nvlen) {
+  for (long i = 0; i < nvlen; i++) {
+    VALUE nv = RARRAY_AREF(headers, i);
+    if (!RTEST(rb_obj_is_kind_of(nv, rb_cNghttp3NV))) {
+      return i;
+    }
+    VALUE name = rb_ivar_get(nv, id_iv_name);
+    VALUE value = rb_ivar_get(nv, id_iv_value);
+    VALUE flags = rb_ivar_get(nv, id_iv_flags);
+    if (!RB_TYPE_P(name, T_STRING) || !RB_TYPE_P(value, T_STRING) ||
+        !FIXNUM_P(flags) || FIX2LONG(flags) < 0 || FIX2LONG(flags) > 255) {
+      return i;
+    }
+    nva[i] = (nghttp3_nv){
+        .name = (const uint8_t *)RSTRING_PTR(name),
+        .namelen = (size_t)RSTRING_LEN(name),
+        .value = (const uint8_t *)RSTRING_PTR(value),
+        .valuelen = (size_t)RSTRING_LEN(value),
+        .flags = (uint8_t)(FIX2LONG(flags) & ~NV_FLAGS_NO_COPY),
+    };
+  }
+  return -1;
+}
 
-  nv.name = (uint8_t *)RSTRING_PTR(name);
-  nv.namelen = RSTRING_LEN(name);
-  nv.value = (uint8_t *)RSTRING_PTR(value);
-  nv.valuelen = RSTRING_LEN(value);
-  nv.flags = (NIL_P(flags) ? 0 : NUM2UINT(flags)) & ~NV_FLAGS_NO_COPY;
-
-  return nv;
+void nghttp3_rb_raise_bad_nv(long index) {
+  rb_raise(rb_eArgError,
+           "headers[%ld] is not an HTTP3::Nghttp3::NV with String name and "
+           "value",
+           index);
 }
 
 /*
@@ -83,6 +96,10 @@ static VALUE rb_nghttp3_nv_get_flags(VALUE self) {
 }
 
 void Init_nghttp3_nv(void) {
+  id_iv_name = rb_intern("@name");
+  id_iv_value = rb_intern("@value");
+  id_iv_flags = rb_intern("@flags");
+
   /* Define NV flag constants */
   rb_define_const(rb_mNghttp3, "NV_FLAG_NONE", UINT2NUM(NGHTTP3_NV_FLAG_NONE));
   rb_define_const(rb_mNghttp3, "NV_FLAG_NEVER_INDEX",

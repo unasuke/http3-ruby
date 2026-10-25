@@ -72,6 +72,11 @@ module HTTP3
       def pending_data: (Integer stream_id) -> Array[String]
 
       # HTTP operations
+      #
+      # The submit_* methods read each NV's name, value and flags as they
+      # are, without to_str or to_int, and raise ArgumentError for an
+      # element that is not an NV with String name and value and flags of
+      # 0..255; nothing is submitted then.
 
       # Submits an HTTP request (client only)
       def submit_request: (Integer stream_id, Array[NV] headers, ?body: String?) ?{ (Integer stream_id) -> (String | Symbol | nil) } -> self

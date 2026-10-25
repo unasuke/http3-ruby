@@ -87,8 +87,17 @@ void nghttp3_rb_raise(int error_code, const char *fmt, ...);
 /* Settings helper */
 nghttp3_settings *nghttp3_rb_get_settings(VALUE rb_settings);
 
-/* NV helper */
-nghttp3_nv nghttp3_rb_nv_to_c(VALUE rb_nv);
+/* NV helpers. nghttp3_rb_nva_fill fills nva with the first nvlen elements
+ * of headers, an Array of NVs, pointing into their Strings. It never raises,
+ * allocates nothing and runs no Ruby code, so that from the moment it takes
+ * those pointers until nghttp3 has copied the Strings, nothing can change,
+ * free or move them; so call it after anything that allocates or may run
+ * Ruby code, and call nghttp3 right after it. It returns the index of the
+ * first element that is not an NV with String name and value and flags of
+ * 0..255, or -1 if there is none. nghttp3_rb_raise_bad_nv raises
+ * ArgumentError for that index. */
+long nghttp3_rb_nva_fill(VALUE headers, nghttp3_nv *nva, long nvlen);
+NORETURN(void nghttp3_rb_raise_bad_nv(long index));
 
 /* Callbacks helper: install the C callbacks, which do their own
  * bookkeeping and then call the Ruby blocks of conn's Callbacks, if any. */

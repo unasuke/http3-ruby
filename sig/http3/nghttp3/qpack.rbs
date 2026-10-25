@@ -5,7 +5,8 @@ module HTTP3
         # Creates a new QPACK encoder
         def initialize: (Integer max_dtable_capacity) -> void
 
-        # Encodes headers for a given stream
+        # Encodes headers for a given stream. headers are checked as
+        # Connection#submit_request checks them.
         def encode: (Integer stream_id, Array[NV] headers) -> { prefix: String, data: String, encoder_stream: String }
 
         # Reads decoder stream data

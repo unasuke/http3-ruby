@@ -835,6 +835,31 @@ static nghttp3_ssize read_data_callback(nghttp3_conn *conn, int64_t stream_id,
 static const nghttp3_data_reader data_reader = {.read_data =
                                                     read_data_callback};
 
+/* The body of a submit_request or submit_response: a frozen copy of body:,
+ * so that the application cannot change the bytes nghttp3 will read, or the
+ * block, or Qnil for none. StringValue may run Ruby code (to_str). */
+static VALUE submit_body_reader(VALUE rb_opts) {
+  VALUE rb_body = Qnil;
+  if (!NIL_P(rb_opts)) {
+    rb_body = rb_hash_aref(rb_opts, ID2SYM(rb_intern("body")));
+  }
+  if (!NIL_P(rb_body)) {
+    StringValue(rb_body);
+    return rb_str_new_frozen(rb_body);
+  }
+  return rb_block_given_p() ? rb_block_proc() : Qnil;
+}
+
+/*
+ * The submit_* methods take the pointers into the header Strings only once
+ * nothing more can run Ruby code or allocate before nghttp3 copies them: Ruby
+ * code could change or drop the Strings, and an allocation could start a GC
+ * that moves them. So they first convert their arguments, which may call
+ * to_int and to_str, then check the connection, which that Ruby code may
+ * have closed, then allocate (the header array, and the reader entry), and
+ * only then fill the array and call nghttp3.
+ */
+
 /*
  * call-seq:
  *   connection.submit_request(stream_id, headers, body: nil) -> self
@@ -845,22 +870,17 @@ static const nghttp3_data_reader data_reader = {.read_data =
  */
 static VALUE rb_nghttp3_connection_submit_request(int argc, VALUE *argv,
                                                   VALUE self) {
-  VALUE rb_stream_id, rb_headers, rb_opts, rb_body;
+  VALUE rb_stream_id, rb_headers, rb_opts, reader;
   ConnectionObj *obj;
   int64_t stream_id;
   nghttp3_nv *nva;
   VALUE nva_buf;
-  size_t nvlen, i;
+  long nvlen, bad;
   int rv;
-  int has_body = 0;
 
   rb_scan_args(argc, argv, "2:", &rb_stream_id, &rb_headers, &rb_opts);
 
   TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
-
-  if (obj->conn == NULL || obj->is_closed) {
-    rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
-  }
 
   if (obj->is_server) {
     rb_raise(rb_eNghttp3InvalidStateError,
@@ -869,38 +889,32 @@ static VALUE rb_nghttp3_connection_submit_request(int argc, VALUE *argv,
 
   stream_id = NUM2LL(rb_stream_id);
   Check_Type(rb_headers, T_ARRAY);
+  reader = submit_body_reader(rb_opts);
+
+  if (obj->conn == NULL || obj->is_closed) {
+    rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
+  }
+
+  /* On the heap: a Ruby thread's machine stack is too small for a long
+   * list. */
   nvlen = RARRAY_LEN(rb_headers);
-
-  /* Allocate and convert headers, on the heap: a Ruby thread's machine
-   * stack is too small for a long list. */
   nva = ALLOCV_N(nghttp3_nv, nva_buf, nvlen);
-  for (i = 0; i < nvlen; i++) {
-    VALUE rb_nv = rb_ary_entry(rb_headers, i);
-    nva[i] = nghttp3_rb_nv_to_c(rb_nv);
+  if (!NIL_P(reader)) {
+    rb_hash_aset(obj->stream_data_readers, LL2NUM(stream_id), reader);
   }
 
-  /* Check for body */
-  rb_body = Qnil;
-  if (!NIL_P(rb_opts)) {
-    rb_body = rb_hash_aref(rb_opts, ID2SYM(rb_intern("body")));
+  bad = nghttp3_rb_nva_fill(rb_headers, nva, nvlen);
+  if (bad >= 0) {
+    ALLOCV_END(nva_buf);
+    if (!NIL_P(reader)) {
+      rb_hash_delete(obj->stream_data_readers, LL2NUM(stream_id));
+    }
+    nghttp3_rb_raise_bad_nv(bad);
   }
-
-  if (!NIL_P(rb_body)) {
-    StringValue(rb_body);
-    /* A frozen copy, so that the application cannot change the bytes
-     * nghttp3 will read. */
-    rb_hash_aset(obj->stream_data_readers, LL2NUM(stream_id),
-                 rb_str_new_frozen(rb_body));
-    has_body = 1;
-  } else if (rb_block_given_p()) {
-    VALUE block = rb_block_proc();
-    rb_hash_aset(obj->stream_data_readers, LL2NUM(stream_id), block);
-    has_body = 1;
-  }
-
-  rv = nghttp3_conn_submit_request(obj->conn, stream_id, nva, nvlen,
-                                   has_body ? &data_reader : NULL, NULL);
+  rv = nghttp3_conn_submit_request(obj->conn, stream_id, nva, (size_t)nvlen,
+                                   NIL_P(reader) ? NULL : &data_reader, NULL);
   ALLOCV_END(nva_buf);
+  RB_GC_GUARD(rb_headers);
   connection_raise_pending(obj);
 
   if (rv != 0) {
@@ -921,22 +935,17 @@ static VALUE rb_nghttp3_connection_submit_request(int argc, VALUE *argv,
  */
 static VALUE rb_nghttp3_connection_submit_response(int argc, VALUE *argv,
                                                    VALUE self) {
-  VALUE rb_stream_id, rb_headers, rb_opts, rb_body;
+  VALUE rb_stream_id, rb_headers, rb_opts, reader;
   ConnectionObj *obj;
   int64_t stream_id;
   nghttp3_nv *nva;
   VALUE nva_buf;
-  size_t nvlen, i;
+  long nvlen, bad;
   int rv;
-  int has_body = 0;
 
   rb_scan_args(argc, argv, "2:", &rb_stream_id, &rb_headers, &rb_opts);
 
   TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
-
-  if (obj->conn == NULL || obj->is_closed) {
-    rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
-  }
 
   if (!obj->is_server) {
     rb_raise(rb_eNghttp3InvalidStateError,
@@ -945,37 +954,30 @@ static VALUE rb_nghttp3_connection_submit_response(int argc, VALUE *argv,
 
   stream_id = NUM2LL(rb_stream_id);
   Check_Type(rb_headers, T_ARRAY);
+  reader = submit_body_reader(rb_opts);
+
+  if (obj->conn == NULL || obj->is_closed) {
+    rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
+  }
+
   nvlen = RARRAY_LEN(rb_headers);
-
-  /* Allocate and convert headers, on the heap, as submit_request does. */
   nva = ALLOCV_N(nghttp3_nv, nva_buf, nvlen);
-  for (i = 0; i < nvlen; i++) {
-    VALUE rb_nv = rb_ary_entry(rb_headers, i);
-    nva[i] = nghttp3_rb_nv_to_c(rb_nv);
+  if (!NIL_P(reader)) {
+    rb_hash_aset(obj->stream_data_readers, LL2NUM(stream_id), reader);
   }
 
-  /* Check for body */
-  rb_body = Qnil;
-  if (!NIL_P(rb_opts)) {
-    rb_body = rb_hash_aref(rb_opts, ID2SYM(rb_intern("body")));
+  bad = nghttp3_rb_nva_fill(rb_headers, nva, nvlen);
+  if (bad >= 0) {
+    ALLOCV_END(nva_buf);
+    if (!NIL_P(reader)) {
+      rb_hash_delete(obj->stream_data_readers, LL2NUM(stream_id));
+    }
+    nghttp3_rb_raise_bad_nv(bad);
   }
-
-  if (!NIL_P(rb_body)) {
-    StringValue(rb_body);
-    /* A frozen copy, so that the application cannot change the bytes
-     * nghttp3 will read. */
-    rb_hash_aset(obj->stream_data_readers, LL2NUM(stream_id),
-                 rb_str_new_frozen(rb_body));
-    has_body = 1;
-  } else if (rb_block_given_p()) {
-    VALUE block = rb_block_proc();
-    rb_hash_aset(obj->stream_data_readers, LL2NUM(stream_id), block);
-    has_body = 1;
-  }
-
-  rv = nghttp3_conn_submit_response(obj->conn, stream_id, nva, nvlen,
-                                    has_body ? &data_reader : NULL);
+  rv = nghttp3_conn_submit_response(obj->conn, stream_id, nva, (size_t)nvlen,
+                                    NIL_P(reader) ? NULL : &data_reader);
   ALLOCV_END(nva_buf);
+  RB_GC_GUARD(rb_headers);
   connection_raise_pending(obj);
 
   if (rv != 0) {
@@ -999,27 +1001,29 @@ static VALUE rb_nghttp3_connection_submit_info(VALUE self, VALUE rb_stream_id,
   int64_t stream_id;
   nghttp3_nv *nva;
   VALUE nva_buf;
-  size_t nvlen, i;
+  long nvlen, bad;
   int rv;
 
   TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
+
+  stream_id = NUM2LL(rb_stream_id);
+  Check_Type(rb_headers, T_ARRAY);
 
   if (obj->conn == NULL || obj->is_closed) {
     rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
   }
 
-  stream_id = NUM2LL(rb_stream_id);
-  Check_Type(rb_headers, T_ARRAY);
   nvlen = RARRAY_LEN(rb_headers);
-
   nva = ALLOCV_N(nghttp3_nv, nva_buf, nvlen);
-  for (i = 0; i < nvlen; i++) {
-    VALUE rb_nv = rb_ary_entry(rb_headers, i);
-    nva[i] = nghttp3_rb_nv_to_c(rb_nv);
-  }
 
-  rv = nghttp3_conn_submit_info(obj->conn, stream_id, nva, nvlen);
+  bad = nghttp3_rb_nva_fill(rb_headers, nva, nvlen);
+  if (bad >= 0) {
+    ALLOCV_END(nva_buf);
+    nghttp3_rb_raise_bad_nv(bad);
+  }
+  rv = nghttp3_conn_submit_info(obj->conn, stream_id, nva, (size_t)nvlen);
   ALLOCV_END(nva_buf);
+  RB_GC_GUARD(rb_headers);
   connection_raise_pending(obj);
 
   if (rv != 0) {
@@ -1044,27 +1048,29 @@ static VALUE rb_nghttp3_connection_submit_trailers(VALUE self,
   int64_t stream_id;
   nghttp3_nv *nva;
   VALUE nva_buf;
-  size_t nvlen, i;
+  long nvlen, bad;
   int rv;
 
   TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
+
+  stream_id = NUM2LL(rb_stream_id);
+  Check_Type(rb_trailers, T_ARRAY);
 
   if (obj->conn == NULL || obj->is_closed) {
     rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
   }
 
-  stream_id = NUM2LL(rb_stream_id);
-  Check_Type(rb_trailers, T_ARRAY);
   nvlen = RARRAY_LEN(rb_trailers);
-
   nva = ALLOCV_N(nghttp3_nv, nva_buf, nvlen);
-  for (i = 0; i < nvlen; i++) {
-    VALUE rb_nv = rb_ary_entry(rb_trailers, i);
-    nva[i] = nghttp3_rb_nv_to_c(rb_nv);
-  }
 
-  rv = nghttp3_conn_submit_trailers(obj->conn, stream_id, nva, nvlen);
+  bad = nghttp3_rb_nva_fill(rb_trailers, nva, nvlen);
+  if (bad >= 0) {
+    ALLOCV_END(nva_buf);
+    nghttp3_rb_raise_bad_nv(bad);
+  }
+  rv = nghttp3_conn_submit_trailers(obj->conn, stream_id, nva, (size_t)nvlen);
   ALLOCV_END(nva_buf);
+  RB_GC_GUARD(rb_trailers);
   connection_raise_pending(obj);
 
   if (rv != 0) {

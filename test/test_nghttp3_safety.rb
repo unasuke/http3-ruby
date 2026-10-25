@@ -123,6 +123,58 @@ class TestNghttp3Safety < Minitest::Test
     refute_empty encoded[:data]
   end
 
+  # The pointers into the header Strings are taken only once no Ruby code
+  # can run before nghttp3 copies them, so an NV's instance variables are
+  # read as they are: one that is not an NV with String name and value and
+  # flags of 0..255 is refused, to_str is not called, and nothing reaches
+  # nghttp3.
+  def test_bad_nvs_are_refused_without_running_ruby_code
+    value = Object.new
+    to_str_called = false
+    value.define_singleton_method(:to_str) { to_str_called = true }
+    bad_nvs = [
+      HTTP3::Nghttp3::NV.new("x-a", "a").tap { |nv| nv.instance_variable_set(:@name, 1) },
+      HTTP3::Nghttp3::NV.new("x-b", "b").tap { |nv| nv.instance_variable_set(:@value, value) },
+      HTTP3::Nghttp3::NV.new("x-c", "c").tap { |nv| nv.instance_variable_set(:@flags, "x") },
+      "x-d: d"
+    ]
+    message = "headers[4] is not an HTTP3::Nghttp3::NV with String name and value"
+    client = new_client
+    server = new_server
+    encoder = HTTP3::Nghttp3::QPACK::Encoder.new(0)
+    bad_nvs.each do |nv|
+      headers = request_headers + [nv]
+      assert_equal message, assert_raises(ArgumentError) { client.submit_request(REQUEST_STREAM, headers, body: "a") }.message
+      assert_equal message, assert_raises(ArgumentError) { client.submit_trailers(REQUEST_STREAM, headers) }.message
+      assert_equal message, assert_raises(ArgumentError) { server.submit_response(REQUEST_STREAM, headers) }.message
+      assert_equal message, assert_raises(ArgumentError) { server.submit_info(REQUEST_STREAM, headers) }.message
+      assert_equal message, assert_raises(ArgumentError) { encoder.encode(REQUEST_STREAM, headers) }.message
+    end
+    refute to_str_called
+
+    # The stream is still free for a request.
+    received = +""
+    callbacks = HTTP3::Nghttp3::Callbacks.new.on_recv_data { |_stream_id, data| received << data }
+    client.submit_request(REQUEST_STREAM, request_headers(method: "POST"), body: "the body")
+    transfer(client, new_server(callbacks))
+    assert_equal "the body", received
+  end
+
+  # The body's to_str runs before the connection is checked, and so before
+  # nghttp3 is called with a connection to_str has closed.
+  def test_connection_closed_by_the_body_to_str
+    client = new_client
+    body = Object.new
+    body.define_singleton_method(:to_str) do
+      client.close
+      "body"
+    end
+    error = assert_raises(HTTP3::Nghttp3::InvalidStateError) do
+      client.submit_request(REQUEST_STREAM, request_headers(method: "POST"), body: body)
+    end
+    assert_equal "Connection is closed", error.message
+  end
+
   def test_read_stream_takes_a_timestamp
     client = new_client
     client.submit_request(REQUEST_STREAM, request_headers)
