@@ -79,6 +79,7 @@ typedef struct {
   quic_ext_conn *qc;
   nghttp3_conn *h3;  /* made on handshake_completed, deleted by h3_fail */
   bool failed;       /* h3_fail has been called: h3 is gone for good */
+  int in_callback;   /* how deep the Ruby part is in h3_protect */
   st_table *streams; /* stream_id => h3_stream * */
   VALUE pending_exc; /* an exception the Ruby part raised in a callback */
   VALUE closed_ids;  /* ids of the streams nghttp3 closed, for #take_closed */
@@ -164,7 +165,9 @@ static void h3_stream_acked(h3_stream *st, uint64_t n) {
 
 static int h3_protect(h3_session *s, VALUE (*body)(VALUE), VALUE arg) {
   int state = 0;
+  s->in_callback++;
   rb_protect(body, arg, &state);
+  s->in_callback--;
   if (state == 0) {
     return 0;
   }
@@ -746,8 +749,24 @@ static h3_session *h3_session_get(VALUE self) {
   return s;
 }
 
-static h3_session *h3_session_get_open(VALUE self) {
+/* The session, for a method that may call into nghttp3 or the QUIC
+ * connection, or fail the connection. The Ruby part's callbacks run inside
+ * nghttp3 or inside the QUIC connection's packet handling, where none of
+ * that may happen, so such a method raises InvalidStateError there. */
+static h3_session *h3_session_enter(VALUE self) {
   h3_session *s = h3_session_get(self);
+  if (s->in_callback > 0) {
+    rb_raise(rb_eNghttp3InvalidStateError,
+             "#%" PRIsVALUE
+             " cannot be called from inside a callback of this session",
+             rb_id2str(rb_frame_this_func()));
+  }
+  return s;
+}
+
+/* h3_session_enter, for a method that needs the nghttp3 connection. */
+static h3_session *h3_session_get_open(VALUE self) {
+  h3_session *s = h3_session_enter(self);
   if (s->failed) {
     rb_raise(rb_eNghttp3InvalidStateError, "the HTTP/3 connection has failed");
   }
@@ -933,8 +952,8 @@ static int64_t h3_request_stream_id(VALUE rb_id) {
  * then ask the client to stop sending it, with H3_NO_ERROR.
  */
 static VALUE rb_http3_session_stop_reading(VALUE self, VALUE rb_id) {
-  h3_session *s = h3_session_get_open(self);
   int64_t id = h3_request_stream_id(rb_id);
+  h3_session *s = h3_session_get_open(self);
   int rv = nghttp3_conn_shutdown_stream_read(s->h3, id);
   if (rv != 0) {
     h3_raise(s, rv, "Failed to stop reading the stream");
@@ -957,7 +976,7 @@ static VALUE rb_http3_session_stop_reading(VALUE self, VALUE rb_id) {
  * Queue a frozen copy of str as the next piece of the response body.
  */
 static VALUE rb_http3_session_push_chunk(VALUE self, VALUE rb_id, VALUE str) {
-  h3_session *s = h3_session_get(self);
+  h3_session *s = h3_session_enter(self);
   StringValue(str);
   VALUE copy = rb_str_new_frozen(str);
   h3_stream *st = h3_session_stream(self, rb_id);
@@ -983,7 +1002,7 @@ static VALUE rb_http3_session_push_chunk(VALUE self, VALUE rb_id, VALUE str) {
  * Mark the end of the response body.
  */
 static VALUE rb_http3_session_push_eof(VALUE self, VALUE rb_id) {
-  h3_session *s = h3_session_get(self);
+  h3_session *s = h3_session_enter(self);
   h3_stream *st = h3_session_stream(self, rb_id);
   st->eof = true;
   h3_stream_wake(s, st);
@@ -1002,7 +1021,7 @@ static VALUE rb_http3_session_push_eof(VALUE self, VALUE rb_id) {
  */
 static VALUE rb_http3_session_attach_file(VALUE self, VALUE rb_id, VALUE io,
                                           VALUE offset, VALUE length) {
-  h3_session *s = h3_session_get(self);
+  h3_session *s = h3_session_enter(self);
   /* The arguments first, as #push_chunk does: io.fileno is Ruby code. */
   int64_t id = NUM2LL(rb_id);
   off_t off = NUM2OFFT(offset);
@@ -1081,7 +1100,7 @@ static VALUE rb_http3_session_take_error(VALUE self) {
  * served.
  */
 static VALUE rb_http3_session_shutdown_notice(VALUE self) {
-  h3_session *s = h3_session_get(self);
+  h3_session *s = h3_session_enter(self);
   if (s->h3 == NULL) {
     return self;
   }
@@ -1101,7 +1120,7 @@ static VALUE rb_http3_session_shutdown_notice(VALUE self) {
  */
 static VALUE rb_http3_session_abort_stream(VALUE self, VALUE rb_id,
                                            VALUE rb_code) {
-  h3_session *s = h3_session_get(self);
+  h3_session *s = h3_session_enter(self);
   int64_t id = NUM2LL(rb_id);
   uint64_t code = NUM2ULL(rb_code);
   if (s->h3 != NULL) {
