@@ -46,25 +46,32 @@ static VALUE encoder_alloc(VALUE klass) {
  * call-seq:
  *   Encoder.new(max_dtable_capacity) -> Encoder
  *
- * Creates a new QPACK encoder.
+ * Creates a new QPACK encoder. Called again, it starts over with a new
+ * encoder and frees the old one; if the new one cannot be made, it raises
+ * and the old one stays.
  */
 static VALUE rb_nghttp3_qpack_encoder_initialize(VALUE self,
                                                  VALUE rb_max_capacity) {
   EncoderObj *obj;
+  nghttp3_qpack_encoder *encoder;
   size_t max_capacity;
   int rv;
 
   TypedData_Get_Struct(self, EncoderObj, &encoder_data_type, obj);
 
   max_capacity = NUM2SIZET(rb_max_capacity);
-  obj->hard_max_dtable_capacity = max_capacity;
 
-  rv = nghttp3_qpack_encoder_new(&obj->encoder, max_capacity,
-                                 nghttp3_mem_default());
+  rv = nghttp3_qpack_encoder_new(&encoder, max_capacity, nghttp3_mem_default());
 
   if (rv != 0) {
     nghttp3_rb_raise(rv, "Failed to create QPACK encoder");
   }
+
+  if (obj->encoder != NULL) {
+    nghttp3_qpack_encoder_del(obj->encoder);
+  }
+  obj->encoder = encoder;
+  obj->hard_max_dtable_capacity = max_capacity;
 
   return self;
 }
@@ -316,12 +323,15 @@ static VALUE decoder_alloc(VALUE klass) {
  * call-seq:
  *   Decoder.new(max_dtable_capacity, max_blocked_streams) -> Decoder
  *
- * Creates a new QPACK decoder.
+ * Creates a new QPACK decoder. Called again, it starts over with a new
+ * decoder and frees the old one with the streams it was decoding; if the
+ * new one cannot be made, it raises and the old one stays.
  */
 static VALUE rb_nghttp3_qpack_decoder_initialize(VALUE self,
                                                  VALUE rb_max_capacity,
                                                  VALUE rb_max_blocked) {
   DecoderObj *obj;
+  nghttp3_qpack_decoder *decoder;
   size_t max_capacity, max_blocked;
   int rv;
 
@@ -329,15 +339,23 @@ static VALUE rb_nghttp3_qpack_decoder_initialize(VALUE self,
 
   max_capacity = NUM2SIZET(rb_max_capacity);
   max_blocked = NUM2SIZET(rb_max_blocked);
-  obj->hard_max_dtable_capacity = max_capacity;
-  obj->max_blocked_streams = max_blocked;
 
-  rv = nghttp3_qpack_decoder_new(&obj->decoder, max_capacity, max_blocked,
+  rv = nghttp3_qpack_decoder_new(&decoder, max_capacity, max_blocked,
                                  nghttp3_mem_default());
 
   if (rv != 0) {
     nghttp3_rb_raise(rv, "Failed to create QPACK decoder");
   }
+
+  /* The stream contexts are of the old decoder's field sections. */
+  st_foreach(obj->stream_contexts, free_stream_context_i, 0);
+  st_clear(obj->stream_contexts);
+  if (obj->decoder != NULL) {
+    nghttp3_qpack_decoder_del(obj->decoder);
+  }
+  obj->decoder = decoder;
+  obj->hard_max_dtable_capacity = max_capacity;
+  obj->max_blocked_streams = max_blocked;
 
   return self;
 }

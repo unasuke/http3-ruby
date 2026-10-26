@@ -138,6 +138,28 @@ class TestNghttp3QPACK < Minitest::Test
     assert_equal 1, decoder.decode(2000 * 4, "\x00".b)[:consumed]
   end
 
+  # initialize, called again, starts over with the new settings: the old
+  # encoder or decoder goes, and with the decoder the field sections it was
+  # in the middle of.
+  def test_initialize_again_starts_over
+    headers = [HTTP3::Nghttp3::NV.new("x-field", "value")]
+    encoder = HTTP3::Nghttp3::QPACK::Encoder.new(0)
+    encoder.max_dtable_capacity = 4096
+    assert_empty encoder.encode(0, headers)[:encoder_stream]
+    encoder.send(:initialize, 4096)
+    encoder.max_dtable_capacity = 4096
+    refute_empty encoder.encode(0, headers)[:encoder_stream]
+
+    decoder = HTTP3::Nghttp3::QPACK::Decoder.new(0, 0)
+    assert_raises(HTTP3::Nghttp3::InvalidArgumentError) { decoder.max_dtable_capacity = 4096 }
+    decoder.decode(0, "\x00".b)
+    decoder.send(:initialize, 4096, 100)
+    decoder.max_dtable_capacity = 4096
+    encoded = HTTP3::Nghttp3::QPACK::Encoder.new(0).encode(0, headers)
+    result = decoder.decode(0, encoded[:prefix] + encoded[:data], fin: true)
+    assert_equal [["x-field", "value"]], result[:headers].map { |h| [h[:name], h[:value]] }
+  end
+
   # ============== Roundtrip tests ==============
 
   def test_encode_decode_roundtrip_static_table_only
