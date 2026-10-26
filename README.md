@@ -77,10 +77,21 @@ A request gets 413, 431 or 503 as soon as it passes a limit, without waiting
 for the rest of it, and the server reads no more of it (STOP_SENDING with
 H3_NO_ERROR). The 503 has neither headers nor body.
 
+A request gets 400, without the application seeing it, when its scheme is
+not `http` or `https`, its path has a fragment, its authority is not `host`
+or `host:port`, or its `:authority` and `host` field differ. `CONNECT` gets
+501: the server opens no tunnels.
+
 Response bodies may be files (`to_path`, sent 16 KiB at a time as the
-connection takes them), arrays or anything with `each`. Streaming bodies
-(`call`) are not supported and get 500, as do response headers whose names
-are not lowercase tokens or whose values contain NUL, CR or LF.
+connection takes them), arrays or anything with `each`. These get 500:
+streaming bodies (`call`), which are not supported; a status outside
+200..599; response headers whose names are not lowercase tokens or whose
+values contain NUL, CR or LF; a `content-length` given more than once, not a
+number, or not the length of a file or array body; and an array body with a
+chunk that is not a String. A body read with `each` is counted as it is
+sent, and its stream is aborted (H3_INTERNAL_ERROR) once it goes past
+`content-length` or ends short of it. The `content-length` of a 204 is
+dropped.
 
 ### Signals
 

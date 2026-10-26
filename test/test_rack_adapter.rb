@@ -20,6 +20,79 @@ class TestRackAdapter < Minitest::Test
     assert_equal "198.51.100.7", env["REMOTE_ADDR"]
   end
 
+  # A request the Rack env cannot carry is answered with 400, and the
+  # application is not called.
+  def test_schemes_other_than_http_and_https_get_400
+    [[[":scheme", "file"], [":path", "etc/passwd"]], [[":scheme", "ftp"], [":path", "/"]]].each do |headers|
+      response, env = exchange([*headers, [":authority", "localhost"]])
+      assert_equal 400, response.status, headers.inspect
+      assert_empty response.headers
+      assert_nil response.body
+      assert_nil env
+    end
+  end
+
+  def test_scheme_is_lowercased
+    env = env_for([[":scheme", "HTTPS"], [":path", "/"], [":authority", "localhost"]])
+    assert_equal "https", env["rack.url_scheme"]
+  end
+
+  # Rack forbids a fragment, which nghttp3 lets through.
+  def test_path_with_a_fragment_gets_400
+    response, env = exchange([[":path", "/a#b"], [":authority", "localhost"]])
+    assert_equal 400, response.status
+    assert_nil env
+  end
+
+  def test_malformed_authority_gets_400
+    ["example.com:abc", "a:b:c", "[2001:db8::1", "2001:db8::1]"].each do |authority|
+      response, env = exchange([[":path", "/"], [":authority", authority]])
+      assert_equal 400, response.status, authority
+      assert_nil env
+    end
+    response, env = exchange([[":path", "/"], ["host", "example.com:abc"]])
+    assert_equal 400, response.status
+    assert_nil env
+  end
+
+  # The port is checked for digits only, as Rack Lint does; an empty one
+  # is the scheme's.
+  def test_authority_ports
+    env = env_for([[":path", "/"], [":authority", "example.com:"]])
+    assert_equal ["example.com", "443"], env.values_at("SERVER_NAME", "SERVER_PORT")
+    env = env_for([[":scheme", "http"], [":path", "/"], [":authority", "example.com"]])
+    assert_equal ["example.com", "80"], env.values_at("SERVER_NAME", "SERVER_PORT")
+    env = env_for([[":path", "/"], [":authority", "[2001:db8::1]:8443"]])
+    assert_equal ["[2001:db8::1]", "8443"], env.values_at("SERVER_NAME", "SERVER_PORT")
+    assert_equal "[2001:db8::1]:8443", env["HTTP_HOST"]
+  end
+
+  # RFC 9114 section 4.3.1: if both are present, they must be the same.
+  def test_authority_and_host_that_differ_get_400
+    response, env = exchange([[":path", "/"], [":authority", "a.example"], ["host", "b.example"]])
+    assert_equal 400, response.status
+    assert_nil env
+    env = env_for([[":path", "/"], [":authority", "a.example"], ["host", "a.example"]])
+    assert_equal "a.example", env["HTTP_HOST"]
+  end
+
+  # The server opens no tunnels: CONNECT, which has neither :scheme nor
+  # :path, gets 501 before anything else is looked at.
+  def test_connect_gets_501
+    adapter_called = false
+    adapter = HTTP3::RackAdapter.new(lambda do |_env|
+      adapter_called = true
+      [200, {}, []]
+    end)
+    request = HTTP3::Request.new(stream_id: 0, headers: [[":method", "CONNECT"], [":authority", "example.com:443"]],
+      body: "".b)
+    response = adapter.call(request, remote: REMOTE)
+    assert_equal 501, response.status
+    assert_empty response.headers
+    assert_nil response.body
+    refute adapter_called
+  end
+
   def test_repeated_fields_are_joined_and_cookies_with_semicolons
     env = env_for([["accept", "a"], ["accept", "b"], ["cookie", "x=1"], ["cookie", "y=2"],
       ["content-type", "text/plain"]])
@@ -64,6 +137,81 @@ class TestRackAdapter < Minitest::Test
     assert_equal [["x-a", "tab\tand space"]], respond([200, {"x-a" => "tab\tand space"}, []]).headers
   end
 
+  # Only a final status can end a response; the body is closed.
+  def test_status_that_is_not_final_is_refused
+    [99, 100, 199, 600].each do |status|
+      body = ClosableBody.new
+      error = assert_raises(HTTP3::RackAdapter::InvalidResponse, status.to_s) { respond([status, {}, body]) }
+      assert_equal "status #{status} is not a final status (200..599)", error.message
+      assert body.closed, status.to_s
+    end
+    assert_equal 599, respond([599, {}, []]).status
+  end
+
+  def test_content_length_must_be_one_number
+    {["3", "3"] => "content-length is given more than once", "abc" => "content-length is not a number",
+     "-1" => "content-length is not a number"}.each do |value, message|
+      error = assert_raises(HTTP3::RackAdapter::InvalidResponse, value.inspect) do
+        respond([200, {"content-length" => value}, ["abc"]])
+      end
+      assert_equal message, error.message
+    end
+    assert_equal [["content-length", "3"]], respond([200, {"content-length" => "3"}, ["abc"]]).headers
+  end
+
+  # A body whose length is known is held against content-length before
+  # anything is sent; the Rack body is closed once, and the file too.
+  def test_content_length_a_known_body_does_not_have
+    body = ArrayBody.new(["abc"], 0)
+    error = assert_raises(HTTP3::RackAdapter::InvalidResponse) { respond([200, {"content-length" => "4"}, body]) }
+    assert_equal "the body is 3 bytes but content-length says otherwise", error.message
+    assert_equal 1, body.closes
+
+    Dir.mktmpdir do |dir|
+      path = File.join(File.realpath(dir), "file")
+      File.write(path, "content")
+      body = CountedPathBody.new(path, 0)
+      error = assert_raises(HTTP3::RackAdapter::InvalidResponse) { respond([200, {"content-length" => "8"}, body]) }
+      assert_equal "the body is 7 bytes but content-length says otherwise", error.message
+      assert_equal 1, body.closes
+      assert_empty descriptors_of(path) if File.directory?("/proc/self/fd")
+    end
+  end
+
+  # Before, a chunk that is not a String was only found once the headers
+  # had gone; now the response is refused, with or without content-length.
+  def test_array_body_chunks_must_be_strings
+    error = assert_raises(HTTP3::RackAdapter::InvalidResponse) { respond([200, {}, ["a", 1]]) }
+    assert_equal "body chunk must be a String (got Integer)", error.message
+  end
+
+  # A body read with each is counted as it is read: the next that goes past
+  # content-length raises, and so does the last one of a body that ends
+  # short of it.
+  def test_each_body_is_counted_against_content_length
+    enum = respond([200, {"content-length" => "3"}, EachBody.new(["ab", "cd"])]).body.enum
+    assert_equal "ab", enum.next
+    error = assert_raises(HTTP3::RackAdapter::InvalidResponse) { enum.next }
+    assert_equal "the body is at least 4 bytes but content-length says otherwise", error.message
+
+    enum = respond([200, {"content-length" => "5"}, EachBody.new(["ab", "cd"])]).body.enum
+    assert_equal ["ab", "cd"], [enum.next, enum.next]
+    error = assert_raises(HTTP3::RackAdapter::InvalidResponse) { enum.next }
+    assert_equal "the body is 4 bytes but content-length says otherwise", error.message
+
+    enum = respond([200, {"content-length" => "4"}, EachBody.new(["ab", "cd"])]).body.enum
+    assert_equal ["ab", "cd"], [enum.next, enum.next]
+    assert_raises(StopIteration) { enum.next }
+  end
+
+  # No body is sent for HEAD, 204 or 304, so content-length is not held
+  # against one; a 204 must not have one at all (RFC 9110 section 8.6).
+  def test_content_length_without_a_body
+    assert_equal [["content-length", "100"]], respond([200, {"content-length" => "100"}, ["x"]], method: "HEAD").headers
+    assert_equal [["content-length", "100"]], respond([304, {"content-length" => "100"}, []]).headers
+    assert_empty respond([204, {"content-length" => "100"}, []]).headers
+  end
+
   def test_head_and_204_have_no_body_and_close_it
     body = ClosableBody.new
     assert_nil respond([200, {}, body], method: "HEAD").body
@@ -101,15 +249,63 @@ class TestRackAdapter < Minitest::Test
     end
   end
 
+  # A file body that counts its closes.
+  CountedPathBody = Struct.new(:to_path, :closes) do
+    def each
+      yield File.binread(to_path)
+    end
+
+    def close
+      self.closes += 1
+    end
+  end
+
+  # A Rack 3 body with to_ary, which closes it.
+  ArrayBody = Struct.new(:chunks, :closes) do
+    def each(&)
+      chunks.each(&)
+    end
+
+    def to_ary
+      close
+      chunks
+    end
+
+    def close
+      self.closes += 1
+    end
+  end
+
+  # A body read with each only.
+  EachBody = Struct.new(:chunks) do
+    def each(&)
+      chunks.each(&)
+    end
+  end
+
   private
 
+  # A request with headers, and :method and :scheme ("https") unless headers
+  # has them.
   def request(headers, method: "GET")
+    defaults = [[":method", method], [":scheme", "https"]].reject { |name, _| headers.assoc(name) }
     HTTP3::Request.new(
       stream_id: 0,
-      headers: [[":method", method], [":scheme", "https"], *headers.select { |name, _| name.start_with?(":") },
+      headers: [*defaults, *headers.select { |name, _| name.start_with?(":") },
         *headers.reject { |name, _| name.start_with?(":") }],
       body: "".b
     )
+  end
+
+  # The response to a request with headers, and the env the application got,
+  # or nil if it was not called.
+  def exchange(headers)
+    env = nil
+    adapter = HTTP3::RackAdapter.new(lambda do |e|
+      env = e
+      [200, {}, []]
+    end)
+    [adapter.call(request(headers), remote: REMOTE), env]
   end
 
   def env_for(headers)
@@ -121,6 +317,15 @@ class TestRackAdapter < Minitest::Test
     headers = [[":path", "/"], [":authority", "localhost"], *headers] unless headers.assoc(":path")
     adapter.call(request(headers), remote: REMOTE)
     env
+  end
+
+  # The descriptors of this process open on path (Linux).
+  def descriptors_of(path)
+    Dir.children("/proc/self/fd").map(&:to_i).select do |fd|
+      File.readlink("/proc/self/fd/#{fd}") == path
+    rescue Errno::ENOENT
+      false
+    end
   end
 
   def respond(triple, method: "GET")

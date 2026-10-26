@@ -8,11 +8,22 @@ module HTTP3
     CONNECTION_FIELDS: Array[String]
     FIELD_NAME: Regexp
     FORBIDDEN_IN_VALUE: Regexp
+    # The schemes a request may have.
+    SCHEMES: Array[String]
+    # What :authority, or host, must look like.
+    AUTHORITY: Regexp
 
     def initialize: (untyped app) -> void
 
-    # Raises what the application raises, and InvalidResponse for an
-    # answer that cannot be sent; the Rack body is closed either way.
+    # Answers, without calling the application, CONNECT with 501, and with
+    # 400 a request whose scheme is not http or https, whose path has a
+    # fragment, or whose authority is malformed or differs from its host
+    # field. Raises what the application raises, and InvalidResponse for an
+    # answer that cannot be sent (among them a status outside 200..599, and
+    # a content-length that is malformed or that a file or array body does
+    # not have); the Rack body is closed either way. A body read with each
+    # raises InvalidResponse from next once it passes content-length or ends
+    # short of it.
     def call: (Request request, remote: Addrinfo) -> Response
   end
 end

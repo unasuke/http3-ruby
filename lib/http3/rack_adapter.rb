@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "stringio"
+require "uri"
 
 module HTTP3
   # Calls a Rack 3 application for an HTTP3::Request and turns what it
@@ -9,6 +10,18 @@ module HTTP3
     # The application's response breaks the Rack 3 specification; the
     # server answers 500 instead.
     class InvalidResponse < StandardError; end
+
+    # The request cannot be put in a Rack env; it is answered with 400.
+    class BadRequest < StandardError; end
+    private_constant :BadRequest
+
+    # The schemes a Rack env may carry (Rack also allows ws and wss, which
+    # HTTP/3 has no use for).
+    SCHEMES = %w[http https].freeze
+
+    # An authority, "host" or "host:port" (RFC 3986 section 3.2), as Rack
+    # Lint checks HTTP_HOST: the port is digits, of any number, or none.
+    AUTHORITY = /\A(?<host>#{URI::RFC3986_Parser::HOST})(?::(?<port>\d*))?\z/
 
     # Connection-specific fields, which HTTP/3 forbids (RFC 9114 section
     # 4.2).
@@ -25,16 +38,37 @@ module HTTP3
       @app = app
     end
 
-    # remote is the client's address, an Addrinfo. Raises whatever the
-    # application raises, and InvalidResponse for a response that cannot be
-    # sent; the Rack body is closed in both cases.
+    # remote is the client's address, an Addrinfo. CONNECT is answered with
+    # 501, and a request the Rack env cannot carry with 400, without calling
+    # the application. Raises whatever the application raises, and
+    # InvalidResponse for a response that cannot be sent; the Rack body is
+    # closed in both cases.
     def call(request, remote:)
-      status, headers, body = @app.call(env_for(request, remote))
+      # The server cannot open a tunnel (RFC 9114 section 4.4), and a
+      # CONNECT request has neither :scheme nor :path, so the env would be
+      # made up. The Session leaves nghttp3's enable_connect_protocol off,
+      # so nghttp3 refuses the :protocol of an extended CONNECT (RFC 9220).
+      return Response.new(status: 501, headers: [], body: nil) if request.headers.assoc(":method")&.last == "CONNECT"
+
+      env = env_for(request, remote)
+    rescue BadRequest
+      # Not logged: the client sent it, the server did not fail.
+      Response.new(status: 400, headers: [], body: nil)
+    else
+      status, headers, body = @app.call(env)
       response_for(request, status, headers, body)
     end
 
     private
 
+    # Raises BadRequest for what Rack does not allow, or allows in a form
+    # the application might read differently from the client, in this
+    # order: a scheme other than http and https, a fragment in the path, an
+    # authority that is not one (RFC 3986 section 3.2), and an :authority
+    # and a host field that disagree (RFC 9114 section 4.3.1). nghttp3 has
+    # already refused a request without :scheme, :path, or both :authority
+    # and host (but CONNECT); the defaults are for calling the adapter
+    # directly.
     def env_for(request, remote)
       pseudo = {}
       fields = {}
@@ -46,18 +80,33 @@ module HTTP3
         end
       end
 
-      path, query = pseudo.fetch(":path", "/").split("?", 2)
-      scheme = pseudo.fetch(":scheme", "https")
-      authority = pseudo[":authority"] || fields["host"]&.first || "localhost"
-      server_name, server_port = split_authority(authority, scheme)
+      # nghttp3 takes either case of http and https; Rack wants them in
+      # lowercase.
+      scheme = pseudo.fetch(":scheme", "https").downcase
+      raise BadRequest, "scheme #{scheme} is not http or https" unless SCHEMES.include?(scheme)
+
+      # nghttp3 lets a fragment through; Rack forbids one.
+      target = pseudo.fetch(":path", "/")
+      raise BadRequest, "the path has a fragment" if target.include?("#")
+
+      path, query = target.split("?", 2)
+      host = fields["host"]&.first
+      authority = pseudo[":authority"] || host || "localhost"
+      match = AUTHORITY.match(authority) or raise BadRequest, "the authority is malformed"
+      if pseudo[":authority"] && host && host != pseudo[":authority"]
+        raise BadRequest, ":authority and host differ"
+      end
+
+      port = match[:port]
+      port = (scheme == "http") ? "80" : "443" if port.nil? || port.empty?
 
       env = {
         "REQUEST_METHOD" => pseudo.fetch(":method", "GET"),
         "SCRIPT_NAME" => "",
         "PATH_INFO" => path,
         "QUERY_STRING" => query || "",
-        "SERVER_NAME" => server_name,
-        "SERVER_PORT" => server_port,
+        "SERVER_NAME" => match[:host],
+        "SERVER_PORT" => port,
         "SERVER_PROTOCOL" => "HTTP/3",
         "REMOTE_ADDR" => remote.ip_address,
         "HTTP_HOST" => authority,
@@ -88,33 +137,43 @@ module HTTP3
       end
     end
 
-    # "host", "host:port", "[v6]" or "[v6]:port"; the port defaults to the
-    # scheme's.
-    def split_authority(authority, scheme)
-      default_port = (scheme == "http") ? "80" : "443"
-      if (match = authority.match(/\A(\[[^\]]*\])(?::(\d+))?\z/))
-        [match[1], match[2] || default_port]
-      else
-        host, port = authority.split(":", 2)
-        [host, port || default_port]
-      end
-    end
-
-    # The Rack body is closed here unless it goes on in the Response.
+    # The Rack body is closed here unless it goes on in the Response, or
+    # to_ary has closed it (body_for yields then).
     def response_for(request, status, headers, body)
       response = nil
       status = Integer(status)
+      # A 1xx is no final response, which is all HTTP/3 can send here (Rack
+      # Lint only asks for 100 or more).
+      unless (200..599).cover?(status)
+        raise InvalidResponse, "status #{status} is not a final status (200..599)"
+      end
       headers = header_pairs(headers)
+      # A 204 must not have one (RFC 9110 section 8.6); it is dropped as the
+      # connection-specific fields are.
+      headers = headers.reject { |pair| pair.first == "content-length" } if status == 204
+      length = content_length(headers)
 
       method = request.headers.assoc(":method")&.last
-      response = if method == "HEAD" || status < 200 || status == 204 || status == 304
+      response = if method == "HEAD" || status == 204 || status == 304
+        # No body is sent, so content-length is not held against one.
         close_rack_body(body)
         Response.new(status: status, headers: headers, body: nil)
       else
-        Response.new(status: status, headers: headers, body: body_for(body))
+        Response.new(status: status, headers: headers, body: body_for(body, length) { body = nil })
       end
     ensure
       close_rack_body(body) if response.nil?
+    end
+
+    # The content-length among headers, as an Integer, or nil if there is
+    # none. The message leaves the value out, as header_pairs's do.
+    def content_length(headers)
+      values = headers.filter_map { |name, value| value if name == "content-length" }
+      return nil if values.empty?
+      raise InvalidResponse, "content-length is given more than once" if values.size > 1
+      raise InvalidResponse, "content-length is not a number" unless values.first.match?(/\A\d+\z/)
+
+      Integer(values.first, 10)
     end
 
     # Rack 3 headers: lowercase names, each value a String or an Array of
@@ -141,18 +200,60 @@ module HTTP3
       pairs
     end
 
-    def body_for(body)
+    # The body to send. One whose length is known before it is sent, a file
+    # or an Array, is held against length, the content-length, now; one
+    # read with each, as it is read (#counted).
+    def body_for(body, length)
       if body.respond_to?(:to_path)
         io = ::File.open(body.to_path, "rb")
+        if length && io.size != length
+          size = io.size
+          io.close
+          raise length_mismatch(size)
+        end
         Body::File.new(io: io, offset: 0, length: io.size, rack_body: body)
       elsif body.respond_to?(:to_ary)
         # Rack 3 has to_ary close the body itself.
-        Body::Chunks.new(enum: body.to_ary.each, rack_body: nil)
+        chunks = body.to_ary
+        yield
+        # Checked before anything is sent, which Session#fill_bodies would
+        # only find out once the headers have gone.
+        chunks.each do |chunk|
+          raise InvalidResponse, "body chunk must be a String (got #{chunk.class})" unless chunk.is_a?(String)
+        end
+        size = chunks.sum(&:bytesize)
+        raise length_mismatch(size) if length && size != length
+
+        Body::Chunks.new(enum: chunks.each, rack_body: nil)
       elsif body.respond_to?(:each)
-        Body::Chunks.new(enum: body.to_enum(:each), rack_body: body)
+        enum = length ? counted(body, length) : body.to_enum(:each)
+        Body::Chunks.new(enum: enum, rack_body: body)
       else
         raise InvalidResponse, "streaming bodies (#{body.class}) are not supported"
       end
+    end
+
+    # The chunks of body's each, raising InvalidResponse from next once they
+    # pass length bytes, or end short of it. Session#fill_bodies aborts the
+    # stream then, since the headers have gone. A chunk that is not a String
+    # goes on to fill_bodies, which refuses it.
+    def counted(body, length)
+      Enumerator.new do |y|
+        size = 0
+        body.each do |chunk|
+          size += chunk.bytesize if chunk.is_a?(String)
+          if size > length
+            raise InvalidResponse, "the body is at least #{size} bytes but content-length says otherwise"
+          end
+
+          y << chunk
+        end
+        raise length_mismatch(size) if size < length
+      end
+    end
+
+    def length_mismatch(size)
+      InvalidResponse.new("the body is #{size} bytes but content-length says otherwise")
     end
 
     def close_rack_body(body)
