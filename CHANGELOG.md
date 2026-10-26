@@ -36,6 +36,7 @@
 - Calling `QPACK::Encoder#initialize` or `QPACK::Decoder#initialize` again frees the old encoder or decoder, which leaked, and a decoder's stream contexts, from which it went on decoding a stream in the old state. ([#13](https://github.com/unasuke/http3-ruby/pull/13))
 - The Rack env no longer carries what the client sent unchecked: the scheme goes in lowercase, and an empty port is the scheme's default. Before, a scheme such as file or ftp became `rack.url_scheme`, a fragment stayed in `PATH_INFO`, an authority such as `example.com:abc` was split into `SERVER_NAME` and `SERVER_PORT` however it fell apart, and `:authority` won over a `host` field that said otherwise. ([#14](https://github.com/unasuke/http3-ruby/pull/14))
 - An array body with a chunk that is not a String is answered with 500 before anything is sent. Before, its headers went out and then its stream was aborted. ([#14](https://github.com/unasuke/http3-ruby/pull/14))
+- `HTTP3::Nghttp3::Connection#read_stream` takes frozen data, such as a String literal under `frozen_string_literal`. Before, it raised `FrozenError`. ([#16](https://github.com/unasuke/http3-ruby/pull/16))
 
 ## [0.0.3] - 2026-10-13
 

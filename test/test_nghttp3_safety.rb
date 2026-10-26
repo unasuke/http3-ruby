@@ -207,7 +207,7 @@ class TestNghttp3Safety < Minitest::Test
     assert_raises(RuntimeError) { transfer(client, server) }
 
     [
-      -> { server.read_stream(REQUEST_STREAM, +"") },
+      -> { server.read_stream(REQUEST_STREAM, "") },
       -> { server.writev_stream },
       -> { server.submit_response(REQUEST_STREAM, [HTTP3::Nghttp3::NV.new(":status", "200")]) }
     ].each do |call|
@@ -242,6 +242,38 @@ class TestNghttp3Safety < Minitest::Test
     transfer(client, server)
     transfer(server, client)
     assert_equal [[":status", "204"]], received
+  end
+
+  # read_stream locks the data while nghttp3 reads it, so that a callback
+  # cannot change it, and unlocks it after; frozen data needs no lock.
+  def test_read_stream_locks_data_that_is_not_frozen
+    data = nil
+    callbacks = HTTP3::Nghttp3::Callbacks.new.on_begin_headers { |_stream_id| data << "x" }
+    client = new_client
+    client.submit_request(REQUEST_STREAM, request_headers)
+    server = new_server(callbacks)
+    error = assert_raises(RuntimeError) do
+      while (out = client.writev_stream)
+        data = out[:data]
+        server.read_stream(out[:stream_id], data, fin: out[:fin])
+        client.add_write_offset(out[:stream_id], data.bytesize)
+      end
+    end
+    assert_match(/temporarily locked/, error.message)
+    data << "x"
+  end
+
+  def test_read_stream_takes_frozen_data
+    headers = []
+    callbacks = HTTP3::Nghttp3::Callbacks.new.on_recv_header { |_stream_id, name, value, _flags| headers << [name, value] }
+    client = new_client
+    client.submit_request(REQUEST_STREAM, request_headers)
+    server = new_server(callbacks)
+    while (out = client.writev_stream)
+      server.read_stream(out[:stream_id], out[:data].freeze, fin: out[:fin])
+      client.add_write_offset(out[:stream_id], out[:data].bytesize)
+    end
+    assert_includes headers, [":method", "GET"]
   end
 
   def test_read_stream_takes_a_timestamp

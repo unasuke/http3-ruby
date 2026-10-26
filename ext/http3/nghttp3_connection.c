@@ -516,6 +516,7 @@ struct read_stream_args {
   ConnectionObj *obj;
   int64_t stream_id;
   VALUE data;
+  int locked; /* read_stream locked data, and read_stream_unlock unlocks it */
   int fin;
   nghttp3_tstamp ts;
 };
@@ -539,7 +540,10 @@ static VALUE read_stream_body(VALUE arg) {
 }
 
 static VALUE read_stream_unlock(VALUE arg) {
-  rb_str_unlocktmp(((struct read_stream_args *)arg)->data);
+  struct read_stream_args *a = (struct read_stream_args *)arg;
+  if (a->locked) {
+    rb_str_unlocktmp(a->data);
+  }
   return Qnil;
 }
 
@@ -589,8 +593,12 @@ static VALUE rb_nghttp3_connection_read_stream(int argc, VALUE *argv,
         "client-initiated bidirectional or server-initiated unidirectional");
   }
 
-  /* Callbacks run Ruby code, which must not change data under nghttp3. */
-  rb_str_locktmp(rb_data);
+  /* Callbacks run Ruby code, which must not change data under nghttp3. A
+   * frozen String cannot be changed, and rb_str_locktmp refuses one. */
+  args.locked = !OBJ_FROZEN(rb_data);
+  if (args.locked) {
+    rb_str_locktmp(rb_data);
+  }
   return rb_ensure(read_stream_body, (VALUE)&args, read_stream_unlock,
                    (VALUE)&args);
 }

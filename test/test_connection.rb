@@ -450,7 +450,7 @@ class TestNghttp3Connection < Minitest::Test
     decoder = HTTP3::Nghttp3::QPACK::Decoder.new(0, 0)
     [-1, 2**62, 2**64].each do |id|
       [
-        -> { server.read_stream(id, +"") },
+        -> { server.read_stream(id, "") },
         -> { server.shutdown_stream_read(id) },
         -> { client.submit_request(id, request_headers) },
         -> { HTTP3::Nghttp3::Connection.client_new.bind_control_stream(id) },
@@ -468,9 +468,9 @@ class TestNghttp3Connection < Minitest::Test
   # A server reads the streams the client opens, a client the request
   # streams and the server's unidirectional streams.
   def test_read_stream_refuses_a_stream_of_the_wrong_kind
-    error = assert_raises(ArgumentError) { bound_server.read_stream(3, +"x") }
+    error = assert_raises(ArgumentError) { bound_server.read_stream(3, "x") }
     assert_equal "stream_id 3 is not a client-initiated stream", error.message
-    error = assert_raises(ArgumentError) { bound_client.read_stream(2, +"x") }
+    error = assert_raises(ArgumentError) { bound_client.read_stream(2, "x") }
     assert_equal "stream_id 2 is not a client-initiated bidirectional or server-initiated unidirectional stream",
       error.message
   end
