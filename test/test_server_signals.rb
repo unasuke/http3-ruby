@@ -66,7 +66,9 @@ class TestServerSignals < Minitest::Test
   # exits once nothing is under way. The client keeps pumping until then:
   # the server counts the request stream as under way until the client
   # acknowledges the end of the response, and that acknowledgement may
-  # still be waiting for its delay to pass when GOAWAY arrives.
+  # still be waiting for its delay to pass when GOAWAY arrives. A packet
+  # the client sends once the server has exited draws an ICMP port
+  # unreachable, which comes out of the next receive as ECONNREFUSED.
   def test_sigterm_sends_goaway_and_exits
     client = connect(@old.ca_file)
     assert_equal "ok", get(client, "/").body
@@ -77,6 +79,8 @@ class TestServerSignals < Minitest::Test
       client.pump_until(timeout: STOP_TIMEOUT) { status = Process.wait2(@pid, Process::WNOHANG)&.last }
     rescue QUIC::Error::Closed
       client.feed
+    rescue Errno::ECONNREFUSED
+      read_after_exit(client)
     end
     refute_nil client.client.goaway_id
     assert_predicate status || wait_server(@pid), :success?
@@ -116,6 +120,24 @@ class TestServerSignals < Minitest::Test
     id = client.request(:get, path)
     client.pump_until { client.response(id).finished? }
     client.response(id)
+  end
+
+  # Read what the server sent before it exited. The socket reports the
+  # ICMP error before the datagrams still queued, GOAWAY or
+  # CONNECTION_CLOSE among them, and reports another for each packet the
+  # client sends meanwhile; so pump for a moment, or until the connection
+  # closes.
+  def read_after_exit(client)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 0.5
+    while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      begin
+        client.pump
+      rescue Errno::ECONNREFUSED
+        nil
+      end
+    end
+  rescue QUIC::Error::Closed
+    client.feed
   end
 
   # Retry the block until it succeeds; the server handles a signal on its
