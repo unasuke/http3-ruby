@@ -120,23 +120,42 @@ module HTTP3
     end
 
     # Queue more of each Body::Chunks body until limit bytes wait unsent on
-    # its stream. A body whose enum raises is the application failing after
-    # its headers went out: the stream is aborted with H3_INTERNAL_ERROR and
-    # the block gets (request, exception). That request has only the
-    # pseudo-headers, and no body.
-    def fill_bodies(limit)
+    # its stream, connection_limit on the whole connection (#unsent_total),
+    # and room more bytes have been queued; nil is no limit. A chunk may
+    # take any of them past its limit, by less than its size. Returns the
+    # bytes queued.
+    #
+    # A body whose enum raises is the application failing after its headers
+    # went out: the stream is aborted with H3_INTERNAL_ERROR and the block
+    # gets (request, exception). That request has only the pseudo-headers,
+    # and no body.
+    def fill_bodies(limit, connection_limit: nil, room: nil)
+      left = [room, connection_limit && connection_limit - unsent_total].compact.min
+      queued = 0
       @outgoing.each_value do |out|
         next if out.done || !out.body.is_a?(Body::Chunks)
+        break if left && queued >= left
 
-        fill_body(out, limit) { |error| yield out.request, error if block_given? }
+        queued += fill_body(out, limit, left && left - queued) { |error| yield out.request, error if block_given? }
       end
+      queued
     end
 
-    # True when a Body::Chunks body could take more right now.
-    def wants_fill?(limit)
+    # True when a Body::Chunks body could take more right now, with the
+    # limits of #fill_bodies.
+    def wants_fill?(limit, connection_limit: nil, room: nil)
+      return false if room && room <= 0
+      return false if connection_limit && unsent_total >= connection_limit
+
       @outgoing.any? do |id, out|
         !out.done && out.body.is_a?(Body::Chunks) && unsent_bytes(id) < limit
       end
+    end
+
+    # Bytes of the Body::Chunks bodies queued but not taken by nghttp3 yet,
+    # on every stream; a body that has ended may still have some.
+    def unsent_total
+      @outgoing.sum { |id, out| out.body.is_a?(Body::Chunks) ? unsent_bytes(id) : 0 }
     end
 
     # True while a request stream is open: received in part, waiting for
@@ -266,33 +285,40 @@ module HTTP3
       @done << [Request.new(stream_id: id, headers: [], body: "".b), status]
     end
 
-    def fill_body(out, limit)
+    # Queue chunks of out's body while its stream has less than limit bytes
+    # unsent and less than room (nil for no limit) has been queued. Returns
+    # the bytes queued.
+    def fill_body(out, limit, room)
+      queued = 0
       id = out.request.stream_id
-      while unsent_bytes(id) < limit
+      while unsent_bytes(id) < limit && (room.nil? || queued < room)
         begin
           chunk = out.body.enum.next
         rescue StopIteration
           out.done = true
           push_eof(id)
-          return
+          return queued
         rescue => e
           out.done = true
           abort_stream(id, Nghttp3::H3_INTERNAL_ERROR)
           yield e
-          return
+          return queued
         end
         unless chunk.is_a?(String)
           out.done = true
           abort_stream(id, Nghttp3::H3_INTERNAL_ERROR)
           yield TypeError.new("body chunk must be a String (got #{chunk.class})")
-          return
+          return queued
         end
         push_chunk(id, chunk)
+        queued += chunk.bytesize
       end
+      queued
     rescue Nghttp3::Error
       # The stream went away under the body (the peer reset it); it is
       # released when its close comes through.
       out.done = true
+      queued
     end
 
     def release(id)

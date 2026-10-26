@@ -61,6 +61,8 @@ Other options, with their defaults:
 | `max_connection_request_buffer:` | `4_194_304` | Bytes a connection's requests may hold before they reach the application (headers counted as RFC 9114 §4.2.2 does, and bodies); more gets 503 |
 | `max_total_request_buffer:` | `67_108_864` | The same over all connections; more gets 503 |
 | `send_buffer_size:` | `65_536` | Bytes of a response body queued but unsent per stream |
+| `max_connection_send_buffer:` | `1_048_576` | Bytes of array and `each` response bodies a connection may have queued but unsent; more waits |
+| `max_total_send_buffer:` | `67_108_864` | The same over all connections |
 | `shutdown_timeout:` | `30` | Seconds a graceful stop waits for the requests under way |
 | `qlog_dir:` | `nil` | Directory for one qlog file per connection |
 | `transport_params:` | `QUIC::TransportParams.default` | QUIC transport parameters |
