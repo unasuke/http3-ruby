@@ -38,11 +38,18 @@ module HTTP3
       @app = app
     end
 
-    # remote is the client's address, an Addrinfo. A request the Rack env
-    # cannot carry is answered with 400, without calling the application.
-    # Raises whatever the application raises, and InvalidResponse for a
-    # response that cannot be sent; the Rack body is closed in both cases.
+    # remote is the client's address, an Addrinfo. CONNECT is answered with
+    # 501, and a request the Rack env cannot carry with 400, without calling
+    # the application. Raises whatever the application raises, and
+    # InvalidResponse for a response that cannot be sent; the Rack body is
+    # closed in both cases.
     def call(request, remote:)
+      # The server cannot open a tunnel (RFC 9114 section 4.4), and a
+      # CONNECT request has neither :scheme nor :path, so the env would be
+      # made up. The Session leaves nghttp3's enable_connect_protocol off,
+      # so nghttp3 refuses the :protocol of an extended CONNECT (RFC 9220).
+      return Response.new(status: 501, headers: [], body: nil) if request.headers.assoc(":method")&.last == "CONNECT"
+
       env = env_for(request, remote)
     rescue BadRequest
       # Not logged: the client sent it, the server did not fail.

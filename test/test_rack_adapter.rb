@@ -76,6 +76,23 @@ class TestRackAdapter < Minitest::Test
     assert_equal "a.example", env["HTTP_HOST"]
   end
 
+  # The server opens no tunnels: CONNECT, which has neither :scheme nor
+  # :path, gets 501 before anything else is looked at.
+  def test_connect_gets_501
+    adapter_called = false
+    adapter = HTTP3::RackAdapter.new(lambda do |_env|
+      adapter_called = true
+      [200, {}, []]
+    end)
+    request = HTTP3::Request.new(stream_id: 0, headers: [[":method", "CONNECT"], [":authority", "example.com:443"]],
+      body: "".b)
+    response = adapter.call(request, remote: REMOTE)
+    assert_equal 501, response.status
+    assert_empty response.headers
+    assert_nil response.body
+    refute adapter_called
+  end
+
   def test_repeated_fields_are_joined_and_cookies_with_semicolons
     env = env_for([["accept", "a"], ["accept", "b"], ["cookie", "x=1"], ["cookie", "y=2"],
       ["content-type", "text/plain"]])
