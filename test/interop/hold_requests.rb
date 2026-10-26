@@ -8,14 +8,16 @@
 # rest with 503.
 #
 #   bundle exec ruby test/interop/hold_requests.rb [--connections 20] \
-#     [--streams 100] [--bytes 1_000_000] [--timeout 120]
+#     [--streams 100] [--bytes 1_000_000] [--timeout 120] \
+#     [--request-timeout SECONDS]
 #
 # Starts server.rb on a temporary directory and certificate, and prints the
 # server's resident set size before and after. Exits non-zero unless some
 # request got 503, the server is still running, and a GET on a new
 # connection gets 200 afterwards, or when it takes more than --timeout
-# seconds. Needs the extension compiled (bundle exec rake compile) and
-# Linux, for /proc.
+# seconds. With --request-timeout, passed on to server.rb, every request
+# held open has to get 408 once that has passed, too. Needs the extension
+# compiled (bundle exec rake compile) and Linux, for /proc.
 
 $LOAD_PATH.unshift File.expand_path("../../lib", __dir__)
 require "http3"
@@ -33,6 +35,9 @@ OptionParser.new do |opts|
   opts.on("--streams N", Integer, "Requests to hold open per connection (100)") { |v| options[:streams] = v }
   opts.on("--bytes N", Integer, "Bytes of body per request (1_000_000)") { |v| options[:bytes] = v }
   opts.on("--timeout SECONDS", Float, "Give up after this long (120)") { |v| options[:timeout] = v }
+  opts.on("--request-timeout SECONDS", Float, "The server's request_timeout (30)") do |v|
+    options[:request_timeout] = v
+  end
 end.parse!
 
 def rss_kib(pid)
@@ -83,9 +88,10 @@ Dir.mktmpdir("http3-hold-") do |work|
   File.write(File.join(root, "index.html"), "hello from http3-ruby\n")
   credentials = TestCertificates.generate_credentials(dir: work)
   port = free_port
+  timeout_args = options[:request_timeout] ? ["--request-timeout", options[:request_timeout].to_s] : []
   pid = Process.spawn(
     RbConfig.ruby, File.join(__dir__, "server.rb"), "--root", root, "--bind", "127.0.0.1:#{port}",
-    "--certificate", credentials.certificate_path, "--private-key", credentials.private_key_path
+    "--certificate", credentials.certificate_path, "--private-key", credentials.private_key_path, *timeout_args
   )
   clients = []
   begin
@@ -118,6 +124,17 @@ Dir.mktmpdir("http3-hold-") do |work|
 
       check.call("some requests got 503", statuses.key?(503))
       check.call("the server is running", alive?(pid))
+      if options[:request_timeout]
+        # Those not refused at once: still held, or already past the time.
+        held = ids.to_h { |client, list| [client, list.reject { |id| client.response(id).status == 503 }] }
+        wait_until = now + options[:request_timeout] + 10
+        until held.all? { |client, list| list.all? { |id| client.response(id).status } } || now > wait_until
+          clients.each(&:pump)
+        end
+        timed_out = held.sum { |client, list| list.count { |id| client.response(id).status == 408 } }
+        count = held.sum { |_, list| list.size }
+        check.call("the requests held open got 408", count.positive? && timed_out == count, "#{timed_out} of #{count}")
+      end
       client = connect(port, credentials.ca_file).tap { |c| clients << c }
       id = client.request(:get, "/index.html")
       client.pump_until(timeout: 10) { client.response(id).finished? }
