@@ -73,6 +73,31 @@ and a GET on a new connection gets 200 afterwards, or when it takes more than
 `--timeout` seconds. The resident set size should grow by about 64 MiB, not by
 the 2 GB sent; it varies from run to run, so the script checks no threshold.
 
+## Responses not read
+
+`stall_responses.rb` checks that clients that stop reading responses cannot
+make the server use up its memory. It starts an `HTTP3::Server` of its own in
+a child process, since `server.rb` serves files, which the server reads only
+as it sends them. Its `/big` is a 10 MiB `each` body and `/small` a short one.
+The script opens 100 connections, and on each asks for `/big` 100 times and
+reads none of them. With its default limits the server keeps no more than
+1 MiB of them unsent per connection (`max_connection_send_buffer`) and 64 MiB
+in all (`max_total_send_buffer`). While the total is full, other connections'
+bodies wait too.
+
+```sh
+bundle exec ruby test/interop/stall_responses.rb [--connections 100] [--streams 100] \
+  [--timeout 120]
+```
+
+It prints the server's resident set size before and once the total is full.
+It exits non-zero unless the server is still running, a `/small` on a new
+connection gets its status but not its body within 2 seconds while the total
+is full, and the rest of it once the connections not reading have closed; or
+when a connection fails, or it takes more than `--timeout` seconds. The
+resident set size should grow by about 64 MiB, not by the 100 GB asked for;
+without the limits it grew past 300 MiB, and the connections timed out.
+
 ## quic-interop-runner
 
 [quic-interop-runner](https://github.com/quic-interop/quic-interop-runner)

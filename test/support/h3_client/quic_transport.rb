@@ -35,6 +35,7 @@ module H3TestClient
       @client = Client.new
       @streams = {}
       @fed_eof = {}
+      @paused = {}
       control, encoder, decoder = Array.new(3) { track(@quic.open_uni_stream) }
       @client.bind_streams(control: control.id, qpack_encoder: encoder.id, qpack_decoder: decoder.id)
     end
@@ -89,6 +90,17 @@ module H3TestClient
       @client.connection.shutdown_stream_write(id)
       stream.reset(HTTP3::Nghttp3::H3_REQUEST_CANCELLED)
       stream.close_read if stop_sending
+    end
+
+    # Stop reading the response on stream id, until #resume. QUIC::Stream
+    # gives the server more window only as the data is read, so the server
+    # soon has to stop sending; the connection goes on.
+    def pause(id)
+      @paused[id] = true
+    end
+
+    def resume(id)
+      @paused.delete(id)
     end
 
     # Pump until the block returns true; raises after timeout seconds.
@@ -170,7 +182,7 @@ module H3TestClient
 
     def feed_stream(stream)
       # Client-initiated unidirectional streams only send.
-      return if stream.id % 4 == 2 || @fed_eof[stream.id]
+      return if stream.id % 4 == 2 || @fed_eof[stream.id] || @paused[stream.id]
 
       loop do
         @client.read_stream(stream.id, stream.read_nonblock(65_536))

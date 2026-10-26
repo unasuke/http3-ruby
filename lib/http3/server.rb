@@ -48,13 +48,18 @@ module HTTP3
     # max_total_request_buffer those of every connection; a request that
     # would pass either gets 503. They have to leave room for a request at
     # the other two limits, or ArgumentError is raised. send_buffer_size
-    # bounds the bytes of a response body queued but unsent per stream.
+    # bounds the bytes of a response body queued but unsent per stream,
+    # max_connection_send_buffer those of the array and each bodies of a
+    # connection, and max_total_send_buffer those of every connection; a
+    # body waits for room. Each has to be at least the one before.
     def initialize(app:, bind:, certificate_path:, private_key_path:, transport_params: nil, settings: nil,
       qlog_dir: nil, max_connections: 1024, max_request_body: 1_048_576, max_field_section_size: 65_536,
       max_connection_request_buffer: 4_194_304, max_total_request_buffer: 67_108_864,
-      send_buffer_size: 65_536, shutdown_timeout: 30, logger: Logger.new($stderr))
+      send_buffer_size: 65_536, max_connection_send_buffer: 1_048_576, max_total_send_buffer: 67_108_864,
+      shutdown_timeout: 30, logger: Logger.new($stderr))
       check_request_limits(max_request_body, max_field_section_size, max_connection_request_buffer,
         max_total_request_buffer)
+      check_send_limits(send_buffer_size, max_connection_send_buffer, max_total_send_buffer)
       @adapter = RackAdapter.new(app)
       @bind_address = parse_bind(bind)
       @certificate_path = certificate_path
@@ -71,6 +76,8 @@ module HTTP3
       @max_connection_request_buffer = max_connection_request_buffer
       @max_total_request_buffer = max_total_request_buffer
       @send_buffer_size = send_buffer_size
+      @max_connection_send_buffer = max_connection_send_buffer
+      @max_total_send_buffer = max_total_send_buffer
       @shutdown_timeout = shutdown_timeout
       @logger = logger
     end
@@ -104,15 +111,19 @@ module HTTP3
 
     private
 
-    # One turn of the loop.
+    # One turn of the loop. The room left in max_total_send_buffer is
+    # counted once, at the start. Only fill_bodies queues more, so until
+    # then the room can only have grown (nghttp3 taking what flush sends),
+    # and filling by the room counted queues no more than the limit allows.
     def turn(sig_r)
+      room = send_room
       writers = @blocked_send ? [@sock] : nil
-      readable, writable, = IO.select([@sock, sig_r], writers, nil, select_timeout)
+      readable, writable, = IO.select([@sock, sig_r], writers, nil, select_timeout(room))
       handle_signals(sig_r) if readable&.include?(sig_r)
       flush if writable&.include?(@sock)
       receive if readable&.include?(@sock)
       serve_requests
-      fill_bodies
+      fill_bodies(room)
       @endpoint.handle_expiry if due?(@endpoint.expiry)
       flush
       reap
@@ -127,9 +138,12 @@ module HTTP3
     end
 
     # Until the next timer or the end of the drain, but no wait at all while
-    # a body could take more.
-    def select_timeout
-      return 0 if @sessions.each_value.any? { |session| session.wants_fill?(@send_buffer_size) }
+    # a body could take more within the send buffers.
+    def select_timeout(room)
+      wants_fill = @sessions.each_value.any? { |session|
+        session.wants_fill?(@send_buffer_size, connection_limit: @max_connection_send_buffer, room: room)
+      }
+      return 0 if wants_fill
 
       timeouts = []
       expiry = @endpoint.expiry
@@ -195,10 +209,18 @@ module HTTP3
       Response.new(status: 500, headers: [], body: nil)
     end
 
-    def fill_bodies
+    # The connections are filled in the order they came, so that while the
+    # total is short the older ones get its room first.
+    def fill_bodies(room)
       @sessions.each do |conn, session|
-        session.fill_bodies(@send_buffer_size) { |request, error| log_app_error(conn, request, error) }
+        room -= session.fill_bodies(@send_buffer_size, connection_limit: @max_connection_send_buffer,
+          room: room) { |request, error| log_app_error(conn, request, error) }
       end
+    end
+
+    # What max_total_send_buffer has left for array and each bodies.
+    def send_room
+      @max_total_send_buffer - @sessions.each_value.sum(&:unsent_total)
     end
 
     # Send what the Endpoint has, until the socket would block.
@@ -332,6 +354,22 @@ module HTTP3
       if max_total_request_buffer < max_connection_request_buffer
         raise ArgumentError, "max_total_request_buffer (#{max_total_request_buffer}) must be at least " \
           "max_connection_request_buffer (#{max_connection_request_buffer})"
+      end
+    end
+
+    # Raise ArgumentError for the first send limit found wrong: each has to
+    # be a positive Integer, at least the one before.
+    def check_send_limits(send_buffer_size, max_connection_send_buffer, max_total_send_buffer)
+      {send_buffer_size:, max_connection_send_buffer:, max_total_send_buffer:}.each do |name, value|
+        raise ArgumentError, "#{name} must be a positive Integer (got #{value.inspect})" unless value.is_a?(Integer) && value.positive?
+      end
+      if max_connection_send_buffer < send_buffer_size
+        raise ArgumentError, "max_connection_send_buffer (#{max_connection_send_buffer}) must be at least " \
+          "send_buffer_size (#{send_buffer_size})"
+      end
+      if max_total_send_buffer < max_connection_send_buffer
+        raise ArgumentError, "max_total_send_buffer (#{max_total_send_buffer}) must be at least " \
+          "max_connection_send_buffer (#{max_connection_send_buffer})"
       end
     end
 

@@ -34,11 +34,16 @@ module HTTP3
     def respond: (Request request, Response response) ?{ (SystemCallError error) -> void } -> void
 
     # Queue more of each Body::Chunks body, up to limit unsent bytes per
-    # stream. Yields the request (its pseudo-headers only, without body) and
-    # exception of a body that raised.
-    def fill_bodies: (Integer limit) ?{ (Request request, Exception error) -> void } -> void
+    # stream, connection_limit on the connection, and room bytes queued now
+    # (nil for no limit); a chunk may pass a limit. Returns the bytes
+    # queued. Yields the request (its pseudo-headers only, without body)
+    # and exception of a body that raised.
+    def fill_bodies: (Integer limit, ?connection_limit: Integer?, ?room: Integer?) ?{ (Request request, Exception error) -> void } -> Integer
 
-    def wants_fill?: (Integer limit) -> bool
+    def wants_fill?: (Integer limit, ?connection_limit: Integer?, ?room: Integer?) -> bool
+
+    # Bytes of the Body::Chunks bodies queued but not taken by nghttp3 yet.
+    def unsent_total: () -> Integer
 
     # True while a request stream is open.
     def busy?: () -> bool
