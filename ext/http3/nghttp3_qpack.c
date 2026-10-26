@@ -248,6 +248,12 @@ static VALUE rb_nghttp3_qpack_encoder_get_num_blocked_streams(VALUE self) {
 
 /* ============== Decoder ============== */
 
+/* The most streams a Decoder decodes at once, Decoder::MAX_STREAMS: each
+ * one not finished holds a stream context, and the peer chooses how many
+ * it leaves unfinished. nghttp3's encoder keeps the same number of streams
+ * (NGHTTP3_QPACK_MAX_QPACK_STREAMS). */
+#define DECODER_MAX_STREAMS 2000
+
 typedef struct {
   nghttp3_qpack_decoder *decoder;
   /* stream_id => nghttp3_qpack_stream_context *, in a C st_table: dfree
@@ -337,7 +343,9 @@ static VALUE rb_nghttp3_qpack_decoder_initialize(VALUE self,
 }
 
 /*
- * Get or create a stream context for the given stream_id
+ * Get or create a stream context for the given stream_id. Raises
+ * InvalidStateError when a new one would be one more than
+ * DECODER_MAX_STREAMS.
  */
 static nghttp3_qpack_stream_context *
 get_or_create_stream_context(DecoderObj *obj, int64_t stream_id) {
@@ -345,6 +353,13 @@ get_or_create_stream_context(DecoderObj *obj, int64_t stream_id) {
 
   if (st_lookup(obj->stream_contexts, (st_data_t)stream_id, &existing)) {
     return (nghttp3_qpack_stream_context *)existing;
+  }
+
+  if (obj->stream_contexts->num_entries >= DECODER_MAX_STREAMS) {
+    rb_raise(rb_eNghttp3InvalidStateError,
+             "a decoder takes at most %d streams at once; finish or "
+             "cancel_stream one first",
+             DECODER_MAX_STREAMS);
   }
 
   /* Create new context */
@@ -647,6 +662,8 @@ void Init_nghttp3_qpack(void) {
   /* Define Decoder class */
   rb_cNghttp3QPACKDecoder =
       rb_define_class_under(rb_mNghttp3QPACK, "Decoder", rb_cObject);
+  rb_define_const(rb_cNghttp3QPACKDecoder, "MAX_STREAMS",
+                  INT2NUM(DECODER_MAX_STREAMS));
   rb_define_alloc_func(rb_cNghttp3QPACKDecoder, decoder_alloc);
   rb_define_method(rb_cNghttp3QPACKDecoder, "initialize",
                    rb_nghttp3_qpack_decoder_initialize, 2);

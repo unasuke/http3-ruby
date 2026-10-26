@@ -24,6 +24,10 @@ module HTTP3
       end
 
       class Decoder
+        # The most streams decoded at once: decode on a new stream past it
+        # raises InvalidStateError, until one is finished or cancelled.
+        MAX_STREAMS: Integer
+
         # Creates a new QPACK decoder
         def initialize: (Integer max_dtable_capacity, Integer max_blocked_streams) -> void
 

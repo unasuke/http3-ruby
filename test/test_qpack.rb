@@ -122,6 +122,22 @@ class TestNghttp3QPACK < Minitest::Test
     assert_predicate status, :success?
   end
 
+  # A field section only begun holds a stream context, and the peer
+  # chooses how many it begins: a decoder takes MAX_STREAMS of them at
+  # once, the streams it already has go on, and cancel_stream frees one.
+  def test_decoder_takes_at_most_max_streams_at_once
+    assert_equal 2000, HTTP3::Nghttp3::QPACK::Decoder::MAX_STREAMS
+    decoder = HTTP3::Nghttp3::QPACK::Decoder.new(0, 0)
+    2000.times { |i| decoder.decode(i * 4, "\x00".b) }
+
+    error = assert_raises(HTTP3::Nghttp3::InvalidStateError) { decoder.decode(2000 * 4, "\x00".b) }
+    assert_equal "a decoder takes at most 2000 streams at once; finish or cancel_stream one first", error.message
+    assert_equal 1, decoder.decode(0, "\x00".b)[:consumed]
+
+    decoder.cancel_stream(4)
+    assert_equal 1, decoder.decode(2000 * 4, "\x00".b)[:consumed]
+  end
+
   # ============== Roundtrip tests ==============
 
   def test_encode_decode_roundtrip_static_table_only
