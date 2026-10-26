@@ -439,4 +439,121 @@ class TestNghttp3Connection < Minitest::Test
       conn.get_stream_user_data(0)
     end
   end
+
+  # nghttp3 asserts what follows, which would abort the process; the
+  # bindings raise instead.
+
+  def test_stream_ids_out_of_range_are_refused
+    client = bound_client
+    server = bound_server
+    encoder = HTTP3::Nghttp3::QPACK::Encoder.new(0)
+    decoder = HTTP3::Nghttp3::QPACK::Decoder.new(0, 0)
+    [-1, 2**62, 2**64].each do |id|
+      [
+        -> { server.read_stream(id, +"") },
+        -> { server.shutdown_stream_read(id) },
+        -> { client.submit_request(id, request_headers) },
+        -> { HTTP3::Nghttp3::Connection.client_new.bind_control_stream(id) },
+        -> { HTTP3::Nghttp3::Connection.client_new.bind_qpack_streams(6, id) },
+        -> { encoder.encode(id, request_headers) },
+        -> { decoder.decode(id, "") },
+        -> { decoder.cancel_stream(id) }
+      ].each do |call|
+        error = assert_raises(ArgumentError) { call.call }
+        assert_equal "stream_id must be 0..2**62-1 (got #{id})", error.message
+      end
+    end
+  end
+
+  # A server reads the streams the client opens, a client the request
+  # streams and the server's unidirectional streams.
+  def test_read_stream_refuses_a_stream_of_the_wrong_kind
+    error = assert_raises(ArgumentError) { bound_server.read_stream(3, +"x") }
+    assert_equal "stream_id 3 is not a client-initiated stream", error.message
+    error = assert_raises(ArgumentError) { bound_client.read_stream(2, +"x") }
+    assert_equal "stream_id 2 is not a client-initiated bidirectional or server-initiated unidirectional stream",
+      error.message
+  end
+
+  def test_submit_request_refuses_a_stream_that_is_not_a_request_stream
+    error = assert_raises(ArgumentError) { bound_client.submit_request(1, request_headers) }
+    assert_equal "stream_id 1 is not a client-initiated bidirectional stream", error.message
+  end
+
+  def test_bind_refuses_a_stream_the_connection_cannot_open
+    error = assert_raises(ArgumentError) { HTTP3::Nghttp3::Connection.server_new.bind_control_stream(2) }
+    assert_equal "stream_id 2 is not a server-initiated unidirectional stream", error.message
+    error = assert_raises(ArgumentError) { HTTP3::Nghttp3::Connection.client_new.bind_qpack_streams(6, 7) }
+    assert_equal "stream_id 7 is not a client-initiated unidirectional stream", error.message
+  end
+
+  def test_server_only_methods_refuse_a_client_connection
+    client = bound_client
+    error = assert_raises(HTTP3::Nghttp3::InvalidStateError) { client.submit_info(0, request_headers) }
+    assert_equal "#submit_info is for a server connection", error.message
+    error = assert_raises(HTTP3::Nghttp3::InvalidStateError) { client.set_max_client_streams_bidi(1) }
+    assert_equal "#set_max_client_streams_bidi is for a server connection", error.message
+  end
+
+  def test_submitting_needs_the_qpack_streams_bound
+    client = HTTP3::Nghttp3::Connection.client_new
+    server = HTTP3::Nghttp3::Connection.server_new
+    {
+      submit_request: -> { client.submit_request(0, request_headers) },
+      submit_trailers: -> { client.submit_trailers(0, request_headers) },
+      submit_response: -> { server.submit_response(0, request_headers) },
+      submit_info: -> { server.submit_info(0, request_headers) }
+    }.each do |name, call|
+      error = assert_raises(HTTP3::Nghttp3::InvalidStateError) { call.call }
+      assert_equal "##{name} needs #bind_qpack_streams first", error.message
+    end
+  end
+
+  def test_goaway_needs_the_control_stream_bound
+    conn = HTTP3::Nghttp3::Connection.server_new
+    error = assert_raises(HTTP3::Nghttp3::InvalidStateError) { conn.submit_shutdown_notice }
+    assert_equal "#submit_shutdown_notice needs #bind_control_stream first", error.message
+    error = assert_raises(HTTP3::Nghttp3::InvalidStateError) { conn.shutdown }
+    assert_equal "#shutdown needs #bind_control_stream first", error.message
+  end
+
+  # The id of a GOAWAY may not grow: a shutdown notice may be sent again,
+  # but nothing may follow a shutdown.
+  def test_nothing_goes_away_after_shutdown
+    conn = bound_server
+    conn.submit_shutdown_notice
+    conn.submit_shutdown_notice
+    conn.shutdown
+    [-> { conn.submit_shutdown_notice }, -> { conn.shutdown }].each do |call|
+      error = assert_raises(HTTP3::Nghttp3::InvalidStateError) { call.call }
+      assert_equal "#shutdown has been called already", error.message
+    end
+  end
+
+  def test_max_client_streams_bidi_cannot_go_down
+    conn = bound_server
+    conn.set_max_client_streams_bidi(100)
+    conn.set_max_client_streams_bidi(100)
+    error = assert_raises(ArgumentError) { conn.set_max_client_streams_bidi(10) }
+    assert_equal "max_client_streams_bidi cannot go down (from 100 to 10)", error.message
+  end
+
+  private
+
+  def bound_client
+    HTTP3::Nghttp3::Connection.client_new.bind_control_stream(2).bind_qpack_streams(6, 10)
+  end
+
+  def bound_server
+    HTTP3::Nghttp3::Connection.server_new.bind_control_stream(3).bind_qpack_streams(7, 11)
+  end
+
+  def request_headers
+    [
+      HTTP3::Nghttp3::NV.new(":method", "GET"),
+      HTTP3::Nghttp3::NV.new(":path", "/"),
+      HTTP3::Nghttp3::NV.new(":scheme", "https"),
+      HTTP3::Nghttp3::NV.new(":authority", "example.com")
+    ]
+  end
 end

@@ -136,6 +136,25 @@ void nghttp3_rb_raise(int error_code, const char *fmt, ...) {
   }
 }
 
+/* The largest stream id, the largest value of a QUIC variable-length
+ * integer. */
+#define NGHTTP3_RB_MAX_STREAM_ID ((1ULL << 62) - 1)
+
+int64_t nghttp3_rb_stream_id(VALUE rb_id) {
+  VALUE id = rb_to_int(rb_id);
+  uint64_t value;
+  /* 0 for zero, 1 for a positive value that fits, -1 or -2 for a negative
+   * one and 2 for one too large. */
+  int sign = rb_integer_pack(id, &value, 1, sizeof(value), 0,
+                             INTEGER_PACK_MSWORD_FIRST |
+                                 INTEGER_PACK_NATIVE_BYTE_ORDER);
+  if ((sign == 0 || sign == 1) && value <= NGHTTP3_RB_MAX_STREAM_ID) {
+    return (int64_t)value;
+  }
+  rb_raise(rb_eArgError, "stream_id must be 0..2**62-1 (got %" PRIsVALUE ")",
+           rb_id);
+}
+
 /*
  * call-seq:
  *   Nghttp3.err_is_fatal?(error_code) -> true or false

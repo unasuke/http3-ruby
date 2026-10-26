@@ -6,7 +6,8 @@ module HTTP3
         def initialize: (Integer max_dtable_capacity) -> void
 
         # Encodes headers for a given stream. headers are checked as
-        # Connection#submit_request checks them.
+        # Connection#submit_request checks them, and a stream_id out of
+        # 0..2**62-1 raises ArgumentError.
         def encode: (Integer stream_id, Array[NV] headers) -> { prefix: String, data: String, encoder_stream: String }
 
         # Reads decoder stream data
@@ -26,7 +27,8 @@ module HTTP3
         # Creates a new QPACK decoder
         def initialize: (Integer max_dtable_capacity, Integer max_blocked_streams) -> void
 
-        # Decodes headers from a stream
+        # Decodes headers from a stream. A stream_id out of 0..2**62-1 raises
+        # ArgumentError.
         def decode: (Integer stream_id, String data, ?fin: bool) -> { headers: Array[{ name: String, value: String, token: Integer }]?, blocked: bool, consumed: Integer }
 
         # Reads encoder stream data
@@ -35,7 +37,7 @@ module HTTP3
         # Returns data to be sent on the decoder stream
         def decoder_stream_data: () -> String
 
-        # Cancels decoding for the given stream
+        # Cancels decoding for the given stream (stream_id 0..2**62-1)
         def cancel_stream: (Integer stream_id) -> void
 
         # Sets the maximum dynamic table capacity

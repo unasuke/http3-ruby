@@ -102,7 +102,7 @@ static VALUE rb_nghttp3_qpack_encoder_encode(VALUE self, VALUE rb_stream_id,
   /* As Connection#submit_request does: the arguments first, since to_int
    * may run Ruby code, then every allocation, and only then the pointers
    * into the header Strings. */
-  stream_id = NUM2LL(rb_stream_id);
+  stream_id = nghttp3_rb_stream_id(rb_stream_id);
   Check_Type(rb_headers, T_ARRAY);
 
   if (obj->encoder == NULL) {
@@ -416,7 +416,7 @@ static VALUE rb_nghttp3_qpack_decoder_decode(int argc, VALUE *argv,
     rb_raise(rb_eNghttp3InvalidStateError, "Decoder is not initialized");
   }
 
-  stream_id = NUM2LL(rb_stream_id);
+  stream_id = nghttp3_rb_stream_id(rb_stream_id);
   Check_Type(rb_data, T_STRING);
   src = (const uint8_t *)RSTRING_PTR(rb_data);
   srclen = RSTRING_LEN(rb_data);
@@ -561,7 +561,7 @@ static VALUE rb_nghttp3_qpack_decoder_cancel_stream(VALUE self,
     rb_raise(rb_eNghttp3InvalidStateError, "Decoder is not initialized");
   }
 
-  stream_id = NUM2LL(rb_stream_id);
+  stream_id = nghttp3_rb_stream_id(rb_stream_id);
 
   delete_stream_context(obj, stream_id);
 

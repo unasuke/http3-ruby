@@ -103,6 +103,10 @@ static VALUE connection_alloc(VALUE klass) {
   obj->is_closed = 0;
   obj->is_server = 0;
   obj->entered = CONN_IDLE;
+  obj->ctrl_bound = 0;
+  obj->qpack_bound = 0;
+  obj->goaway = 0;
+  obj->max_client_streams = 0;
   obj->pending = st_init_numtable();
   obj->stream_data_readers = rb_hash_new();
   obj->stream_user_data = rb_hash_new();
@@ -145,6 +149,9 @@ static void connection_raise_pending(ConnectionObj *obj) {
  * Around the call into nghttp3, the method sets obj->entered to the kind of
  * call (CONN_IN_READ for read_stream, CONN_IN_OTHER otherwise) and puts the
  * value before back as soon as nghttp3 returns. */
+/* The name of the method being run, for messages. */
+static VALUE this_method(void) { return rb_id2str(rb_frame_this_func()); }
+
 static ConnectionObj *connection_enter(VALUE self, int allowed_in_read) {
   ConnectionObj *obj;
   TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
@@ -156,9 +163,54 @@ static ConnectionObj *connection_enter(VALUE self, int allowed_in_read) {
     rb_raise(rb_eNghttp3InvalidStateError,
              "#%" PRIsVALUE
              " cannot be called from inside a callback of this connection",
-             rb_id2str(rb_frame_this_func()));
+             this_method());
   }
   return obj;
+}
+
+/* What nghttp3 asserts of its callers, which would abort the process,
+ * checked here first: the kind of a stream id (its range is checked by
+ * nghttp3_rb_stream_id), the role of the connection and the calls that must
+ * or must not have come before. Each raises for the method being run. */
+
+NORETURN(static void raise_stream_kind(VALUE rb_id, const char *kind));
+static void raise_stream_kind(VALUE rb_id, const char *kind) {
+  rb_raise(rb_eArgError, "stream_id %" PRIsVALUE " is not a %s stream", rb_id,
+           kind);
+}
+
+/* A unidirectional stream opened by this end, for the bind_* methods. */
+static void check_own_uni_stream(ConnectionObj *obj, VALUE rb_id, int64_t id) {
+  if (obj->is_server && (id & 3) != 3) {
+    raise_stream_kind(rb_id, "server-initiated unidirectional");
+  }
+  if (!obj->is_server && (id & 3) != 2) {
+    raise_stream_kind(rb_id, "client-initiated unidirectional");
+  }
+}
+
+static void check_server(ConnectionObj *obj) {
+  if (!obj->is_server) {
+    rb_raise(rb_eNghttp3InvalidStateError,
+             "#%" PRIsVALUE " is for a server connection", this_method());
+  }
+}
+
+static void check_done(int done, const char *first) {
+  if (!done) {
+    rb_raise(rb_eNghttp3InvalidStateError, "#%" PRIsVALUE " needs #%s first",
+             this_method(), first);
+  }
+}
+
+/* nghttp3 asserts that the id of each GOAWAY is no larger than the one
+ * before. A server's shutdown sends one past the largest stream it has
+ * seen, which may have grown since, and a shutdown notice sends the largest
+ * id there is, so neither may follow a shutdown. */
+static void check_no_shutdown(ConnectionObj *obj) {
+  if (obj->goaway == 2) {
+    rb_raise(rb_eNghttp3InvalidStateError, "#shutdown has been called already");
+  }
 }
 
 static PendingStream *pending_lookup(ConnectionObj *obj, int64_t stream_id) {
@@ -323,8 +375,9 @@ static VALUE rb_nghttp3_connection_bind_control_stream(VALUE self,
   int64_t stream_id;
   int rv, entered;
 
-  stream_id = NUM2LL(rb_stream_id);
+  stream_id = nghttp3_rb_stream_id(rb_stream_id);
   obj = connection_enter(self, 0);
+  check_own_uni_stream(obj, rb_stream_id, stream_id);
 
   entered = obj->entered;
   obj->entered = CONN_IN_OTHER;
@@ -335,6 +388,7 @@ static VALUE rb_nghttp3_connection_bind_control_stream(VALUE self,
     nghttp3_rb_raise(rv, "Failed to bind control stream");
   }
 
+  obj->ctrl_bound = 1;
   return self;
 }
 
@@ -352,9 +406,11 @@ static VALUE rb_nghttp3_connection_bind_qpack_streams(VALUE self,
   int64_t enc_stream_id, dec_stream_id;
   int rv, entered;
 
-  enc_stream_id = NUM2LL(rb_enc_stream_id);
-  dec_stream_id = NUM2LL(rb_dec_stream_id);
+  enc_stream_id = nghttp3_rb_stream_id(rb_enc_stream_id);
+  dec_stream_id = nghttp3_rb_stream_id(rb_dec_stream_id);
   obj = connection_enter(self, 0);
+  check_own_uni_stream(obj, rb_enc_stream_id, enc_stream_id);
+  check_own_uni_stream(obj, rb_dec_stream_id, dec_stream_id);
 
   entered = obj->entered;
   obj->entered = CONN_IN_OTHER;
@@ -365,6 +421,7 @@ static VALUE rb_nghttp3_connection_bind_qpack_streams(VALUE self,
     nghttp3_rb_raise(rv, "Failed to bind QPACK streams");
   }
 
+  obj->qpack_bound = 1;
   return self;
 }
 
@@ -497,11 +554,22 @@ static VALUE rb_nghttp3_connection_read_stream(int argc, VALUE *argv,
   Check_Type(rb_data, T_STRING);
 
   struct read_stream_args args;
-  args.stream_id = NUM2LL(rb_stream_id);
+  args.stream_id = nghttp3_rb_stream_id(rb_stream_id);
   args.data = rb_data;
   args.fin = RTEST(rb_fin) ? 1 : 0;
   args.ts = NIL_P(rb_ts) ? monotonic_now() : (nghttp3_tstamp)NUM2ULL(rb_ts);
   args.obj = connection_enter(self, 0);
+  /* Data comes in on the streams of the other end and the request streams;
+   * nghttp3 asserts that a stream it knows is one of those. */
+  if (args.obj->is_server && (args.stream_id & 1) != 0) {
+    raise_stream_kind(rb_stream_id, "client-initiated");
+  }
+  if (!args.obj->is_server && (args.stream_id & 3) != 0 &&
+      (args.stream_id & 3) != 3) {
+    raise_stream_kind(
+        rb_stream_id,
+        "client-initiated bidirectional or server-initiated unidirectional");
+  }
 
   /* Callbacks run Ruby code, which must not change data under nghttp3. */
   rb_str_locktmp(rb_data);
@@ -904,11 +972,15 @@ static VALUE rb_nghttp3_connection_submit_request(int argc, VALUE *argv,
              "submit_request can only be called on client connections");
   }
 
-  stream_id = NUM2LL(rb_stream_id);
+  stream_id = nghttp3_rb_stream_id(rb_stream_id);
   Check_Type(rb_headers, T_ARRAY);
   reader = submit_body_reader(rb_opts);
 
   connection_enter(self, 1);
+  if ((stream_id & 3) != 0) {
+    raise_stream_kind(rb_stream_id, "client-initiated bidirectional");
+  }
+  check_done(obj->qpack_bound, "bind_qpack_streams");
 
   /* On the heap: a Ruby thread's machine stack is too small for a long
    * list. */
@@ -975,6 +1047,7 @@ static VALUE rb_nghttp3_connection_submit_response(int argc, VALUE *argv,
   reader = submit_body_reader(rb_opts);
 
   connection_enter(self, 1);
+  check_done(obj->qpack_bound, "bind_qpack_streams");
 
   nvlen = RARRAY_LEN(rb_headers);
   nva = ALLOCV_N(nghttp3_nv, nva_buf, nvlen);
@@ -1025,10 +1098,13 @@ static VALUE rb_nghttp3_connection_submit_info(VALUE self, VALUE rb_stream_id,
 
   TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
 
+  check_server(obj);
+
   stream_id = NUM2LL(rb_stream_id);
   Check_Type(rb_headers, T_ARRAY);
 
   connection_enter(self, 1);
+  check_done(obj->qpack_bound, "bind_qpack_streams");
 
   nvlen = RARRAY_LEN(rb_headers);
   nva = ALLOCV_N(nghttp3_nv, nva_buf, nvlen);
@@ -1077,6 +1153,7 @@ static VALUE rb_nghttp3_connection_submit_trailers(VALUE self,
   Check_Type(rb_trailers, T_ARRAY);
 
   connection_enter(self, 1);
+  check_done(obj->qpack_bound, "bind_qpack_streams");
 
   nvlen = RARRAY_LEN(rb_trailers);
   nva = ALLOCV_N(nghttp3_nv, nva_buf, nvlen);
@@ -1113,6 +1190,8 @@ static VALUE rb_nghttp3_connection_submit_shutdown_notice(VALUE self) {
   int rv, entered;
 
   obj = connection_enter(self, 1);
+  check_done(obj->ctrl_bound, "bind_control_stream");
+  check_no_shutdown(obj);
 
   entered = obj->entered;
   obj->entered = CONN_IN_OTHER;
@@ -1124,6 +1203,7 @@ static VALUE rb_nghttp3_connection_submit_shutdown_notice(VALUE self) {
     nghttp3_rb_raise(rv, "Failed to submit shutdown notice");
   }
 
+  obj->goaway = 1;
   return self;
 }
 
@@ -1138,6 +1218,8 @@ static VALUE rb_nghttp3_connection_shutdown(VALUE self) {
   int rv, entered;
 
   obj = connection_enter(self, 1);
+  check_done(obj->ctrl_bound, "bind_control_stream");
+  check_no_shutdown(obj);
 
   entered = obj->entered;
   obj->entered = CONN_IN_OTHER;
@@ -1149,6 +1231,7 @@ static VALUE rb_nghttp3_connection_shutdown(VALUE self) {
     nghttp3_rb_raise(rv, "Failed to shutdown connection");
   }
 
+  obj->goaway = 2;
   return self;
 }
 
@@ -1165,7 +1248,7 @@ static VALUE rb_nghttp3_connection_shutdown_stream_read(VALUE self,
   int64_t stream_id;
   int rv, entered;
 
-  stream_id = NUM2LL(rb_stream_id);
+  stream_id = nghttp3_rb_stream_id(rb_stream_id);
   obj = connection_enter(self, 1);
 
   entered = obj->entered;
@@ -1187,7 +1270,7 @@ static VALUE rb_nghttp3_connection_shutdown_stream_read(VALUE self,
  *
  * Tells a server connection the cumulative number of bidirectional streams
  * the client may open, as QUIC's MAX_STREAMS allows. nghttp3 uses it for
- * graceful shutdown.
+ * graceful shutdown. Like MAX_STREAMS, it never goes down.
  */
 static VALUE
 rb_nghttp3_connection_set_max_client_streams_bidi(VALUE self,
@@ -1196,14 +1279,25 @@ rb_nghttp3_connection_set_max_client_streams_bidi(VALUE self,
   uint64_t max_streams;
   int entered;
 
+  TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
+
+  check_server(obj);
+
   max_streams = NUM2ULL(rb_max_streams);
-  obj = connection_enter(self, 1);
+  connection_enter(self, 1);
+  if (max_streams < obj->max_client_streams) {
+    rb_raise(rb_eArgError,
+             "max_client_streams_bidi cannot go down (from %" PRIsVALUE
+             " to %" PRIsVALUE ")",
+             ULL2NUM(obj->max_client_streams), rb_max_streams);
+  }
 
   entered = obj->entered;
   obj->entered = CONN_IN_OTHER;
   nghttp3_conn_set_max_client_streams_bidi(obj->conn, max_streams);
   obj->entered = entered;
 
+  obj->max_client_streams = max_streams;
   return self;
 }
 
