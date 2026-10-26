@@ -12,6 +12,11 @@ module HTTP3
     # InvalidStateError. #closed?, #server?, #client?, #pending_data and the
     # stream user data methods call no nghttp3 and can be called anywhere.
     #
+    # Once #read_stream or #writev_stream has raised for an error nghttp3
+    # returned, or another method for a fatal one, nghttp3 allows nothing
+    # but deleting the connection: only #close and the methods that call no
+    # nghttp3 can be called, and the rest raise InvalidStateError.
+    #
     # What nghttp3 asserts of its callers raises instead: a stream id out of
     # 0..2**62-1 or of the wrong kind raises ArgumentError, and a call on a
     # connection of the wrong role, or before or after the calls nghttp3

@@ -197,6 +197,29 @@ class TestNghttp3Safety < Minitest::Test
     end
   end
 
+  # Once read_stream has failed, nghttp3 allows nothing but deleting the
+  # connection, so only #close goes through, and what calls no nghttp3.
+  def test_only_close_after_the_connection_failed
+    callbacks = HTTP3::Nghttp3::Callbacks.new.on_begin_headers { |_stream_id| raise "boom" }
+    client = new_client
+    client.submit_request(REQUEST_STREAM, request_headers)
+    server = new_server(callbacks)
+    assert_raises(RuntimeError) { transfer(client, server) }
+
+    [
+      -> { server.read_stream(REQUEST_STREAM, +"") },
+      -> { server.writev_stream },
+      -> { server.submit_response(REQUEST_STREAM, [HTTP3::Nghttp3::NV.new(":status", "200")]) }
+    ].each do |call|
+      error = assert_raises(HTTP3::Nghttp3::InvalidStateError) { call.call }
+      assert_equal "the connection has failed; only #close is allowed", error.message
+    end
+    assert_empty server.pending_data(REQUEST_STREAM)
+    refute_predicate server, :closed?
+    server.close
+    assert_predicate server, :closed?
+  end
+
   def test_writev_stream_is_refused_inside_a_body_block
     client = nil
     client = new_client

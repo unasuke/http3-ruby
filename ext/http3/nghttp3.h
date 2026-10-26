@@ -74,6 +74,10 @@ typedef struct {
   int is_closed;
   int is_server;
   int entered; /* CONN_IDLE, or the call into nghttp3 under way */
+  /* nghttp3 returned an error after which it allows nothing but
+   * nghttp3_conn_del: any from read_stream or writev_stream, or a fatal one
+   * from another call. */
+  int failed;
   /* What has been done to the connection, for the calls nghttp3 asserts
    * come after it or not after it. goaway is 0 before any GOAWAY, 1 after
    * submit_shutdown_notice and 2 after shutdown. max_client_streams is the

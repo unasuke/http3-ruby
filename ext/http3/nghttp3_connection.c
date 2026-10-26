@@ -103,6 +103,7 @@ static VALUE connection_alloc(VALUE klass) {
   obj->is_closed = 0;
   obj->is_server = 0;
   obj->entered = CONN_IDLE;
+  obj->failed = 0;
   obj->ctrl_bound = 0;
   obj->qpack_bound = 0;
   obj->goaway = 0;
@@ -140,15 +141,23 @@ static void connection_raise_pending(ConnectionObj *obj) {
 }
 
 /* The connection of self, for a method about to call into nghttp3. Raises
- * InvalidStateError if the connection is closed, or if this is a callback
- * of a call into nghttp3 that does not allow the method: inside read_stream
- * only the methods allowed_in_read, and inside any other call none. Called
- * once the arguments are converted, since to_int and to_str may run Ruby
- * code that closes the connection.
+ * InvalidStateError if the connection is closed or has failed, or if this
+ * is a callback of a call into nghttp3 that does not allow the method:
+ * inside read_stream only the methods allowed_in_read, and inside any other
+ * call none. Called once the arguments are converted, since to_int and
+ * to_str may run Ruby code that closes the connection.
  *
  * Around the call into nghttp3, the method sets obj->entered to the kind of
  * call (CONN_IN_READ for read_stream, CONN_IN_OTHER otherwise) and puts the
  * value before back as soon as nghttp3 returns. */
+/* Note that the connection has failed if rv, which a call into nghttp3
+ * other than read_stream or writev_stream returned, is a fatal error. */
+static void connection_check_fatal(ConnectionObj *obj, int rv) {
+  if (nghttp3_err_is_fatal(rv)) {
+    obj->failed = 1;
+  }
+}
+
 /* The name of the method being run, for messages. */
 static VALUE this_method(void) { return rb_id2str(rb_frame_this_func()); }
 
@@ -157,6 +166,10 @@ static ConnectionObj *connection_enter(VALUE self, int allowed_in_read) {
   TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
   if (obj->conn == NULL || obj->is_closed) {
     rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
+  }
+  if (obj->failed) {
+    rb_raise(rb_eNghttp3InvalidStateError,
+             "the connection has failed; only #close is allowed");
   }
   if (obj->entered == CONN_IN_OTHER ||
       (obj->entered == CONN_IN_READ && !allowed_in_read)) {
@@ -383,6 +396,7 @@ static VALUE rb_nghttp3_connection_bind_control_stream(VALUE self,
   obj->entered = CONN_IN_OTHER;
   rv = nghttp3_conn_bind_control_stream(obj->conn, stream_id);
   obj->entered = entered;
+  connection_check_fatal(obj, rv);
 
   if (rv != 0) {
     nghttp3_rb_raise(rv, "Failed to bind control stream");
@@ -416,6 +430,7 @@ static VALUE rb_nghttp3_connection_bind_qpack_streams(VALUE self,
   obj->entered = CONN_IN_OTHER;
   rv = nghttp3_conn_bind_qpack_streams(obj->conn, enc_stream_id, dec_stream_id);
   obj->entered = entered;
+  connection_check_fatal(obj, rv);
 
   if (rv != 0) {
     nghttp3_rb_raise(rv, "Failed to bind QPACK streams");
@@ -513,6 +528,9 @@ static VALUE read_stream_body(VALUE arg) {
       a->obj->conn, a->stream_id, (const uint8_t *)RSTRING_PTR(a->data),
       (size_t)RSTRING_LEN(a->data), a->fin, a->ts);
   a->obj->entered = entered;
+  if (rv < 0) {
+    a->obj->failed = 1;
+  }
   connection_raise_pending(a->obj);
   if (rv < 0) {
     nghttp3_rb_raise((int)rv, "Failed to read stream");
@@ -599,6 +617,9 @@ static VALUE rb_nghttp3_connection_writev_stream(VALUE self) {
   obj->entered = CONN_IN_OTHER;
   rv = nghttp3_conn_writev_stream(obj->conn, &stream_id, &fin, vec, 16);
   obj->entered = entered;
+  if (rv < 0) {
+    obj->failed = 1;
+  }
   connection_raise_pending(obj);
 
   if (rv < 0) {
@@ -650,6 +671,7 @@ static VALUE rb_nghttp3_connection_add_write_offset(VALUE self,
   obj->entered = CONN_IN_OTHER;
   rv = nghttp3_conn_add_write_offset(obj->conn, stream_id, n);
   obj->entered = entered;
+  connection_check_fatal(obj, rv);
   connection_raise_pending(obj);
 
   if (rv != 0) {
@@ -681,6 +703,7 @@ static VALUE rb_nghttp3_connection_add_ack_offset(VALUE self,
   obj->entered = CONN_IN_OTHER;
   rv = nghttp3_conn_add_ack_offset(obj->conn, stream_id, n);
   obj->entered = entered;
+  connection_check_fatal(obj, rv);
   connection_raise_pending(obj);
 
   if (rv != 0) {
@@ -732,6 +755,7 @@ static VALUE rb_nghttp3_connection_unblock_stream(VALUE self,
   obj->entered = CONN_IN_OTHER;
   rv = nghttp3_conn_unblock_stream(obj->conn, stream_id);
   obj->entered = entered;
+  connection_check_fatal(obj, rv);
   connection_raise_pending(obj);
 
   if (rv != 0) {
@@ -785,6 +809,7 @@ static VALUE rb_nghttp3_connection_close_stream(VALUE self, VALUE rb_stream_id,
   obj->entered = CONN_IN_OTHER;
   rv = nghttp3_conn_close_stream(obj->conn, stream_id, app_error_code);
   obj->entered = entered;
+  connection_check_fatal(obj, rv);
   connection_raise_pending(obj);
 
   if (rv != 0) {
@@ -837,6 +862,7 @@ static VALUE rb_nghttp3_connection_resume_stream(VALUE self,
   obj->entered = CONN_IN_OTHER;
   rv = nghttp3_conn_resume_stream(obj->conn, stream_id);
   obj->entered = entered;
+  connection_check_fatal(obj, rv);
   connection_raise_pending(obj);
 
   if (rv != 0) {
@@ -1003,6 +1029,7 @@ static VALUE rb_nghttp3_connection_submit_request(int argc, VALUE *argv,
   rv = nghttp3_conn_submit_request(obj->conn, stream_id, nva, (size_t)nvlen,
                                    NIL_P(reader) ? NULL : &data_reader, NULL);
   obj->entered = entered;
+  connection_check_fatal(obj, rv);
   ALLOCV_END(nva_buf);
   RB_GC_GUARD(rb_headers);
   connection_raise_pending(obj);
@@ -1068,6 +1095,7 @@ static VALUE rb_nghttp3_connection_submit_response(int argc, VALUE *argv,
   rv = nghttp3_conn_submit_response(obj->conn, stream_id, nva, (size_t)nvlen,
                                     NIL_P(reader) ? NULL : &data_reader);
   obj->entered = entered;
+  connection_check_fatal(obj, rv);
   ALLOCV_END(nva_buf);
   RB_GC_GUARD(rb_headers);
   connection_raise_pending(obj);
@@ -1118,6 +1146,7 @@ static VALUE rb_nghttp3_connection_submit_info(VALUE self, VALUE rb_stream_id,
   obj->entered = CONN_IN_OTHER;
   rv = nghttp3_conn_submit_info(obj->conn, stream_id, nva, (size_t)nvlen);
   obj->entered = entered;
+  connection_check_fatal(obj, rv);
   ALLOCV_END(nva_buf);
   RB_GC_GUARD(rb_headers);
   connection_raise_pending(obj);
@@ -1167,6 +1196,7 @@ static VALUE rb_nghttp3_connection_submit_trailers(VALUE self,
   obj->entered = CONN_IN_OTHER;
   rv = nghttp3_conn_submit_trailers(obj->conn, stream_id, nva, (size_t)nvlen);
   obj->entered = entered;
+  connection_check_fatal(obj, rv);
   ALLOCV_END(nva_buf);
   RB_GC_GUARD(rb_trailers);
   connection_raise_pending(obj);
@@ -1197,6 +1227,7 @@ static VALUE rb_nghttp3_connection_submit_shutdown_notice(VALUE self) {
   obj->entered = CONN_IN_OTHER;
   rv = nghttp3_conn_submit_shutdown_notice(obj->conn);
   obj->entered = entered;
+  connection_check_fatal(obj, rv);
   connection_raise_pending(obj);
 
   if (rv != 0) {
@@ -1225,6 +1256,7 @@ static VALUE rb_nghttp3_connection_shutdown(VALUE self) {
   obj->entered = CONN_IN_OTHER;
   rv = nghttp3_conn_shutdown(obj->conn);
   obj->entered = entered;
+  connection_check_fatal(obj, rv);
   connection_raise_pending(obj);
 
   if (rv != 0) {
@@ -1255,6 +1287,7 @@ static VALUE rb_nghttp3_connection_shutdown_stream_read(VALUE self,
   obj->entered = CONN_IN_OTHER;
   rv = nghttp3_conn_shutdown_stream_read(obj->conn, stream_id);
   obj->entered = entered;
+  connection_check_fatal(obj, rv);
   connection_raise_pending(obj);
 
   if (rv != 0) {
