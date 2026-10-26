@@ -141,10 +141,15 @@ module HTTP3
     def response_for(request, status, headers, body)
       response = nil
       status = Integer(status)
+      # A 1xx is no final response, which is all HTTP/3 can send here (Rack
+      # Lint only asks for 100 or more).
+      unless (200..599).cover?(status)
+        raise InvalidResponse, "status #{status} is not a final status (200..599)"
+      end
       headers = header_pairs(headers)
 
       method = request.headers.assoc(":method")&.last
-      response = if method == "HEAD" || status < 200 || status == 204 || status == 304
+      response = if method == "HEAD" || status == 204 || status == 304
         close_rack_body(body)
         Response.new(status: status, headers: headers, body: nil)
       else

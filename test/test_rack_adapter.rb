@@ -137,6 +137,17 @@ class TestRackAdapter < Minitest::Test
     assert_equal [["x-a", "tab\tand space"]], respond([200, {"x-a" => "tab\tand space"}, []]).headers
   end
 
+  # Only a final status can end a response; the body is closed.
+  def test_status_that_is_not_final_is_refused
+    [99, 100, 199, 600].each do |status|
+      body = ClosableBody.new
+      error = assert_raises(HTTP3::RackAdapter::InvalidResponse, status.to_s) { respond([status, {}, body]) }
+      assert_equal "status #{status} is not a final status (200..599)", error.message
+      assert body.closed, status.to_s
+    end
+    assert_equal 599, respond([599, {}, []]).status
+  end
+
   def test_head_and_204_have_no_body_and_close_it
     body = ClosableBody.new
     assert_nil respond([200, {}, body], method: "HEAD").body
