@@ -137,7 +137,8 @@ module HTTP3
       end
     end
 
-    # The Rack body is closed here unless it goes on in the Response.
+    # The Rack body is closed here unless it goes on in the Response, or
+    # to_ary has closed it (body_for yields then).
     def response_for(request, status, headers, body)
       response = nil
       status = Integer(status)
@@ -147,16 +148,32 @@ module HTTP3
         raise InvalidResponse, "status #{status} is not a final status (200..599)"
       end
       headers = header_pairs(headers)
+      # A 204 must not have one (RFC 9110 section 8.6); it is dropped as the
+      # connection-specific fields are.
+      headers = headers.reject { |pair| pair.first == "content-length" } if status == 204
+      length = content_length(headers)
 
       method = request.headers.assoc(":method")&.last
       response = if method == "HEAD" || status == 204 || status == 304
+        # No body is sent, so content-length is not held against one.
         close_rack_body(body)
         Response.new(status: status, headers: headers, body: nil)
       else
-        Response.new(status: status, headers: headers, body: body_for(body))
+        Response.new(status: status, headers: headers, body: body_for(body, length) { body = nil })
       end
     ensure
       close_rack_body(body) if response.nil?
+    end
+
+    # The content-length among headers, as an Integer, or nil if there is
+    # none. The message leaves the value out, as header_pairs's do.
+    def content_length(headers)
+      values = headers.filter_map { |name, value| value if name == "content-length" }
+      return nil if values.empty?
+      raise InvalidResponse, "content-length is given more than once" if values.size > 1
+      raise InvalidResponse, "content-length is not a number" unless values.first.match?(/\A\d+\z/)
+
+      Integer(values.first, 10)
     end
 
     # Rack 3 headers: lowercase names, each value a String or an Array of
@@ -183,18 +200,60 @@ module HTTP3
       pairs
     end
 
-    def body_for(body)
+    # The body to send. One whose length is known before it is sent, a file
+    # or an Array, is held against length, the content-length, now; one
+    # read with each, as it is read (#counted).
+    def body_for(body, length)
       if body.respond_to?(:to_path)
         io = ::File.open(body.to_path, "rb")
+        if length && io.size != length
+          size = io.size
+          io.close
+          raise length_mismatch(size)
+        end
         Body::File.new(io: io, offset: 0, length: io.size, rack_body: body)
       elsif body.respond_to?(:to_ary)
         # Rack 3 has to_ary close the body itself.
-        Body::Chunks.new(enum: body.to_ary.each, rack_body: nil)
+        chunks = body.to_ary
+        yield
+        # Checked before anything is sent, which Session#fill_bodies would
+        # only find out once the headers have gone.
+        chunks.each do |chunk|
+          raise InvalidResponse, "body chunk must be a String (got #{chunk.class})" unless chunk.is_a?(String)
+        end
+        size = chunks.sum(&:bytesize)
+        raise length_mismatch(size) if length && size != length
+
+        Body::Chunks.new(enum: chunks.each, rack_body: nil)
       elsif body.respond_to?(:each)
-        Body::Chunks.new(enum: body.to_enum(:each), rack_body: body)
+        enum = length ? counted(body, length) : body.to_enum(:each)
+        Body::Chunks.new(enum: enum, rack_body: body)
       else
         raise InvalidResponse, "streaming bodies (#{body.class}) are not supported"
       end
+    end
+
+    # The chunks of body's each, raising InvalidResponse from next once they
+    # pass length bytes, or end short of it. Session#fill_bodies aborts the
+    # stream then, since the headers have gone. A chunk that is not a String
+    # goes on to fill_bodies, which refuses it.
+    def counted(body, length)
+      Enumerator.new do |y|
+        size = 0
+        body.each do |chunk|
+          size += chunk.bytesize if chunk.is_a?(String)
+          if size > length
+            raise InvalidResponse, "the body is at least #{size} bytes but content-length says otherwise"
+          end
+
+          y << chunk
+        end
+        raise length_mismatch(size) if size < length
+      end
+    end
+
+    def length_mismatch(size)
+      InvalidResponse.new("the body is #{size} bytes but content-length says otherwise")
     end
 
     def close_rack_body(body)

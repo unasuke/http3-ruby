@@ -148,6 +148,70 @@ class TestRackAdapter < Minitest::Test
     assert_equal 599, respond([599, {}, []]).status
   end
 
+  def test_content_length_must_be_one_number
+    {["3", "3"] => "content-length is given more than once", "abc" => "content-length is not a number",
+     "-1" => "content-length is not a number"}.each do |value, message|
+      error = assert_raises(HTTP3::RackAdapter::InvalidResponse, value.inspect) do
+        respond([200, {"content-length" => value}, ["abc"]])
+      end
+      assert_equal message, error.message
+    end
+    assert_equal [["content-length", "3"]], respond([200, {"content-length" => "3"}, ["abc"]]).headers
+  end
+
+  # A body whose length is known is held against content-length before
+  # anything is sent; the Rack body is closed once, and the file too.
+  def test_content_length_a_known_body_does_not_have
+    body = ArrayBody.new(["abc"], 0)
+    error = assert_raises(HTTP3::RackAdapter::InvalidResponse) { respond([200, {"content-length" => "4"}, body]) }
+    assert_equal "the body is 3 bytes but content-length says otherwise", error.message
+    assert_equal 1, body.closes
+
+    Dir.mktmpdir do |dir|
+      path = File.join(File.realpath(dir), "file")
+      File.write(path, "content")
+      body = CountedPathBody.new(path, 0)
+      error = assert_raises(HTTP3::RackAdapter::InvalidResponse) { respond([200, {"content-length" => "8"}, body]) }
+      assert_equal "the body is 7 bytes but content-length says otherwise", error.message
+      assert_equal 1, body.closes
+      assert_empty descriptors_of(path) if File.directory?("/proc/self/fd")
+    end
+  end
+
+  # Before, a chunk that is not a String was only found once the headers
+  # had gone; now the response is refused, with or without content-length.
+  def test_array_body_chunks_must_be_strings
+    error = assert_raises(HTTP3::RackAdapter::InvalidResponse) { respond([200, {}, ["a", 1]]) }
+    assert_equal "body chunk must be a String (got Integer)", error.message
+  end
+
+  # A body read with each is counted as it is read: the next that goes past
+  # content-length raises, and so does the last one of a body that ends
+  # short of it.
+  def test_each_body_is_counted_against_content_length
+    enum = respond([200, {"content-length" => "3"}, EachBody.new(["ab", "cd"])]).body.enum
+    assert_equal "ab", enum.next
+    error = assert_raises(HTTP3::RackAdapter::InvalidResponse) { enum.next }
+    assert_equal "the body is at least 4 bytes but content-length says otherwise", error.message
+
+    enum = respond([200, {"content-length" => "5"}, EachBody.new(["ab", "cd"])]).body.enum
+    assert_equal ["ab", "cd"], [enum.next, enum.next]
+    error = assert_raises(HTTP3::RackAdapter::InvalidResponse) { enum.next }
+    assert_equal "the body is 4 bytes but content-length says otherwise", error.message
+
+    enum = respond([200, {"content-length" => "4"}, EachBody.new(["ab", "cd"])]).body.enum
+    assert_equal ["ab", "cd"], [enum.next, enum.next]
+    assert_raises(StopIteration) { enum.next }
+  end
+
+  # No body is sent for HEAD, 204 or 304, so content-length is not held
+  # against one; a 204 must not have one at all (RFC 9110 section 8.6).
+  def test_content_length_without_a_body
+    assert_equal [["content-length", "100"]], respond([200, {"content-length" => "100"}, ["x"]], method: "HEAD").headers
+    assert_equal [["content-length", "100"]], respond([304, {"content-length" => "100"}, []]).headers
+    assert_empty respond([204, {"content-length" => "100"}, []]).headers
+  end
+
   def test_head_and_204_have_no_body_and_close_it
     body = ClosableBody.new
     assert_nil respond([200, {}, body], method: "HEAD").body
@@ -185,6 +249,40 @@ class TestRackAdapter < Minitest::Test
     end
   end
 
+  # A file body that counts its closes.
+  CountedPathBody = Struct.new(:to_path, :closes) do
+    def each
+      yield File.binread(to_path)
+    end
+
+    def close
+      self.closes += 1
+    end
+  end
+
+  # A Rack 3 body with to_ary, which closes it.
+  ArrayBody = Struct.new(:chunks, :closes) do
+    def each(&)
+      chunks.each(&)
+    end
+
+    def to_ary
+      close
+      chunks
+    end
+
+    def close
+      self.closes += 1
+    end
+  end
+
+  # A body read with each only.
+  EachBody = Struct.new(:chunks) do
+    def each(&)
+      chunks.each(&)
+    end
+  end
+
   private
 
   # A request with headers, and :method and :scheme ("https") unless headers
@@ -219,6 +317,15 @@ class TestRackAdapter < Minitest::Test
     headers = [[":path", "/"], [":authority", "localhost"], *headers] unless headers.assoc(":path")
     adapter.call(request(headers), remote: REMOTE)
     env
+  end
+
+  # The descriptors of this process open on path (Linux).
+  def descriptors_of(path)
+    Dir.children("/proc/self/fd").map(&:to_i).select do |fd|
+      File.readlink("/proc/self/fd/#{fd}") == path
+    rescue Errno::ENOENT
+      false
+    end
   end
 
   def respond(triple, method: "GET")
