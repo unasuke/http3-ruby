@@ -175,6 +175,53 @@ class TestNghttp3Safety < Minitest::Test
     assert_equal "Connection is closed", error.message
   end
 
+  # nghttp3 is still using the connection while it runs a callback: closing
+  # it there, or reading into it again, is refused, and the error comes out
+  # of read_stream as a callback's exception does.
+  def test_close_and_read_stream_are_refused_inside_a_callback
+    [
+      [:close, ->(conn, _stream_id) { conn.close }, :on_begin_headers],
+      [:read_stream, ->(conn, stream_id) { conn.read_stream(stream_id, "") }, :on_recv_header]
+    ].each do |name, call, callback|
+      server = nil
+      callbacks = HTTP3::Nghttp3::Callbacks.new.public_send(callback) { |stream_id, *| call.call(server, stream_id) }
+      server = new_server(callbacks)
+      client = new_client
+      client.submit_request(REQUEST_STREAM, request_headers)
+
+      error = assert_raises(HTTP3::Nghttp3::InvalidStateError) { transfer(client, server) }
+      assert_equal "##{name} cannot be called from inside a callback of this connection", error.message
+      refute_predicate server, :closed?
+      server.close
+      assert_predicate server, :closed?
+    end
+  end
+
+  def test_writev_stream_is_refused_inside_a_body_block
+    client = nil
+    client = new_client
+    client.submit_request(REQUEST_STREAM, request_headers(method: "POST")) { |_stream_id| client.writev_stream }
+
+    error = assert_raises(HTTP3::Nghttp3::InvalidStateError) { drain(client) }
+    assert_equal "#writev_stream cannot be called from inside a callback of this connection", error.message
+  end
+
+  # As ngtcp2's examples do, a server may answer from inside read_stream.
+  def test_submit_response_inside_on_end_stream
+    server = nil
+    callbacks = HTTP3::Nghttp3::Callbacks.new.on_end_stream do |stream_id|
+      server.submit_response(stream_id, [HTTP3::Nghttp3::NV.new(":status", "204")])
+    end
+    server = new_server(callbacks)
+    received = []
+    client = new_client(HTTP3::Nghttp3::Callbacks.new.on_recv_header { |_stream_id, name, value, _flags| received << [name, value] })
+    client.submit_request(REQUEST_STREAM, request_headers)
+
+    transfer(client, server)
+    transfer(server, client)
+    assert_equal [[":status", "204"]], received
+  end
+
   def test_read_stream_takes_a_timestamp
     client = new_client
     client.submit_request(REQUEST_STREAM, request_headers)

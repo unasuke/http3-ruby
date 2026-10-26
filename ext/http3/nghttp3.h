@@ -46,6 +46,13 @@ extern const rb_data_type_t settings_data_type;
 /* TypedData type for Callbacks */
 extern const rb_data_type_t callbacks_data_type;
 
+/* Which call into nghttp3 a connection is in, for ConnectionObj.entered.
+ * nghttp3 runs callbacks only inside such a call, and lets a callback call
+ * back into the connection only as far as that call allows: from inside
+ * read_stream, ngtcp2's examples submit a response, but nghttp3 is in no
+ * state to read, write or be deleted. */
+enum { CONN_IDLE, CONN_IN_READ, CONN_IN_OTHER };
+
 /* The C side of an Nghttp3::Connection. nghttp3 gets a pointer to this
  * struct as conn_user_data, never the Ruby object: GC.compact may move the
  * object, and dcompact keeps self pointing at it. */
@@ -66,6 +73,7 @@ typedef struct {
   VALUE pending_exc;
   int is_closed;
   int is_server;
+  int entered; /* CONN_IDLE, or the call into nghttp3 under way */
 } ConnectionObj;
 
 /* Run body(arg) under rb_protect on behalf of a callback of obj. An

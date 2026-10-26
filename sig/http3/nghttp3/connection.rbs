@@ -1,5 +1,16 @@
 module HTTP3
   module Nghttp3
+    # A callback, a Callbacks block or a body block, runs while nghttp3 is
+    # in the middle of a call on the connection, and may call back into it
+    # only as far as nghttp3 allows there. Inside the callbacks of
+    # #read_stream, it may call #submit_request, #submit_response,
+    # #submit_info, #submit_trailers, #resume_stream, #block_stream,
+    # #unblock_stream, #shutdown_stream_read, #shutdown_stream_write,
+    # #submit_shutdown_notice, #shutdown, #set_max_client_streams_bidi and
+    # #stream_writable?; inside any other callback, none of the methods that
+    # call into nghttp3. Anything else, #close among it, raises
+    # InvalidStateError. #closed?, #server?, #client?, #pending_data and the
+    # stream user data methods call no nghttp3 and can be called anywhere.
     class Connection
       # Creates a new client connection
       def self.client_new: (?Settings? settings, ?Callbacks? callbacks) -> Connection
