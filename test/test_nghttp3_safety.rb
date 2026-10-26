@@ -221,7 +221,6 @@ class TestNghttp3Safety < Minitest::Test
   end
 
   def test_writev_stream_is_refused_inside_a_body_block
-    client = nil
     client = new_client
     client.submit_request(REQUEST_STREAM, request_headers(method: "POST")) { |_stream_id| client.writev_stream }
 
