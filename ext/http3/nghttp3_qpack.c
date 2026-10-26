@@ -46,25 +46,32 @@ static VALUE encoder_alloc(VALUE klass) {
  * call-seq:
  *   Encoder.new(max_dtable_capacity) -> Encoder
  *
- * Creates a new QPACK encoder.
+ * Creates a new QPACK encoder. Called again, it starts over with a new
+ * encoder and frees the old one; if the new one cannot be made, it raises
+ * and the old one stays.
  */
 static VALUE rb_nghttp3_qpack_encoder_initialize(VALUE self,
                                                  VALUE rb_max_capacity) {
   EncoderObj *obj;
+  nghttp3_qpack_encoder *encoder;
   size_t max_capacity;
   int rv;
 
   TypedData_Get_Struct(self, EncoderObj, &encoder_data_type, obj);
 
   max_capacity = NUM2SIZET(rb_max_capacity);
-  obj->hard_max_dtable_capacity = max_capacity;
 
-  rv = nghttp3_qpack_encoder_new(&obj->encoder, max_capacity,
-                                 nghttp3_mem_default());
+  rv = nghttp3_qpack_encoder_new(&encoder, max_capacity, nghttp3_mem_default());
 
   if (rv != 0) {
     nghttp3_rb_raise(rv, "Failed to create QPACK encoder");
   }
+
+  if (obj->encoder != NULL) {
+    nghttp3_qpack_encoder_del(obj->encoder);
+  }
+  obj->encoder = encoder;
+  obj->hard_max_dtable_capacity = max_capacity;
 
   return self;
 }
@@ -91,26 +98,33 @@ static VALUE rb_nghttp3_qpack_encoder_encode(VALUE self, VALUE rb_stream_id,
   EncoderObj *obj;
   int64_t stream_id;
   nghttp3_nv *nva;
-  size_t nvlen, i;
+  VALUE nva_buf;
+  long nvlen, bad;
   nghttp3_buf pbuf, rbuf, ebuf;
   int rv;
   VALUE result;
 
   TypedData_Get_Struct(self, EncoderObj, &encoder_data_type, obj);
 
+  /* As Connection#submit_request does: the arguments first, since to_int
+   * may run Ruby code, then every allocation, and only then the pointers
+   * into the header Strings. */
+  stream_id = nghttp3_rb_stream_id(rb_stream_id);
+  Check_Type(rb_headers, T_ARRAY);
+
   if (obj->encoder == NULL) {
     rb_raise(rb_eNghttp3InvalidStateError, "Encoder is not initialized");
   }
 
-  stream_id = NUM2LL(rb_stream_id);
-  Check_Type(rb_headers, T_ARRAY);
+  /* On the heap: a Ruby thread's machine stack is too small for a long
+   * list. */
   nvlen = RARRAY_LEN(rb_headers);
+  nva = ALLOCV_N(nghttp3_nv, nva_buf, nvlen);
 
-  /* Allocate and convert headers */
-  nva = ALLOCA_N(nghttp3_nv, nvlen);
-  for (i = 0; i < nvlen; i++) {
-    VALUE rb_nv = rb_ary_entry(rb_headers, i);
-    nva[i] = nghttp3_rb_nv_to_c(rb_nv);
+  bad = nghttp3_rb_nva_fill(rb_headers, nva, nvlen);
+  if (bad >= 0) {
+    ALLOCV_END(nva_buf);
+    nghttp3_rb_raise_bad_nv(bad);
   }
 
   /* Initialize buffers */
@@ -119,7 +133,9 @@ static VALUE rb_nghttp3_qpack_encoder_encode(VALUE self, VALUE rb_stream_id,
   nghttp3_buf_init(&ebuf);
 
   rv = nghttp3_qpack_encoder_encode(obj->encoder, &pbuf, &rbuf, &ebuf,
-                                    stream_id, nva, nvlen);
+                                    stream_id, nva, (size_t)nvlen);
+  ALLOCV_END(nva_buf);
+  RB_GC_GUARD(rb_headers);
 
   if (rv != 0) {
     nghttp3_buf_free(&pbuf, nghttp3_mem_default());
@@ -239,6 +255,12 @@ static VALUE rb_nghttp3_qpack_encoder_get_num_blocked_streams(VALUE self) {
 
 /* ============== Decoder ============== */
 
+/* The most streams a Decoder decodes at once, Decoder::MAX_STREAMS: each
+ * one not finished holds a stream context, and the peer chooses how many
+ * it leaves unfinished. nghttp3's encoder keeps the same number of streams
+ * (NGHTTP3_QPACK_MAX_QPACK_STREAMS). */
+#define DECODER_MAX_STREAMS 2000
+
 typedef struct {
   nghttp3_qpack_decoder *decoder;
   /* stream_id => nghttp3_qpack_stream_context *, in a C st_table: dfree
@@ -301,12 +323,15 @@ static VALUE decoder_alloc(VALUE klass) {
  * call-seq:
  *   Decoder.new(max_dtable_capacity, max_blocked_streams) -> Decoder
  *
- * Creates a new QPACK decoder.
+ * Creates a new QPACK decoder. Called again, it starts over with a new
+ * decoder and frees the old one with the streams it was decoding; if the
+ * new one cannot be made, it raises and the old one stays.
  */
 static VALUE rb_nghttp3_qpack_decoder_initialize(VALUE self,
                                                  VALUE rb_max_capacity,
                                                  VALUE rb_max_blocked) {
   DecoderObj *obj;
+  nghttp3_qpack_decoder *decoder;
   size_t max_capacity, max_blocked;
   int rv;
 
@@ -314,21 +339,31 @@ static VALUE rb_nghttp3_qpack_decoder_initialize(VALUE self,
 
   max_capacity = NUM2SIZET(rb_max_capacity);
   max_blocked = NUM2SIZET(rb_max_blocked);
-  obj->hard_max_dtable_capacity = max_capacity;
-  obj->max_blocked_streams = max_blocked;
 
-  rv = nghttp3_qpack_decoder_new(&obj->decoder, max_capacity, max_blocked,
+  rv = nghttp3_qpack_decoder_new(&decoder, max_capacity, max_blocked,
                                  nghttp3_mem_default());
 
   if (rv != 0) {
     nghttp3_rb_raise(rv, "Failed to create QPACK decoder");
   }
 
+  /* The stream contexts are of the old decoder's field sections. */
+  st_foreach(obj->stream_contexts, free_stream_context_i, 0);
+  st_clear(obj->stream_contexts);
+  if (obj->decoder != NULL) {
+    nghttp3_qpack_decoder_del(obj->decoder);
+  }
+  obj->decoder = decoder;
+  obj->hard_max_dtable_capacity = max_capacity;
+  obj->max_blocked_streams = max_blocked;
+
   return self;
 }
 
 /*
- * Get or create a stream context for the given stream_id
+ * Get or create a stream context for the given stream_id. Raises
+ * InvalidStateError when a new one would be one more than
+ * DECODER_MAX_STREAMS.
  */
 static nghttp3_qpack_stream_context *
 get_or_create_stream_context(DecoderObj *obj, int64_t stream_id) {
@@ -336,6 +371,13 @@ get_or_create_stream_context(DecoderObj *obj, int64_t stream_id) {
 
   if (st_lookup(obj->stream_contexts, (st_data_t)stream_id, &existing)) {
     return (nghttp3_qpack_stream_context *)existing;
+  }
+
+  if (obj->stream_contexts->num_entries >= DECODER_MAX_STREAMS) {
+    rb_raise(rb_eNghttp3InvalidStateError,
+             "a decoder takes at most %d streams at once; finish or "
+             "cancel_stream one first",
+             DECODER_MAX_STREAMS);
   }
 
   /* Create new context */
@@ -407,7 +449,7 @@ static VALUE rb_nghttp3_qpack_decoder_decode(int argc, VALUE *argv,
     rb_raise(rb_eNghttp3InvalidStateError, "Decoder is not initialized");
   }
 
-  stream_id = NUM2LL(rb_stream_id);
+  stream_id = nghttp3_rb_stream_id(rb_stream_id);
   Check_Type(rb_data, T_STRING);
   src = (const uint8_t *)RSTRING_PTR(rb_data);
   srclen = RSTRING_LEN(rb_data);
@@ -552,7 +594,7 @@ static VALUE rb_nghttp3_qpack_decoder_cancel_stream(VALUE self,
     rb_raise(rb_eNghttp3InvalidStateError, "Decoder is not initialized");
   }
 
-  stream_id = NUM2LL(rb_stream_id);
+  stream_id = nghttp3_rb_stream_id(rb_stream_id);
 
   delete_stream_context(obj, stream_id);
 
@@ -638,6 +680,8 @@ void Init_nghttp3_qpack(void) {
   /* Define Decoder class */
   rb_cNghttp3QPACKDecoder =
       rb_define_class_under(rb_mNghttp3QPACK, "Decoder", rb_cObject);
+  rb_define_const(rb_cNghttp3QPACKDecoder, "MAX_STREAMS",
+                  INT2NUM(DECODER_MAX_STREAMS));
   rb_define_alloc_func(rb_cNghttp3QPACKDecoder, decoder_alloc);
   rb_define_method(rb_cNghttp3QPACKDecoder, "initialize",
                    rb_nghttp3_qpack_decoder_initialize, 2);

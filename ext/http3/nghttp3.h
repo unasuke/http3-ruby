@@ -46,6 +46,13 @@ extern const rb_data_type_t settings_data_type;
 /* TypedData type for Callbacks */
 extern const rb_data_type_t callbacks_data_type;
 
+/* Which call into nghttp3 a connection is in, for ConnectionObj.entered.
+ * nghttp3 runs callbacks only inside such a call, and lets a callback call
+ * back into the connection only as far as that call allows: from inside
+ * read_stream, ngtcp2's examples submit a response, but nghttp3 is in no
+ * state to read, write or be deleted. */
+enum { CONN_IDLE, CONN_IN_READ, CONN_IN_OTHER };
+
 /* The C side of an Nghttp3::Connection. nghttp3 gets a pointer to this
  * struct as conn_user_data, never the Ruby object: GC.compact may move the
  * object, and dcompact keeps self pointing at it. */
@@ -66,6 +73,19 @@ typedef struct {
   VALUE pending_exc;
   int is_closed;
   int is_server;
+  int entered; /* CONN_IDLE, or the call into nghttp3 under way */
+  /* nghttp3 returned an error after which it allows nothing but
+   * nghttp3_conn_del: any from read_stream or writev_stream, or a fatal one
+   * from another call. */
+  int failed;
+  /* What has been done to the connection, for the calls nghttp3 asserts
+   * come after it or not after it. goaway is 0 before any GOAWAY, 1 after
+   * submit_shutdown_notice and 2 after shutdown. max_client_streams is the
+   * last value given to set_max_client_streams_bidi. */
+  int ctrl_bound;
+  int qpack_bound;
+  int goaway;
+  uint64_t max_client_streams;
 } ConnectionObj;
 
 /* Run body(arg) under rb_protect on behalf of a callback of obj. An
@@ -84,11 +104,24 @@ void nghttp3_rb_conn_stream_closed(ConnectionObj *obj, int64_t stream_id);
 VALUE nghttp3_rb_error_class_for_code(int error_code);
 void nghttp3_rb_raise(int error_code, const char *fmt, ...);
 
+/* rb_id (to_int is called) as a stream id for nghttp3, which asserts the
+ * range of the ids it is given: ArgumentError unless it is 0..2**62-1. */
+int64_t nghttp3_rb_stream_id(VALUE rb_id);
+
 /* Settings helper */
 nghttp3_settings *nghttp3_rb_get_settings(VALUE rb_settings);
 
-/* NV helper */
-nghttp3_nv nghttp3_rb_nv_to_c(VALUE rb_nv);
+/* NV helpers. nghttp3_rb_nva_fill fills nva with the first nvlen elements
+ * of headers, an Array of NVs, pointing into their Strings. It never raises,
+ * allocates nothing and runs no Ruby code, so that from the moment it takes
+ * those pointers until nghttp3 has copied the Strings, nothing can change,
+ * free or move them; so call it after anything that allocates or may run
+ * Ruby code, and call nghttp3 right after it. It returns the index of the
+ * first element that is not an NV with String name and value and flags of
+ * 0..255, or -1 if there is none. nghttp3_rb_raise_bad_nv raises
+ * ArgumentError for that index. */
+long nghttp3_rb_nva_fill(VALUE headers, nghttp3_nv *nva, long nvlen);
+NORETURN(void nghttp3_rb_raise_bad_nv(long index));
 
 /* Callbacks helper: install the C callbacks, which do their own
  * bookkeeping and then call the Ruby blocks of conn's Callbacks, if any. */

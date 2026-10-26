@@ -117,6 +117,30 @@ alt-svc: h3=":443"
 
 That is configured in that server (nginx, Puma, ...), not in this gem.
 
+### HTTP3::Nghttp3
+
+The bindings keep nghttp3's rules for its callers, so that a wrong call
+raises instead of crashing the process or reaching freed memory:
+
+- A callback (a `Callbacks` block or a body block) runs while nghttp3 is in
+  the middle of a call. Inside the callbacks of `read_stream`, it may call
+  `submit_*`, `resume_stream`, `block_stream`, `unblock_stream`,
+  `shutdown_stream_read`, `shutdown_stream_write`, `submit_shutdown_notice`,
+  `shutdown`, `set_max_client_streams_bidi` and `stream_writable?` on the
+  same connection. `close`, `read_stream`, `writev_stream` and the rest
+  raise `InvalidStateError` there, and inside any other callback every call
+  into nghttp3 does.
+- Once nghttp3 reports a connection error, only `#close` can be called; the
+  rest raise `InvalidStateError`.
+- `NV_FLAG_NO_COPY_NAME` and `NV_FLAG_NO_COPY_VALUE` are ignored: names and
+  values are always copied.
+- Stream ids are checked for their range and kind, and calls for the role
+  and state of the connection, raising `ArgumentError` and
+  `InvalidStateError` instead of tripping nghttp3's assertions.
+- A `QPACK::Decoder` decodes at most `MAX_STREAMS` (2000) streams at once.
+
+The signatures in `sig/` describe each method.
+
 ## Development
 
 After checking out the repo, run `bin/setup` to install dependencies. Then,

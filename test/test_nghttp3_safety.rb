@@ -93,6 +93,157 @@ class TestNghttp3Safety < Minitest::Test
     assert_equal "compact me", received
   end
 
+  # Told not to copy, nghttp3 would read the names and values only when
+  # writev_stream sends them, after the NVs are gone and their Strings
+  # freed or moved. The flags are ignored, so the right headers arrive.
+  def test_no_copy_flags_are_ignored
+    headers = [[":method", "GET"], [":path", "/" + "p" * 200], [":scheme", "https"], [":authority", "example.com"]]
+    received = []
+    callbacks = HTTP3::Nghttp3::Callbacks.new.on_recv_header { |_stream_id, name, value, _flags| received << [name, value] }
+    client = new_client
+    flags = HTTP3::Nghttp3::NV_FLAG_NO_COPY_NAME | HTTP3::Nghttp3::NV_FLAG_NO_COPY_VALUE
+    client.submit_request(REQUEST_STREAM, headers.map { |name, value| HTTP3::Nghttp3::NV.new(name, value, flags: flags) })
+
+    GC.start
+    GC.verify_compaction_references(expand_heap: true, toward: :empty)
+    Array.new(100_000) { "x" * 200 }
+
+    transfer(client, new_server(callbacks))
+    assert_equal headers, received
+  end
+
+  # A Ruby thread's machine stack is small: 100,000 fields, 40 bytes each
+  # as nghttp3_nv, would overflow it were they put there.
+  def test_many_fields_in_a_thread
+    headers = request_headers + Array.new(100_000) { |i| HTTP3::Nghttp3::NV.new("x-field", i.to_s) }
+    encoded = Thread.new do
+      new_client.submit_request(REQUEST_STREAM, headers)
+      HTTP3::Nghttp3::QPACK::Encoder.new(0).encode(REQUEST_STREAM, headers)
+    end.value
+    refute_empty encoded[:data]
+  end
+
+  # The pointers into the header Strings are taken only once no Ruby code
+  # can run before nghttp3 copies them, so an NV's instance variables are
+  # read as they are: one that is not an NV with String name and value and
+  # flags of 0..255 is refused, to_str is not called, and nothing reaches
+  # nghttp3.
+  def test_bad_nvs_are_refused_without_running_ruby_code
+    value = Object.new
+    to_str_called = false
+    value.define_singleton_method(:to_str) { to_str_called = true }
+    bad_nvs = [
+      HTTP3::Nghttp3::NV.new("x-a", "a").tap { |nv| nv.instance_variable_set(:@name, 1) },
+      HTTP3::Nghttp3::NV.new("x-b", "b").tap { |nv| nv.instance_variable_set(:@value, value) },
+      HTTP3::Nghttp3::NV.new("x-c", "c").tap { |nv| nv.instance_variable_set(:@flags, "x") },
+      "x-d: d"
+    ]
+    message = "headers[4] is not an HTTP3::Nghttp3::NV with String name and value"
+    client = new_client
+    server = new_server
+    encoder = HTTP3::Nghttp3::QPACK::Encoder.new(0)
+    bad_nvs.each do |nv|
+      headers = request_headers + [nv]
+      assert_equal message, assert_raises(ArgumentError) { client.submit_request(REQUEST_STREAM, headers, body: "a") }.message
+      assert_equal message, assert_raises(ArgumentError) { client.submit_trailers(REQUEST_STREAM, headers) }.message
+      assert_equal message, assert_raises(ArgumentError) { server.submit_response(REQUEST_STREAM, headers) }.message
+      assert_equal message, assert_raises(ArgumentError) { server.submit_info(REQUEST_STREAM, headers) }.message
+      assert_equal message, assert_raises(ArgumentError) { encoder.encode(REQUEST_STREAM, headers) }.message
+    end
+    refute to_str_called
+
+    # The stream is still free for a request.
+    received = +""
+    callbacks = HTTP3::Nghttp3::Callbacks.new.on_recv_data { |_stream_id, data| received << data }
+    client.submit_request(REQUEST_STREAM, request_headers(method: "POST"), body: "the body")
+    transfer(client, new_server(callbacks))
+    assert_equal "the body", received
+  end
+
+  # The body's to_str runs before the connection is checked, and so before
+  # nghttp3 is called with a connection to_str has closed.
+  def test_connection_closed_by_the_body_to_str
+    client = new_client
+    body = Object.new
+    body.define_singleton_method(:to_str) do
+      client.close
+      "body"
+    end
+    error = assert_raises(HTTP3::Nghttp3::InvalidStateError) do
+      client.submit_request(REQUEST_STREAM, request_headers(method: "POST"), body: body)
+    end
+    assert_equal "Connection is closed", error.message
+  end
+
+  # nghttp3 is still using the connection while it runs a callback: closing
+  # it there, or reading into it again, is refused, and the error comes out
+  # of read_stream as a callback's exception does.
+  def test_close_and_read_stream_are_refused_inside_a_callback
+    [
+      [:close, ->(conn, _stream_id) { conn.close }, :on_begin_headers],
+      [:read_stream, ->(conn, stream_id) { conn.read_stream(stream_id, "") }, :on_recv_header]
+    ].each do |name, call, callback|
+      server = nil
+      callbacks = HTTP3::Nghttp3::Callbacks.new.public_send(callback) { |stream_id, *| call.call(server, stream_id) }
+      server = new_server(callbacks)
+      client = new_client
+      client.submit_request(REQUEST_STREAM, request_headers)
+
+      error = assert_raises(HTTP3::Nghttp3::InvalidStateError) { transfer(client, server) }
+      assert_equal "##{name} cannot be called from inside a callback of this connection", error.message
+      refute_predicate server, :closed?
+      server.close
+      assert_predicate server, :closed?
+    end
+  end
+
+  # Once read_stream has failed, nghttp3 allows nothing but deleting the
+  # connection, so only #close goes through, and what calls no nghttp3.
+  def test_only_close_after_the_connection_failed
+    callbacks = HTTP3::Nghttp3::Callbacks.new.on_begin_headers { |_stream_id| raise "boom" }
+    client = new_client
+    client.submit_request(REQUEST_STREAM, request_headers)
+    server = new_server(callbacks)
+    assert_raises(RuntimeError) { transfer(client, server) }
+
+    [
+      -> { server.read_stream(REQUEST_STREAM, +"") },
+      -> { server.writev_stream },
+      -> { server.submit_response(REQUEST_STREAM, [HTTP3::Nghttp3::NV.new(":status", "200")]) }
+    ].each do |call|
+      error = assert_raises(HTTP3::Nghttp3::InvalidStateError) { call.call }
+      assert_equal "the connection has failed; only #close is allowed", error.message
+    end
+    assert_empty server.pending_data(REQUEST_STREAM)
+    refute_predicate server, :closed?
+    server.close
+    assert_predicate server, :closed?
+  end
+
+  def test_writev_stream_is_refused_inside_a_body_block
+    client = new_client
+    client.submit_request(REQUEST_STREAM, request_headers(method: "POST")) { |_stream_id| client.writev_stream }
+
+    error = assert_raises(HTTP3::Nghttp3::InvalidStateError) { drain(client) }
+    assert_equal "#writev_stream cannot be called from inside a callback of this connection", error.message
+  end
+
+  # As ngtcp2's examples do, a server may answer from inside read_stream.
+  def test_submit_response_inside_on_end_stream
+    server = nil
+    callbacks = HTTP3::Nghttp3::Callbacks.new.on_end_stream do |stream_id|
+      server.submit_response(stream_id, [HTTP3::Nghttp3::NV.new(":status", "204")])
+    end
+    server = new_server(callbacks)
+    received = []
+    client = new_client(HTTP3::Nghttp3::Callbacks.new.on_recv_header { |_stream_id, name, value, _flags| received << [name, value] })
+    client.submit_request(REQUEST_STREAM, request_headers)
+
+    transfer(client, server)
+    transfer(server, client)
+    assert_equal [[":status", "204"]], received
+  end
+
   def test_read_stream_takes_a_timestamp
     client = new_client
     client.submit_request(REQUEST_STREAM, request_headers)

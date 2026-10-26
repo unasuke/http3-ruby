@@ -1,5 +1,26 @@
 module HTTP3
   module Nghttp3
+    # A callback, a Callbacks block or a body block, runs while nghttp3 is
+    # in the middle of a call on the connection, and may call back into it
+    # only as far as nghttp3 allows there. Inside the callbacks of
+    # #read_stream, it may call #submit_request, #submit_response,
+    # #submit_info, #submit_trailers, #resume_stream, #block_stream,
+    # #unblock_stream, #shutdown_stream_read, #shutdown_stream_write,
+    # #submit_shutdown_notice, #shutdown, #set_max_client_streams_bidi and
+    # #stream_writable?; inside any other callback, none of the methods that
+    # call into nghttp3. Anything else, #close among it, raises
+    # InvalidStateError. #closed?, #server?, #client?, #pending_data and the
+    # stream user data methods call no nghttp3 and can be called anywhere.
+    #
+    # Once #read_stream or #writev_stream has raised for an error nghttp3
+    # returned, or another method for a fatal one, nghttp3 allows nothing
+    # but deleting the connection: only #close and the methods that call no
+    # nghttp3 can be called, and the rest raise InvalidStateError.
+    #
+    # What nghttp3 asserts of its callers raises instead: a stream id out of
+    # 0..2**62-1 or of the wrong kind raises ArgumentError, and a call on a
+    # connection of the wrong role, or before or after the calls nghttp3
+    # needs, InvalidStateError.
     class Connection
       # Creates a new client connection
       def self.client_new: (?Settings? settings, ?Callbacks? callbacks) -> Connection
@@ -7,10 +28,12 @@ module HTTP3
       # Creates a new server connection
       def self.server_new: (?Settings? settings, ?Callbacks? callbacks) -> Connection
 
-      # Binds the control stream
+      # Binds the control stream, a unidirectional stream of this end (id % 4
+      # == 3 for a server, 2 for a client)
       def bind_control_stream: (Integer stream_id) -> self
 
-      # Binds QPACK encoder and decoder streams
+      # Binds QPACK encoder and decoder streams, unidirectional streams of
+      # this end as for bind_control_stream
       def bind_qpack_streams: (Integer encoder_stream_id, Integer decoder_stream_id) -> self
 
       # Closes the connection
@@ -29,7 +52,9 @@ module HTTP3
 
       # Reads data on a stream from the QUIC layer. ts is the time in
       # nanoseconds on a monotonic clock (CLOCK_MONOTONIC by default). An
-      # exception raised by a callback comes out of here.
+      # exception raised by a callback comes out of here. A server reads the
+      # streams the client opened (even ids), a client the request streams
+      # and the server's unidirectional streams (id % 4 of 0 or 3).
       def read_stream: (Integer stream_id, String data, ?fin: bool, ?ts: Integer?) -> Integer
 
       # Gets stream data to send to the QUIC layer. An exception raised by a
@@ -64,7 +89,7 @@ module HTTP3
       def shutdown_stream_read: (Integer stream_id) -> self
 
       # Tells a server connection how many bidirectional streams the client
-      # may open in total
+      # may open in total. It never goes down (ArgumentError).
       def set_max_client_streams_bidi: (Integer max_streams) -> self
 
       # The body Strings handed to nghttp3 that the peer has not acknowledged
@@ -72,23 +97,32 @@ module HTTP3
       def pending_data: (Integer stream_id) -> Array[String]
 
       # HTTP operations
+      #
+      # The submit_* methods read each NV's name, value and flags as they
+      # are, without to_str or to_int, and raise ArgumentError for an
+      # element that is not an NV with String name and value and flags of
+      # 0..255; nothing is submitted then. They need #bind_qpack_streams
+      # first.
 
-      # Submits an HTTP request (client only)
+      # Submits an HTTP request (client only) on a client-initiated
+      # bidirectional stream (id % 4 == 0)
       def submit_request: (Integer stream_id, Array[NV] headers, ?body: String?) ?{ (Integer stream_id) -> (String | Symbol | nil) } -> self
 
       # Submits an HTTP response (server only)
       def submit_response: (Integer stream_id, Array[NV] headers, ?body: String?) ?{ (Integer stream_id) -> (String | Symbol | nil) } -> self
 
-      # Submits a 1xx informational response
+      # Submits a 1xx informational response (server only)
       def submit_info: (Integer stream_id, Array[NV] headers) -> self
 
       # Submits trailer headers (implicitly ends the stream)
       def submit_trailers: (Integer stream_id, Array[NV] trailers) -> self
 
-      # Signals the intention to shut down the connection gracefully
+      # Signals the intention to shut down the connection gracefully. Needs
+      # #bind_control_stream first, and cannot follow #shutdown.
       def submit_shutdown_notice: () -> self
 
-      # Initiates graceful shutdown
+      # Initiates graceful shutdown. Needs #bind_control_stream first, and
+      # can be called once.
       def shutdown: () -> self
 
       # Associates arbitrary data with a stream

@@ -102,6 +102,12 @@ static VALUE connection_alloc(VALUE klass) {
   obj->pending_exc = Qnil;
   obj->is_closed = 0;
   obj->is_server = 0;
+  obj->entered = CONN_IDLE;
+  obj->failed = 0;
+  obj->ctrl_bound = 0;
+  obj->qpack_bound = 0;
+  obj->goaway = 0;
+  obj->max_client_streams = 0;
   obj->pending = st_init_numtable();
   obj->stream_data_readers = rb_hash_new();
   obj->stream_user_data = rb_hash_new();
@@ -132,6 +138,92 @@ static void connection_raise_pending(ConnectionObj *obj) {
   VALUE exc = obj->pending_exc;
   obj->pending_exc = Qnil;
   rb_exc_raise(exc);
+}
+
+/* The connection of self, for a method about to call into nghttp3. Raises
+ * InvalidStateError if the connection is closed or has failed, or if this
+ * is a callback of a call into nghttp3 that does not allow the method:
+ * inside read_stream only the methods allowed_in_read, and inside any other
+ * call none. Called once the arguments are converted, since to_int and
+ * to_str may run Ruby code that closes the connection.
+ *
+ * Around the call into nghttp3, the method sets obj->entered to the kind of
+ * call (CONN_IN_READ for read_stream, CONN_IN_OTHER otherwise) and puts the
+ * value before back as soon as nghttp3 returns. */
+/* Note that the connection has failed if rv, which a call into nghttp3
+ * other than read_stream or writev_stream returned, is a fatal error. */
+static void connection_check_fatal(ConnectionObj *obj, int rv) {
+  if (nghttp3_err_is_fatal(rv)) {
+    obj->failed = 1;
+  }
+}
+
+/* The name of the method being run, for messages. */
+static VALUE this_method(void) { return rb_id2str(rb_frame_this_func()); }
+
+static ConnectionObj *connection_enter(VALUE self, int allowed_in_read) {
+  ConnectionObj *obj;
+  TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
+  if (obj->conn == NULL || obj->is_closed) {
+    rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
+  }
+  if (obj->failed) {
+    rb_raise(rb_eNghttp3InvalidStateError,
+             "the connection has failed; only #close is allowed");
+  }
+  if (obj->entered == CONN_IN_OTHER ||
+      (obj->entered == CONN_IN_READ && !allowed_in_read)) {
+    rb_raise(rb_eNghttp3InvalidStateError,
+             "#%" PRIsVALUE
+             " cannot be called from inside a callback of this connection",
+             this_method());
+  }
+  return obj;
+}
+
+/* What nghttp3 asserts of its callers, which would abort the process,
+ * checked here first: the kind of a stream id (its range is checked by
+ * nghttp3_rb_stream_id), the role of the connection and the calls that must
+ * or must not have come before. Each raises for the method being run. */
+
+NORETURN(static void raise_stream_kind(VALUE rb_id, const char *kind));
+static void raise_stream_kind(VALUE rb_id, const char *kind) {
+  rb_raise(rb_eArgError, "stream_id %" PRIsVALUE " is not a %s stream", rb_id,
+           kind);
+}
+
+/* A unidirectional stream opened by this end, for the bind_* methods. */
+static void check_own_uni_stream(ConnectionObj *obj, VALUE rb_id, int64_t id) {
+  if (obj->is_server && (id & 3) != 3) {
+    raise_stream_kind(rb_id, "server-initiated unidirectional");
+  }
+  if (!obj->is_server && (id & 3) != 2) {
+    raise_stream_kind(rb_id, "client-initiated unidirectional");
+  }
+}
+
+static void check_server(ConnectionObj *obj) {
+  if (!obj->is_server) {
+    rb_raise(rb_eNghttp3InvalidStateError,
+             "#%" PRIsVALUE " is for a server connection", this_method());
+  }
+}
+
+static void check_done(int done, const char *first) {
+  if (!done) {
+    rb_raise(rb_eNghttp3InvalidStateError, "#%" PRIsVALUE " needs #%s first",
+             this_method(), first);
+  }
+}
+
+/* nghttp3 asserts that the id of each GOAWAY is no larger than the one
+ * before. A server's shutdown sends one past the largest stream it has
+ * seen, which may have grown since, and a shutdown notice sends the largest
+ * id there is, so neither may follow a shutdown. */
+static void check_no_shutdown(ConnectionObj *obj) {
+  if (obj->goaway == 2) {
+    rb_raise(rb_eNghttp3InvalidStateError, "#shutdown has been called already");
+  }
 }
 
 static PendingStream *pending_lookup(ConnectionObj *obj, int64_t stream_id) {
@@ -294,21 +386,23 @@ static VALUE rb_nghttp3_connection_bind_control_stream(VALUE self,
                                                        VALUE rb_stream_id) {
   ConnectionObj *obj;
   int64_t stream_id;
-  int rv;
+  int rv, entered;
 
-  TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
+  stream_id = nghttp3_rb_stream_id(rb_stream_id);
+  obj = connection_enter(self, 0);
+  check_own_uni_stream(obj, rb_stream_id, stream_id);
 
-  if (obj->conn == NULL || obj->is_closed) {
-    rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
-  }
-
-  stream_id = NUM2LL(rb_stream_id);
+  entered = obj->entered;
+  obj->entered = CONN_IN_OTHER;
   rv = nghttp3_conn_bind_control_stream(obj->conn, stream_id);
+  obj->entered = entered;
+  connection_check_fatal(obj, rv);
 
   if (rv != 0) {
     nghttp3_rb_raise(rv, "Failed to bind control stream");
   }
 
+  obj->ctrl_bound = 1;
   return self;
 }
 
@@ -324,23 +418,25 @@ static VALUE rb_nghttp3_connection_bind_qpack_streams(VALUE self,
                                                       VALUE rb_dec_stream_id) {
   ConnectionObj *obj;
   int64_t enc_stream_id, dec_stream_id;
-  int rv;
+  int rv, entered;
 
-  TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
+  enc_stream_id = nghttp3_rb_stream_id(rb_enc_stream_id);
+  dec_stream_id = nghttp3_rb_stream_id(rb_dec_stream_id);
+  obj = connection_enter(self, 0);
+  check_own_uni_stream(obj, rb_enc_stream_id, enc_stream_id);
+  check_own_uni_stream(obj, rb_dec_stream_id, dec_stream_id);
 
-  if (obj->conn == NULL || obj->is_closed) {
-    rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
-  }
-
-  enc_stream_id = NUM2LL(rb_enc_stream_id);
-  dec_stream_id = NUM2LL(rb_dec_stream_id);
-
+  entered = obj->entered;
+  obj->entered = CONN_IN_OTHER;
   rv = nghttp3_conn_bind_qpack_streams(obj->conn, enc_stream_id, dec_stream_id);
+  obj->entered = entered;
+  connection_check_fatal(obj, rv);
 
   if (rv != 0) {
     nghttp3_rb_raise(rv, "Failed to bind QPACK streams");
   }
 
+  obj->qpack_bound = 1;
   return self;
 }
 
@@ -349,13 +445,20 @@ static VALUE rb_nghttp3_connection_bind_qpack_streams(VALUE self,
  *   connection.close -> nil
  *
  * Explicitly closes the connection and frees resources.
- * After calling this, the connection object cannot be used.
+ * After calling this, the connection object cannot be used. Closing a
+ * closed connection does nothing; closing it from inside one of its
+ * callbacks, while nghttp3 still uses it, raises InvalidStateError.
  */
 static VALUE rb_nghttp3_connection_close(VALUE self) {
   ConnectionObj *obj;
 
   TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
 
+  if (obj->entered != CONN_IDLE) {
+    rb_raise(rb_eNghttp3InvalidStateError,
+             "#close cannot be called from inside a callback of this "
+             "connection");
+  }
   if (obj->conn != NULL && !obj->is_closed) {
     nghttp3_conn_del(obj->conn);
     obj->conn = NULL;
@@ -419,9 +522,15 @@ struct read_stream_args {
 
 static VALUE read_stream_body(VALUE arg) {
   struct read_stream_args *a = (struct read_stream_args *)arg;
+  int entered = a->obj->entered;
+  a->obj->entered = CONN_IN_READ;
   nghttp3_ssize rv = nghttp3_conn_read_stream2(
       a->obj->conn, a->stream_id, (const uint8_t *)RSTRING_PTR(a->data),
       (size_t)RSTRING_LEN(a->data), a->fin, a->ts);
+  a->obj->entered = entered;
+  if (rv < 0) {
+    a->obj->failed = 1;
+  }
   connection_raise_pending(a->obj);
   if (rv < 0) {
     nghttp3_rb_raise((int)rv, "Failed to read stream");
@@ -449,7 +558,6 @@ static VALUE rb_nghttp3_connection_read_stream(int argc, VALUE *argv,
   VALUE rb_stream_id, rb_data, rb_opts;
   VALUE rb_fin = Qfalse;
   VALUE rb_ts = Qnil;
-  ConnectionObj *obj;
 
   rb_scan_args(argc, argv, "2:", &rb_stream_id, &rb_data, &rb_opts);
 
@@ -461,20 +569,25 @@ static VALUE rb_nghttp3_connection_read_stream(int argc, VALUE *argv,
     rb_ts = rb_hash_aref(rb_opts, ID2SYM(rb_intern("ts")));
   }
 
-  TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
-
-  if (obj->conn == NULL || obj->is_closed) {
-    rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
-  }
-
   Check_Type(rb_data, T_STRING);
 
   struct read_stream_args args;
-  args.obj = obj;
-  args.stream_id = NUM2LL(rb_stream_id);
+  args.stream_id = nghttp3_rb_stream_id(rb_stream_id);
   args.data = rb_data;
   args.fin = RTEST(rb_fin) ? 1 : 0;
   args.ts = NIL_P(rb_ts) ? monotonic_now() : (nghttp3_tstamp)NUM2ULL(rb_ts);
+  args.obj = connection_enter(self, 0);
+  /* Data comes in on the streams of the other end and the request streams;
+   * nghttp3 asserts that a stream it knows is one of those. */
+  if (args.obj->is_server && (args.stream_id & 1) != 0) {
+    raise_stream_kind(rb_stream_id, "client-initiated");
+  }
+  if (!args.obj->is_server && (args.stream_id & 3) != 0 &&
+      (args.stream_id & 3) != 3) {
+    raise_stream_kind(
+        rb_stream_id,
+        "client-initiated bidirectional or server-initiated unidirectional");
+  }
 
   /* Callbacks run Ruby code, which must not change data under nghttp3. */
   rb_str_locktmp(rb_data);
@@ -494,17 +607,19 @@ static VALUE rb_nghttp3_connection_writev_stream(VALUE self) {
   nghttp3_vec vec[16];
   nghttp3_ssize rv;
   int64_t stream_id;
-  int fin;
+  int fin, entered;
   VALUE rb_result, rb_data;
   size_t i, total_len;
 
-  TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
+  obj = connection_enter(self, 0);
 
-  if (obj->conn == NULL || obj->is_closed) {
-    rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
-  }
-
+  entered = obj->entered;
+  obj->entered = CONN_IN_OTHER;
   rv = nghttp3_conn_writev_stream(obj->conn, &stream_id, &fin, vec, 16);
+  obj->entered = entered;
+  if (rv < 0) {
+    obj->failed = 1;
+  }
   connection_raise_pending(obj);
 
   if (rv < 0) {
@@ -544,20 +659,19 @@ static VALUE rb_nghttp3_connection_add_write_offset(VALUE self,
                                                     VALUE rb_stream_id,
                                                     VALUE rb_n) {
   ConnectionObj *obj;
-  int rv;
+  int rv, entered;
   int64_t stream_id;
   size_t n;
 
-  TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
-
-  if (obj->conn == NULL || obj->is_closed) {
-    rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
-  }
-
   stream_id = NUM2LL(rb_stream_id);
   n = NUM2SIZET(rb_n);
+  obj = connection_enter(self, 0);
 
+  entered = obj->entered;
+  obj->entered = CONN_IN_OTHER;
   rv = nghttp3_conn_add_write_offset(obj->conn, stream_id, n);
+  obj->entered = entered;
+  connection_check_fatal(obj, rv);
   connection_raise_pending(obj);
 
   if (rv != 0) {
@@ -577,20 +691,19 @@ static VALUE rb_nghttp3_connection_add_ack_offset(VALUE self,
                                                   VALUE rb_stream_id,
                                                   VALUE rb_n) {
   ConnectionObj *obj;
-  int rv;
+  int rv, entered;
   int64_t stream_id;
   uint64_t n;
 
-  TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
-
-  if (obj->conn == NULL || obj->is_closed) {
-    rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
-  }
-
   stream_id = NUM2LL(rb_stream_id);
   n = NUM2ULL(rb_n);
+  obj = connection_enter(self, 0);
 
+  entered = obj->entered;
+  obj->entered = CONN_IN_OTHER;
   rv = nghttp3_conn_add_ack_offset(obj->conn, stream_id, n);
+  obj->entered = entered;
+  connection_check_fatal(obj, rv);
   connection_raise_pending(obj);
 
   if (rv != 0) {
@@ -610,15 +723,15 @@ static VALUE rb_nghttp3_connection_block_stream(VALUE self,
                                                 VALUE rb_stream_id) {
   ConnectionObj *obj;
   int64_t stream_id;
-
-  TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
-
-  if (obj->conn == NULL || obj->is_closed) {
-    rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
-  }
+  int entered;
 
   stream_id = NUM2LL(rb_stream_id);
+  obj = connection_enter(self, 1);
+
+  entered = obj->entered;
+  obj->entered = CONN_IN_OTHER;
   nghttp3_conn_block_stream(obj->conn, stream_id);
+  obj->entered = entered;
 
   return self;
 }
@@ -632,17 +745,17 @@ static VALUE rb_nghttp3_connection_block_stream(VALUE self,
 static VALUE rb_nghttp3_connection_unblock_stream(VALUE self,
                                                   VALUE rb_stream_id) {
   ConnectionObj *obj;
-  int rv;
+  int rv, entered;
   int64_t stream_id;
 
-  TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
-
-  if (obj->conn == NULL || obj->is_closed) {
-    rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
-  }
-
   stream_id = NUM2LL(rb_stream_id);
+  obj = connection_enter(self, 1);
+
+  entered = obj->entered;
+  obj->entered = CONN_IN_OTHER;
   rv = nghttp3_conn_unblock_stream(obj->conn, stream_id);
+  obj->entered = entered;
+  connection_check_fatal(obj, rv);
   connection_raise_pending(obj);
 
   if (rv != 0) {
@@ -662,16 +775,15 @@ static VALUE rb_nghttp3_connection_stream_writable_p(VALUE self,
                                                      VALUE rb_stream_id) {
   ConnectionObj *obj;
   int64_t stream_id;
-  int rv;
-
-  TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
-
-  if (obj->conn == NULL || obj->is_closed) {
-    rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
-  }
+  int rv, entered;
 
   stream_id = NUM2LL(rb_stream_id);
+  obj = connection_enter(self, 1);
+
+  entered = obj->entered;
+  obj->entered = CONN_IN_OTHER;
   rv = nghttp3_conn_is_stream_writable(obj->conn, stream_id);
+  obj->entered = entered;
 
   return rv ? Qtrue : Qfalse;
 }
@@ -685,20 +797,19 @@ static VALUE rb_nghttp3_connection_stream_writable_p(VALUE self,
 static VALUE rb_nghttp3_connection_close_stream(VALUE self, VALUE rb_stream_id,
                                                 VALUE rb_error_code) {
   ConnectionObj *obj;
-  int rv;
+  int rv, entered;
   int64_t stream_id;
   uint64_t app_error_code;
 
-  TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
-
-  if (obj->conn == NULL || obj->is_closed) {
-    rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
-  }
-
   stream_id = NUM2LL(rb_stream_id);
   app_error_code = NUM2ULL(rb_error_code);
+  obj = connection_enter(self, 0);
 
+  entered = obj->entered;
+  obj->entered = CONN_IN_OTHER;
   rv = nghttp3_conn_close_stream(obj->conn, stream_id, app_error_code);
+  obj->entered = entered;
+  connection_check_fatal(obj, rv);
   connection_raise_pending(obj);
 
   if (rv != 0) {
@@ -718,15 +829,15 @@ static VALUE rb_nghttp3_connection_shutdown_stream_write(VALUE self,
                                                          VALUE rb_stream_id) {
   ConnectionObj *obj;
   int64_t stream_id;
-
-  TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
-
-  if (obj->conn == NULL || obj->is_closed) {
-    rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
-  }
+  int entered;
 
   stream_id = NUM2LL(rb_stream_id);
+  obj = connection_enter(self, 1);
+
+  entered = obj->entered;
+  obj->entered = CONN_IN_OTHER;
   nghttp3_conn_shutdown_stream_write(obj->conn, stream_id);
+  obj->entered = entered;
   connection_raise_pending(obj);
 
   return self;
@@ -741,17 +852,17 @@ static VALUE rb_nghttp3_connection_shutdown_stream_write(VALUE self,
 static VALUE rb_nghttp3_connection_resume_stream(VALUE self,
                                                  VALUE rb_stream_id) {
   ConnectionObj *obj;
-  int rv;
+  int rv, entered;
   int64_t stream_id;
 
-  TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
-
-  if (obj->conn == NULL || obj->is_closed) {
-    rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
-  }
-
   stream_id = NUM2LL(rb_stream_id);
+  obj = connection_enter(self, 1);
+
+  entered = obj->entered;
+  obj->entered = CONN_IN_OTHER;
   rv = nghttp3_conn_resume_stream(obj->conn, stream_id);
+  obj->entered = entered;
+  connection_check_fatal(obj, rv);
   connection_raise_pending(obj);
 
   if (rv != 0) {
@@ -835,6 +946,31 @@ static nghttp3_ssize read_data_callback(nghttp3_conn *conn, int64_t stream_id,
 static const nghttp3_data_reader data_reader = {.read_data =
                                                     read_data_callback};
 
+/* The body of a submit_request or submit_response: a frozen copy of body:,
+ * so that the application cannot change the bytes nghttp3 will read, or the
+ * block, or Qnil for none. StringValue may run Ruby code (to_str). */
+static VALUE submit_body_reader(VALUE rb_opts) {
+  VALUE rb_body = Qnil;
+  if (!NIL_P(rb_opts)) {
+    rb_body = rb_hash_aref(rb_opts, ID2SYM(rb_intern("body")));
+  }
+  if (!NIL_P(rb_body)) {
+    StringValue(rb_body);
+    return rb_str_new_frozen(rb_body);
+  }
+  return rb_block_given_p() ? rb_block_proc() : Qnil;
+}
+
+/*
+ * The submit_* methods take the pointers into the header Strings only once
+ * nothing more can run Ruby code or allocate before nghttp3 copies them: Ruby
+ * code could change or drop the Strings, and an allocation could start a GC
+ * that moves them. So they first convert their arguments, which may call
+ * to_int and to_str, then check the connection, which that Ruby code may
+ * have closed, then allocate (the header array, and the reader entry), and
+ * only then fill the array and call nghttp3.
+ */
+
 /*
  * call-seq:
  *   connection.submit_request(stream_id, headers, body: nil) -> self
@@ -845,59 +981,57 @@ static const nghttp3_data_reader data_reader = {.read_data =
  */
 static VALUE rb_nghttp3_connection_submit_request(int argc, VALUE *argv,
                                                   VALUE self) {
-  VALUE rb_stream_id, rb_headers, rb_opts, rb_body;
+  VALUE rb_stream_id, rb_headers, rb_opts, reader;
   ConnectionObj *obj;
   int64_t stream_id;
   nghttp3_nv *nva;
-  size_t nvlen, i;
-  int rv;
-  int has_body = 0;
+  VALUE nva_buf;
+  long nvlen, bad;
+  int rv, entered;
 
   rb_scan_args(argc, argv, "2:", &rb_stream_id, &rb_headers, &rb_opts);
 
   TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
-
-  if (obj->conn == NULL || obj->is_closed) {
-    rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
-  }
 
   if (obj->is_server) {
     rb_raise(rb_eNghttp3InvalidStateError,
              "submit_request can only be called on client connections");
   }
 
-  stream_id = NUM2LL(rb_stream_id);
+  stream_id = nghttp3_rb_stream_id(rb_stream_id);
   Check_Type(rb_headers, T_ARRAY);
+  reader = submit_body_reader(rb_opts);
+
+  connection_enter(self, 1);
+  if ((stream_id & 3) != 0) {
+    raise_stream_kind(rb_stream_id, "client-initiated bidirectional");
+  }
+  check_done(obj->qpack_bound, "bind_qpack_streams");
+
+  /* On the heap: a Ruby thread's machine stack is too small for a long
+   * list. */
   nvlen = RARRAY_LEN(rb_headers);
-
-  /* Allocate and convert headers */
-  nva = ALLOCA_N(nghttp3_nv, nvlen);
-  for (i = 0; i < nvlen; i++) {
-    VALUE rb_nv = rb_ary_entry(rb_headers, i);
-    nva[i] = nghttp3_rb_nv_to_c(rb_nv);
+  nva = ALLOCV_N(nghttp3_nv, nva_buf, nvlen);
+  if (!NIL_P(reader)) {
+    rb_hash_aset(obj->stream_data_readers, LL2NUM(stream_id), reader);
   }
 
-  /* Check for body */
-  rb_body = Qnil;
-  if (!NIL_P(rb_opts)) {
-    rb_body = rb_hash_aref(rb_opts, ID2SYM(rb_intern("body")));
+  bad = nghttp3_rb_nva_fill(rb_headers, nva, nvlen);
+  if (bad >= 0) {
+    ALLOCV_END(nva_buf);
+    if (!NIL_P(reader)) {
+      rb_hash_delete(obj->stream_data_readers, LL2NUM(stream_id));
+    }
+    nghttp3_rb_raise_bad_nv(bad);
   }
-
-  if (!NIL_P(rb_body)) {
-    StringValue(rb_body);
-    /* A frozen copy, so that the application cannot change the bytes
-     * nghttp3 will read. */
-    rb_hash_aset(obj->stream_data_readers, LL2NUM(stream_id),
-                 rb_str_new_frozen(rb_body));
-    has_body = 1;
-  } else if (rb_block_given_p()) {
-    VALUE block = rb_block_proc();
-    rb_hash_aset(obj->stream_data_readers, LL2NUM(stream_id), block);
-    has_body = 1;
-  }
-
-  rv = nghttp3_conn_submit_request(obj->conn, stream_id, nva, nvlen,
-                                   has_body ? &data_reader : NULL, NULL);
+  entered = obj->entered;
+  obj->entered = CONN_IN_OTHER;
+  rv = nghttp3_conn_submit_request(obj->conn, stream_id, nva, (size_t)nvlen,
+                                   NIL_P(reader) ? NULL : &data_reader, NULL);
+  obj->entered = entered;
+  connection_check_fatal(obj, rv);
+  ALLOCV_END(nva_buf);
+  RB_GC_GUARD(rb_headers);
   connection_raise_pending(obj);
 
   if (rv != 0) {
@@ -918,21 +1052,17 @@ static VALUE rb_nghttp3_connection_submit_request(int argc, VALUE *argv,
  */
 static VALUE rb_nghttp3_connection_submit_response(int argc, VALUE *argv,
                                                    VALUE self) {
-  VALUE rb_stream_id, rb_headers, rb_opts, rb_body;
+  VALUE rb_stream_id, rb_headers, rb_opts, reader;
   ConnectionObj *obj;
   int64_t stream_id;
   nghttp3_nv *nva;
-  size_t nvlen, i;
-  int rv;
-  int has_body = 0;
+  VALUE nva_buf;
+  long nvlen, bad;
+  int rv, entered;
 
   rb_scan_args(argc, argv, "2:", &rb_stream_id, &rb_headers, &rb_opts);
 
   TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
-
-  if (obj->conn == NULL || obj->is_closed) {
-    rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
-  }
 
   if (!obj->is_server) {
     rb_raise(rb_eNghttp3InvalidStateError,
@@ -941,36 +1071,33 @@ static VALUE rb_nghttp3_connection_submit_response(int argc, VALUE *argv,
 
   stream_id = NUM2LL(rb_stream_id);
   Check_Type(rb_headers, T_ARRAY);
+  reader = submit_body_reader(rb_opts);
+
+  connection_enter(self, 1);
+  check_done(obj->qpack_bound, "bind_qpack_streams");
+
   nvlen = RARRAY_LEN(rb_headers);
-
-  /* Allocate and convert headers */
-  nva = ALLOCA_N(nghttp3_nv, nvlen);
-  for (i = 0; i < nvlen; i++) {
-    VALUE rb_nv = rb_ary_entry(rb_headers, i);
-    nva[i] = nghttp3_rb_nv_to_c(rb_nv);
+  nva = ALLOCV_N(nghttp3_nv, nva_buf, nvlen);
+  if (!NIL_P(reader)) {
+    rb_hash_aset(obj->stream_data_readers, LL2NUM(stream_id), reader);
   }
 
-  /* Check for body */
-  rb_body = Qnil;
-  if (!NIL_P(rb_opts)) {
-    rb_body = rb_hash_aref(rb_opts, ID2SYM(rb_intern("body")));
+  bad = nghttp3_rb_nva_fill(rb_headers, nva, nvlen);
+  if (bad >= 0) {
+    ALLOCV_END(nva_buf);
+    if (!NIL_P(reader)) {
+      rb_hash_delete(obj->stream_data_readers, LL2NUM(stream_id));
+    }
+    nghttp3_rb_raise_bad_nv(bad);
   }
-
-  if (!NIL_P(rb_body)) {
-    StringValue(rb_body);
-    /* A frozen copy, so that the application cannot change the bytes
-     * nghttp3 will read. */
-    rb_hash_aset(obj->stream_data_readers, LL2NUM(stream_id),
-                 rb_str_new_frozen(rb_body));
-    has_body = 1;
-  } else if (rb_block_given_p()) {
-    VALUE block = rb_block_proc();
-    rb_hash_aset(obj->stream_data_readers, LL2NUM(stream_id), block);
-    has_body = 1;
-  }
-
-  rv = nghttp3_conn_submit_response(obj->conn, stream_id, nva, nvlen,
-                                    has_body ? &data_reader : NULL);
+  entered = obj->entered;
+  obj->entered = CONN_IN_OTHER;
+  rv = nghttp3_conn_submit_response(obj->conn, stream_id, nva, (size_t)nvlen,
+                                    NIL_P(reader) ? NULL : &data_reader);
+  obj->entered = entered;
+  connection_check_fatal(obj, rv);
+  ALLOCV_END(nva_buf);
+  RB_GC_GUARD(rb_headers);
   connection_raise_pending(obj);
 
   if (rv != 0) {
@@ -993,26 +1120,35 @@ static VALUE rb_nghttp3_connection_submit_info(VALUE self, VALUE rb_stream_id,
   ConnectionObj *obj;
   int64_t stream_id;
   nghttp3_nv *nva;
-  size_t nvlen, i;
-  int rv;
+  VALUE nva_buf;
+  long nvlen, bad;
+  int rv, entered;
 
   TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
 
-  if (obj->conn == NULL || obj->is_closed) {
-    rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
-  }
+  check_server(obj);
 
   stream_id = NUM2LL(rb_stream_id);
   Check_Type(rb_headers, T_ARRAY);
+
+  connection_enter(self, 1);
+  check_done(obj->qpack_bound, "bind_qpack_streams");
+
   nvlen = RARRAY_LEN(rb_headers);
+  nva = ALLOCV_N(nghttp3_nv, nva_buf, nvlen);
 
-  nva = ALLOCA_N(nghttp3_nv, nvlen);
-  for (i = 0; i < nvlen; i++) {
-    VALUE rb_nv = rb_ary_entry(rb_headers, i);
-    nva[i] = nghttp3_rb_nv_to_c(rb_nv);
+  bad = nghttp3_rb_nva_fill(rb_headers, nva, nvlen);
+  if (bad >= 0) {
+    ALLOCV_END(nva_buf);
+    nghttp3_rb_raise_bad_nv(bad);
   }
-
-  rv = nghttp3_conn_submit_info(obj->conn, stream_id, nva, nvlen);
+  entered = obj->entered;
+  obj->entered = CONN_IN_OTHER;
+  rv = nghttp3_conn_submit_info(obj->conn, stream_id, nva, (size_t)nvlen);
+  obj->entered = entered;
+  connection_check_fatal(obj, rv);
+  ALLOCV_END(nva_buf);
+  RB_GC_GUARD(rb_headers);
   connection_raise_pending(obj);
 
   if (rv != 0) {
@@ -1036,26 +1172,33 @@ static VALUE rb_nghttp3_connection_submit_trailers(VALUE self,
   ConnectionObj *obj;
   int64_t stream_id;
   nghttp3_nv *nva;
-  size_t nvlen, i;
-  int rv;
+  VALUE nva_buf;
+  long nvlen, bad;
+  int rv, entered;
 
   TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
 
-  if (obj->conn == NULL || obj->is_closed) {
-    rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
-  }
-
   stream_id = NUM2LL(rb_stream_id);
   Check_Type(rb_trailers, T_ARRAY);
+
+  connection_enter(self, 1);
+  check_done(obj->qpack_bound, "bind_qpack_streams");
+
   nvlen = RARRAY_LEN(rb_trailers);
+  nva = ALLOCV_N(nghttp3_nv, nva_buf, nvlen);
 
-  nva = ALLOCA_N(nghttp3_nv, nvlen);
-  for (i = 0; i < nvlen; i++) {
-    VALUE rb_nv = rb_ary_entry(rb_trailers, i);
-    nva[i] = nghttp3_rb_nv_to_c(rb_nv);
+  bad = nghttp3_rb_nva_fill(rb_trailers, nva, nvlen);
+  if (bad >= 0) {
+    ALLOCV_END(nva_buf);
+    nghttp3_rb_raise_bad_nv(bad);
   }
-
-  rv = nghttp3_conn_submit_trailers(obj->conn, stream_id, nva, nvlen);
+  entered = obj->entered;
+  obj->entered = CONN_IN_OTHER;
+  rv = nghttp3_conn_submit_trailers(obj->conn, stream_id, nva, (size_t)nvlen);
+  obj->entered = entered;
+  connection_check_fatal(obj, rv);
+  ALLOCV_END(nva_buf);
+  RB_GC_GUARD(rb_trailers);
   connection_raise_pending(obj);
 
   if (rv != 0) {
@@ -1074,21 +1217,24 @@ static VALUE rb_nghttp3_connection_submit_trailers(VALUE self,
  */
 static VALUE rb_nghttp3_connection_submit_shutdown_notice(VALUE self) {
   ConnectionObj *obj;
-  int rv;
+  int rv, entered;
 
-  TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
+  obj = connection_enter(self, 1);
+  check_done(obj->ctrl_bound, "bind_control_stream");
+  check_no_shutdown(obj);
 
-  if (obj->conn == NULL || obj->is_closed) {
-    rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
-  }
-
+  entered = obj->entered;
+  obj->entered = CONN_IN_OTHER;
   rv = nghttp3_conn_submit_shutdown_notice(obj->conn);
+  obj->entered = entered;
+  connection_check_fatal(obj, rv);
   connection_raise_pending(obj);
 
   if (rv != 0) {
     nghttp3_rb_raise(rv, "Failed to submit shutdown notice");
   }
 
+  obj->goaway = 1;
   return self;
 }
 
@@ -1100,21 +1246,24 @@ static VALUE rb_nghttp3_connection_submit_shutdown_notice(VALUE self) {
  */
 static VALUE rb_nghttp3_connection_shutdown(VALUE self) {
   ConnectionObj *obj;
-  int rv;
+  int rv, entered;
 
-  TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
+  obj = connection_enter(self, 1);
+  check_done(obj->ctrl_bound, "bind_control_stream");
+  check_no_shutdown(obj);
 
-  if (obj->conn == NULL || obj->is_closed) {
-    rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
-  }
-
+  entered = obj->entered;
+  obj->entered = CONN_IN_OTHER;
   rv = nghttp3_conn_shutdown(obj->conn);
+  obj->entered = entered;
+  connection_check_fatal(obj, rv);
   connection_raise_pending(obj);
 
   if (rv != 0) {
     nghttp3_rb_raise(rv, "Failed to shutdown connection");
   }
 
+  obj->goaway = 2;
   return self;
 }
 
@@ -1128,15 +1277,17 @@ static VALUE rb_nghttp3_connection_shutdown(VALUE self) {
 static VALUE rb_nghttp3_connection_shutdown_stream_read(VALUE self,
                                                         VALUE rb_stream_id) {
   ConnectionObj *obj;
-  int rv;
+  int64_t stream_id;
+  int rv, entered;
 
-  TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
+  stream_id = nghttp3_rb_stream_id(rb_stream_id);
+  obj = connection_enter(self, 1);
 
-  if (obj->conn == NULL || obj->is_closed) {
-    rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
-  }
-
-  rv = nghttp3_conn_shutdown_stream_read(obj->conn, NUM2LL(rb_stream_id));
+  entered = obj->entered;
+  obj->entered = CONN_IN_OTHER;
+  rv = nghttp3_conn_shutdown_stream_read(obj->conn, stream_id);
+  obj->entered = entered;
+  connection_check_fatal(obj, rv);
   connection_raise_pending(obj);
 
   if (rv != 0) {
@@ -1152,21 +1303,34 @@ static VALUE rb_nghttp3_connection_shutdown_stream_read(VALUE self,
  *
  * Tells a server connection the cumulative number of bidirectional streams
  * the client may open, as QUIC's MAX_STREAMS allows. nghttp3 uses it for
- * graceful shutdown.
+ * graceful shutdown. Like MAX_STREAMS, it never goes down.
  */
 static VALUE
 rb_nghttp3_connection_set_max_client_streams_bidi(VALUE self,
                                                   VALUE rb_max_streams) {
   ConnectionObj *obj;
+  uint64_t max_streams;
+  int entered;
 
   TypedData_Get_Struct(self, ConnectionObj, &connection_data_type, obj);
 
-  if (obj->conn == NULL || obj->is_closed) {
-    rb_raise(rb_eNghttp3InvalidStateError, "Connection is closed");
+  check_server(obj);
+
+  max_streams = NUM2ULL(rb_max_streams);
+  connection_enter(self, 1);
+  if (max_streams < obj->max_client_streams) {
+    rb_raise(rb_eArgError,
+             "max_client_streams_bidi cannot go down (from %" PRIsVALUE
+             " to %" PRIsVALUE ")",
+             ULL2NUM(obj->max_client_streams), rb_max_streams);
   }
 
-  nghttp3_conn_set_max_client_streams_bidi(obj->conn, NUM2ULL(rb_max_streams));
+  entered = obj->entered;
+  obj->entered = CONN_IN_OTHER;
+  nghttp3_conn_set_max_client_streams_bidi(obj->conn, max_streams);
+  obj->entered = entered;
 
+  obj->max_client_streams = max_streams;
   return self;
 }
 

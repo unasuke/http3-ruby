@@ -52,21 +52,39 @@ class TestSessionFailures < Minitest::Test
     assert_equal FAILED, outcome
   end
 
+  # A Session method called from inside a callback of the Session would
+  # call into nghttp3, or delete it, while nghttp3 runs: it is refused.
+  # The refusal is the callback's exception, which fails the connection
+  # and waits in #take_error.
+  def test_session_method_called_from_inside_a_callback
+    prepare = ->(session) { session.define_singleton_method(:on_end_stream) { |_id| shutdown_notice } }
+    outcome = serve_in_child(prepare) do |port|
+      client = H3TestClient::QuicTransport.connect(port, ca_file: credentials.ca_file)
+      client.request(:get, "/")
+      # Hand the request to QUIC; the QUIC connection alone is pumped next.
+      client.pump
+      client.quic
+    end
+    assert_equal "#{FAILED}; take_error returned HTTP3::Nghttp3::InvalidStateError: " \
+      "#shutdown_notice cannot be called from inside a callback of this session", outcome
+  end
+
   private
 
-  # Accept one connection in a child process, attach a Session to it and
-  # pump until the connection fails; then call #shutdown_notice and
-  # #submit_response, and return what they did. The block is the client:
-  # it gets the port and returns a connection, which is pumped until the
-  # child has exited.
-  def serve_in_child
+  # Accept one connection in a child process, attach a Session to it, give
+  # it to prepare, if any, and pump until the connection fails; then call
+  # #shutdown_notice and #submit_response, and return what they did, and
+  # what #take_error returned if not nil. The block is the client: it gets
+  # the port and returns a connection, which is pumped until the child has
+  # exited.
+  def serve_in_child(prepare = nil)
     credentials
     server_sock = UDPSocket.new(Socket::AF_INET)
     server_sock.bind("127.0.0.1", 0)
     reader, writer = IO.pipe
     pid = fork do
       reader.close
-      writer.write(fail_session(server_sock))
+      writer.write(fail_session(server_sock, prepare))
       writer.close
       # Not exit: the parent's at_exit hooks (Minitest's included) must not
       # run here.
@@ -105,12 +123,13 @@ class TestSessionFailures < Minitest::Test
   end
 
   # In the child.
-  def fail_session(sock)
+  def fail_session(sock, prepare)
     conn = QUIC::Connection::Server.accept(
       sock: sock, certificate_path: credentials.certificate_path, private_key_path: credentials.private_key_path,
       settings: QUIC::Settings.default.with(alpn: ["h3"])
     )
     session = HTTP3::Session.attach(conn, max_request_body: 1_024, max_field_section_size: 1_024)
+    prepare&.call(session)
     deadline = now + TIMEOUT
     begin
       conn.pump_once(timeout: 0.01) until now > deadline
@@ -121,10 +140,12 @@ class TestSessionFailures < Minitest::Test
     outcome = "shutdown_notice returned #{session.shutdown_notice.equal?(session) ? "self" : "something else"}"
     begin
       session.submit_response(0, [[":status", "200"]], false)
-      "#{outcome}; submit_response did not raise"
+      outcome += "; submit_response did not raise"
     rescue HTTP3::Nghttp3::InvalidStateError => e
-      "#{outcome}; submit_response raised InvalidStateError: #{e.message}"
+      outcome += "; submit_response raised InvalidStateError: #{e.message}"
     end
+    error = session.take_error
+    error ? "#{outcome}; take_error returned #{error.class}: #{error.message}" : outcome
   rescue Exception => e # rubocop:disable Lint/RescueException
     e.full_message
   end

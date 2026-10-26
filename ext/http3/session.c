@@ -79,6 +79,7 @@ typedef struct {
   quic_ext_conn *qc;
   nghttp3_conn *h3;  /* made on handshake_completed, deleted by h3_fail */
   bool failed;       /* h3_fail has been called: h3 is gone for good */
+  int in_callback;   /* how deep the Ruby part is in h3_protect */
   st_table *streams; /* stream_id => h3_stream * */
   VALUE pending_exc; /* an exception the Ruby part raised in a callback */
   VALUE closed_ids;  /* ids of the streams nghttp3 closed, for #take_closed */
@@ -164,7 +165,9 @@ static void h3_stream_acked(h3_stream *st, uint64_t n) {
 
 static int h3_protect(h3_session *s, VALUE (*body)(VALUE), VALUE arg) {
   int state = 0;
+  s->in_callback++;
   rb_protect(body, arg, &state);
+  s->in_callback--;
   if (state == 0) {
     return 0;
   }
@@ -746,8 +749,24 @@ static h3_session *h3_session_get(VALUE self) {
   return s;
 }
 
-static h3_session *h3_session_get_open(VALUE self) {
+/* The session, for a method that may call into nghttp3 or the QUIC
+ * connection, or fail the connection. The Ruby part's callbacks run inside
+ * nghttp3 or inside the QUIC connection's packet handling, where none of
+ * that may happen, so such a method raises InvalidStateError there. */
+static h3_session *h3_session_enter(VALUE self) {
   h3_session *s = h3_session_get(self);
+  if (s->in_callback > 0) {
+    rb_raise(rb_eNghttp3InvalidStateError,
+             "#%" PRIsVALUE
+             " cannot be called from inside a callback of this session",
+             rb_id2str(rb_frame_this_func()));
+  }
+  return s;
+}
+
+/* h3_session_enter, for a method that needs the nghttp3 connection. */
+static h3_session *h3_session_get_open(VALUE self) {
+  h3_session *s = h3_session_enter(self);
   if (s->failed) {
     rb_raise(rb_eNghttp3InvalidStateError, "the HTTP/3 connection has failed");
   }
@@ -758,12 +777,20 @@ static h3_session *h3_session_get_open(VALUE self) {
   return s;
 }
 
+NORETURN(static void h3_raise_no_body(VALUE rb_id));
+static void h3_raise_no_body(VALUE rb_id) {
+  rb_raise(rb_eNghttp3StreamNotFoundError,
+           "no response body is open on stream %" PRIsVALUE, rb_id);
+}
+
+/* The body of stream rb_id. Ruby code that runs once it is found may make
+ * the connection go on and close the stream, so convert everything else
+ * first. */
 static h3_stream *h3_session_stream(VALUE self, VALUE rb_id) {
   h3_session *s = h3_session_get(self);
   h3_stream *st = h3_stream_find(s, NUM2LL(rb_id));
   if (st == NULL) {
-    rb_raise(rb_eNghttp3StreamNotFoundError,
-             "no response body is open on stream %" PRIsVALUE, rb_id);
+    h3_raise_no_body(rb_id);
   }
   return st;
 }
@@ -835,15 +862,19 @@ static VALUE rb_http3_session_s_attach(VALUE klass, VALUE quic_conn,
  */
 static VALUE rb_http3_session_submit_response(VALUE self, VALUE rb_id,
                                               VALUE headers, VALUE has_body) {
-  h3_session *s = h3_session_get_open(self);
   int64_t id = NUM2LL(rb_id);
   Check_Type(headers, T_ARRAY);
 
-  long nvlen = RARRAY_LEN(headers);
-  VALUE tmp;
-  nghttp3_nv *nva = ALLOCV_N(nghttp3_nv, tmp, nvlen);
+  /* Every field is converted before a pointer into any is taken: to_ary and
+   * to_str may run Ruby code, which could change or drop the Strings taken
+   * so far, or start a GC that moves them. It goes over a copy of headers,
+   * which that code cannot shrink under it, and keeps the Strings in
+   * strings, two per field. */
+  VALUE fields = rb_ary_dup(headers);
+  long nvlen = RARRAY_LEN(fields);
+  VALUE strings = rb_ary_new_capa(nvlen * 2);
   for (long i = 0; i < nvlen; i++) {
-    VALUE pair = rb_check_array_type(RARRAY_AREF(headers, i));
+    VALUE pair = rb_check_array_type(RARRAY_AREF(fields, i));
     if (NIL_P(pair) || RARRAY_LEN(pair) != 2) {
       rb_raise(rb_eArgError, "headers must be [name, value] pairs");
     }
@@ -851,13 +882,16 @@ static VALUE rb_http3_session_submit_response(VALUE self, VALUE rb_id,
     VALUE value = RARRAY_AREF(pair, 1);
     StringValue(name);
     StringValue(value);
-    nva[i] = (nghttp3_nv){.name = (const uint8_t *)RSTRING_PTR(name),
-                          .value = (const uint8_t *)RSTRING_PTR(value),
-                          .namelen = (size_t)RSTRING_LEN(name),
-                          .valuelen = (size_t)RSTRING_LEN(value),
-                          .flags = NGHTTP3_NV_FLAG_NONE};
+    rb_ary_push(strings, name);
+    rb_ary_push(strings, value);
   }
 
+  /* Then the connection, which that code may have failed, and every
+   * allocation; then the pointers, and nghttp3 copies the names and values
+   * before anything else can run. */
+  h3_session *s = h3_session_get_open(self);
+  VALUE tmp;
+  nghttp3_nv *nva = ALLOCV_N(nghttp3_nv, tmp, nvlen);
   h3_stream *st = NULL;
   if (RTEST(has_body) && h3_stream_find(s, id) == NULL) {
     st = ZALLOC(h3_stream);
@@ -865,12 +899,20 @@ static VALUE rb_http3_session_submit_response(VALUE self, VALUE rb_id,
     st->fd = -1;
     st_insert(s->streams, (st_data_t)id, (st_data_t)st);
   }
+  for (long i = 0; i < nvlen; i++) {
+    VALUE name = RARRAY_AREF(strings, 2 * i);
+    VALUE value = RARRAY_AREF(strings, 2 * i + 1);
+    nva[i] = (nghttp3_nv){.name = (const uint8_t *)RSTRING_PTR(name),
+                          .value = (const uint8_t *)RSTRING_PTR(value),
+                          .namelen = (size_t)RSTRING_LEN(name),
+                          .valuelen = (size_t)RSTRING_LEN(value),
+                          .flags = NGHTTP3_NV_FLAG_NONE};
+  }
 
-  /* nghttp3 copies the header names and values. */
   int rv = nghttp3_conn_submit_response(
       s->h3, id, nva, (size_t)nvlen, RTEST(has_body) ? &h3_data_reader : NULL);
   ALLOCV_END(tmp);
-  RB_GC_GUARD(headers);
+  RB_GC_GUARD(strings);
   if (rv != 0) {
     if (st != NULL) {
       st_data_t key = (st_data_t)id;
@@ -910,8 +952,8 @@ static int64_t h3_request_stream_id(VALUE rb_id) {
  * then ask the client to stop sending it, with H3_NO_ERROR.
  */
 static VALUE rb_http3_session_stop_reading(VALUE self, VALUE rb_id) {
-  h3_session *s = h3_session_get_open(self);
   int64_t id = h3_request_stream_id(rb_id);
+  h3_session *s = h3_session_get_open(self);
   int rv = nghttp3_conn_shutdown_stream_read(s->h3, id);
   if (rv != 0) {
     h3_raise(s, rv, "Failed to stop reading the stream");
@@ -934,16 +976,16 @@ static VALUE rb_http3_session_stop_reading(VALUE self, VALUE rb_id) {
  * Queue a frozen copy of str as the next piece of the response body.
  */
 static VALUE rb_http3_session_push_chunk(VALUE self, VALUE rb_id, VALUE str) {
-  h3_session *s = h3_session_get(self);
-  h3_stream *st = h3_session_stream(self, rb_id);
+  h3_session *s = h3_session_enter(self);
   StringValue(str);
+  VALUE copy = rb_str_new_frozen(str);
+  h3_stream *st = h3_session_stream(self, rb_id);
   if (st->eof) {
     rb_raise(rb_eNghttp3InvalidStateError, "the body has ended");
   }
-  if (RSTRING_LEN(str) == 0) {
+  if (RSTRING_LEN(copy) == 0) {
     return self;
   }
-  VALUE copy = rb_str_new_frozen(str);
   if (h3_stream_push(st, (const uint8_t *)RSTRING_PTR(copy),
                      (size_t)RSTRING_LEN(copy), copy) != 0) {
     rb_raise(rb_eNoMemError, "failed to queue a body chunk");
@@ -960,7 +1002,7 @@ static VALUE rb_http3_session_push_chunk(VALUE self, VALUE rb_id, VALUE str) {
  * Mark the end of the response body.
  */
 static VALUE rb_http3_session_push_eof(VALUE self, VALUE rb_id) {
-  h3_session *s = h3_session_get(self);
+  h3_session *s = h3_session_enter(self);
   h3_stream *st = h3_session_stream(self, rb_id);
   st->eof = true;
   h3_stream_wake(s, st);
@@ -979,11 +1021,9 @@ static VALUE rb_http3_session_push_eof(VALUE self, VALUE rb_id) {
  */
 static VALUE rb_http3_session_attach_file(VALUE self, VALUE rb_id, VALUE io,
                                           VALUE offset, VALUE length) {
-  h3_session *s = h3_session_get(self);
-  h3_stream *st = h3_session_stream(self, rb_id);
-  if (st->fd >= 0 || st->eof || st->nchunks > 0) {
-    rb_raise(rb_eNghttp3InvalidStateError, "the body is already given");
-  }
+  h3_session *s = h3_session_enter(self);
+  /* The arguments first, as #push_chunk does: io.fileno is Ruby code. */
+  int64_t id = NUM2LL(rb_id);
   off_t off = NUM2OFFT(offset);
   off_t len = NUM2OFFT(length);
   if (off < 0 || len < 0) {
@@ -994,6 +1034,15 @@ static VALUE rb_http3_session_attach_file(VALUE self, VALUE rb_id, VALUE io,
     rb_sys_fail("dup");
   }
   rb_update_max_fd(fd);
+  h3_stream *st = h3_stream_find(s, id);
+  if (st == NULL) {
+    close(fd);
+    h3_raise_no_body(rb_id);
+  }
+  if (st->fd >= 0 || st->eof || st->nchunks > 0) {
+    close(fd);
+    rb_raise(rb_eNghttp3InvalidStateError, "the body is already given");
+  }
   st->fd = fd;
   st->file_off = off;
   st->file_end = off + len;
@@ -1051,7 +1100,7 @@ static VALUE rb_http3_session_take_error(VALUE self) {
  * served.
  */
 static VALUE rb_http3_session_shutdown_notice(VALUE self) {
-  h3_session *s = h3_session_get(self);
+  h3_session *s = h3_session_enter(self);
   if (s->h3 == NULL) {
     return self;
   }
@@ -1071,7 +1120,7 @@ static VALUE rb_http3_session_shutdown_notice(VALUE self) {
  */
 static VALUE rb_http3_session_abort_stream(VALUE self, VALUE rb_id,
                                            VALUE rb_code) {
-  h3_session *s = h3_session_get(self);
+  h3_session *s = h3_session_enter(self);
   int64_t id = NUM2LL(rb_id);
   uint64_t code = NUM2ULL(rb_code);
   if (s->h3 != NULL) {
