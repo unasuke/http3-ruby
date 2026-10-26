@@ -18,7 +18,9 @@ class TestServerLimits < Minitest::Test
     send_buffer_size: 4_096,
     # One connection's streams can take all of the total.
     max_connection_send_buffer: 8_192,
-    max_total_send_buffer: 8_192
+    max_total_send_buffer: 8_192,
+    # Long enough for the requests the other tests hold open.
+    request_timeout: 2
   }.freeze
 
   # /big is far more than the client's window lets the server send unread.
@@ -100,6 +102,23 @@ class TestServerLimits < Minitest::Test
     assert_equal "small", second.response(id).body
   end
 
+  # The server's request_timeout reaches the Sessions: a request held open
+  # past it gets 408.
+  def test_request_held_past_request_timeout_gets_408
+    client = connect
+    id = client.request(:post, "/", body: "x" * 1_000, fin: false)
+    client.pump_until(timeout: 10) { client.response(id).finished? }
+    assert_equal 408, client.response(id).status
+  end
+
+  def test_request_timeout_is_checked
+    [0, -1, "30"].each do |value|
+      error = assert_raises(ArgumentError, value.inspect) { new_server(request_timeout: value) }
+      assert_equal "request_timeout must be nil or a positive number of seconds (got #{value.inspect})", error.message
+    end
+    [nil, 0.5].each { |value| new_server(request_timeout: value) }
+  end
+
   def test_send_limits_are_checked
     {
       {send_buffer_size: 0} => "send_buffer_size must be a positive Integer (got 0)",
@@ -145,6 +164,13 @@ class TestServerLimits < Minitest::Test
 
   def connect
     H3TestClient::QuicTransport.connect(@port, ca_file: credentials.ca_file).tap { |client| @clients << client }
+  end
+
+  def new_server(**options)
+    HTTP3::Server.new(
+      app: ->(_env) {}, bind: "127.0.0.1:0",
+      certificate_path: credentials.certificate_path, private_key_path: credentials.private_key_path, **options
+    )
   end
 
   def post(client, body)
