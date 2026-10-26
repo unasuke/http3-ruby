@@ -20,6 +20,62 @@ class TestRackAdapter < Minitest::Test
     assert_equal "198.51.100.7", env["REMOTE_ADDR"]
   end
 
+  # A request the Rack env cannot carry is answered with 400, and the
+  # application is not called.
+  def test_schemes_other_than_http_and_https_get_400
+    [[[":scheme", "file"], [":path", "etc/passwd"]], [[":scheme", "ftp"], [":path", "/"]]].each do |headers|
+      response, env = exchange([*headers, [":authority", "localhost"]])
+      assert_equal 400, response.status, headers.inspect
+      assert_empty response.headers
+      assert_nil response.body
+      assert_nil env
+    end
+  end
+
+  def test_scheme_is_lowercased
+    env = env_for([[":scheme", "HTTPS"], [":path", "/"], [":authority", "localhost"]])
+    assert_equal "https", env["rack.url_scheme"]
+  end
+
+  # Rack forbids a fragment, which nghttp3 lets through.
+  def test_path_with_a_fragment_gets_400
+    response, env = exchange([[":path", "/a#b"], [":authority", "localhost"]])
+    assert_equal 400, response.status
+    assert_nil env
+  end
+
+  def test_malformed_authority_gets_400
+    ["example.com:abc", "a:b:c", "[2001:db8::1", "2001:db8::1]"].each do |authority|
+      response, env = exchange([[":path", "/"], [":authority", authority]])
+      assert_equal 400, response.status, authority
+      assert_nil env
+    end
+    response, env = exchange([[":path", "/"], ["host", "example.com:abc"]])
+    assert_equal 400, response.status
+    assert_nil env
+  end
+
+  # The port is checked for digits only, as Rack Lint does; an empty one
+  # is the scheme's.
+  def test_authority_ports
+    env = env_for([[":path", "/"], [":authority", "example.com:"]])
+    assert_equal ["example.com", "443"], env.values_at("SERVER_NAME", "SERVER_PORT")
+    env = env_for([[":scheme", "http"], [":path", "/"], [":authority", "example.com"]])
+    assert_equal ["example.com", "80"], env.values_at("SERVER_NAME", "SERVER_PORT")
+    env = env_for([[":path", "/"], [":authority", "[2001:db8::1]:8443"]])
+    assert_equal ["[2001:db8::1]", "8443"], env.values_at("SERVER_NAME", "SERVER_PORT")
+    assert_equal "[2001:db8::1]:8443", env["HTTP_HOST"]
+  end
+
+  # RFC 9114 section 4.3.1: if both are present, they must be the same.
+  def test_authority_and_host_that_differ_get_400
+    response, env = exchange([[":path", "/"], [":authority", "a.example"], ["host", "b.example"]])
+    assert_equal 400, response.status
+    assert_nil env
+    env = env_for([[":path", "/"], [":authority", "a.example"], ["host", "a.example"]])
+    assert_equal "a.example", env["HTTP_HOST"]
+  end
+
   def test_repeated_fields_are_joined_and_cookies_with_semicolons
     env = env_for([["accept", "a"], ["accept", "b"], ["cookie", "x=1"], ["cookie", "y=2"],
       ["content-type", "text/plain"]])
@@ -103,13 +159,27 @@ class TestRackAdapter < Minitest::Test
 
   private
 
+  # A request with headers, and :method and :scheme ("https") unless headers
+  # has them.
   def request(headers, method: "GET")
+    defaults = [[":method", method], [":scheme", "https"]].reject { |name, _| headers.assoc(name) }
     HTTP3::Request.new(
       stream_id: 0,
-      headers: [[":method", method], [":scheme", "https"], *headers.select { |name, _| name.start_with?(":") },
+      headers: [*defaults, *headers.select { |name, _| name.start_with?(":") },
         *headers.reject { |name, _| name.start_with?(":") }],
       body: "".b
     )
+  end
+
+  # The response to a request with headers, and the env the application got,
+  # or nil if it was not called.
+  def exchange(headers)
+    env = nil
+    adapter = HTTP3::RackAdapter.new(lambda do |e|
+      env = e
+      [200, {}, []]
+    end)
+    [adapter.call(request(headers), remote: REMOTE), env]
   end
 
   def env_for(headers)

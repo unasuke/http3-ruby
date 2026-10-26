@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "stringio"
+require "uri"
 
 module HTTP3
   # Calls a Rack 3 application for an HTTP3::Request and turns what it
@@ -9,6 +10,18 @@ module HTTP3
     # The application's response breaks the Rack 3 specification; the
     # server answers 500 instead.
     class InvalidResponse < StandardError; end
+
+    # The request cannot be put in a Rack env; it is answered with 400.
+    class BadRequest < StandardError; end
+    private_constant :BadRequest
+
+    # The schemes a Rack env may carry (Rack also allows ws and wss, which
+    # HTTP/3 has no use for).
+    SCHEMES = %w[http https].freeze
+
+    # An authority, "host" or "host:port" (RFC 3986 section 3.2), as Rack
+    # Lint checks HTTP_HOST: the port is digits, of any number, or none.
+    AUTHORITY = /\A(?<host>#{URI::RFC3986_Parser::HOST})(?::(?<port>\d*))?\z/
 
     # Connection-specific fields, which HTTP/3 forbids (RFC 9114 section
     # 4.2).
@@ -25,16 +38,30 @@ module HTTP3
       @app = app
     end
 
-    # remote is the client's address, an Addrinfo. Raises whatever the
-    # application raises, and InvalidResponse for a response that cannot be
-    # sent; the Rack body is closed in both cases.
+    # remote is the client's address, an Addrinfo. A request the Rack env
+    # cannot carry is answered with 400, without calling the application.
+    # Raises whatever the application raises, and InvalidResponse for a
+    # response that cannot be sent; the Rack body is closed in both cases.
     def call(request, remote:)
-      status, headers, body = @app.call(env_for(request, remote))
+      env = env_for(request, remote)
+    rescue BadRequest
+      # Not logged: the client sent it, the server did not fail.
+      Response.new(status: 400, headers: [], body: nil)
+    else
+      status, headers, body = @app.call(env)
       response_for(request, status, headers, body)
     end
 
     private
 
+    # Raises BadRequest for what Rack does not allow, or allows in a form
+    # the application might read differently from the client, in this
+    # order: a scheme other than http and https, a fragment in the path, an
+    # authority that is not one (RFC 3986 section 3.2), and an :authority
+    # and a host field that disagree (RFC 9114 section 4.3.1). nghttp3 has
+    # already refused a request without :scheme, :path, or both :authority
+    # and host (but CONNECT); the defaults are for calling the adapter
+    # directly.
     def env_for(request, remote)
       pseudo = {}
       fields = {}
@@ -46,18 +73,33 @@ module HTTP3
         end
       end
 
-      path, query = pseudo.fetch(":path", "/").split("?", 2)
-      scheme = pseudo.fetch(":scheme", "https")
-      authority = pseudo[":authority"] || fields["host"]&.first || "localhost"
-      server_name, server_port = split_authority(authority, scheme)
+      # nghttp3 takes either case of http and https; Rack wants them in
+      # lowercase.
+      scheme = pseudo.fetch(":scheme", "https").downcase
+      raise BadRequest, "scheme #{scheme} is not http or https" unless SCHEMES.include?(scheme)
+
+      # nghttp3 lets a fragment through; Rack forbids one.
+      target = pseudo.fetch(":path", "/")
+      raise BadRequest, "the path has a fragment" if target.include?("#")
+
+      path, query = target.split("?", 2)
+      host = fields["host"]&.first
+      authority = pseudo[":authority"] || host || "localhost"
+      match = AUTHORITY.match(authority) or raise BadRequest, "the authority is malformed"
+      if pseudo[":authority"] && host && host != pseudo[":authority"]
+        raise BadRequest, ":authority and host differ"
+      end
+
+      port = match[:port]
+      port = (scheme == "http") ? "80" : "443" if port.nil? || port.empty?
 
       env = {
         "REQUEST_METHOD" => pseudo.fetch(":method", "GET"),
         "SCRIPT_NAME" => "",
         "PATH_INFO" => path,
         "QUERY_STRING" => query || "",
-        "SERVER_NAME" => server_name,
-        "SERVER_PORT" => server_port,
+        "SERVER_NAME" => match[:host],
+        "SERVER_PORT" => port,
         "SERVER_PROTOCOL" => "HTTP/3",
         "REMOTE_ADDR" => remote.ip_address,
         "HTTP_HOST" => authority,
@@ -85,18 +127,6 @@ module HTTP3
       when "content-type" then "CONTENT_TYPE"
       when "content-length" then "CONTENT_LENGTH"
       else "HTTP_#{name.upcase.tr("-", "_")}"
-      end
-    end
-
-    # "host", "host:port", "[v6]" or "[v6]:port"; the port defaults to the
-    # scheme's.
-    def split_authority(authority, scheme)
-      default_port = (scheme == "http") ? "80" : "443"
-      if (match = authority.match(/\A(\[[^\]]*\])(?::(\d+))?\z/))
-        [match[1], match[2] || default_port]
-      else
-        host, port = authority.split(":", 2)
-        [host, port || default_port]
       end
     end
 
