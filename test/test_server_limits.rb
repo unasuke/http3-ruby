@@ -23,15 +23,22 @@ class TestServerLimits < Minitest::Test
     request_timeout: 2
   }.freeze
 
+  # The options of the tests that need more than LIMITS.
+  OPTIONS = {
+    "test_refusals_are_logged_once_refusal_log_interval_has_passed" => {refusal_log_interval: 1}
+  }.freeze
+
   # /big is far more than the client's window lets the server send unread.
   BIG = 2 * 1_024 * 1_024
 
   def setup
     @dir = Dir.mktmpdir("http3-limits-")
+    @log_path = File.join(@dir, "server.log")
     @clients = []
     @pid, @port = start_server(
-      log_path: File.join(@dir, "server.log"),
-      certificate_path: credentials.certificate_path, private_key_path: credentials.private_key_path, **LIMITS
+      log_path: @log_path,
+      certificate_path: credentials.certificate_path, private_key_path: credentials.private_key_path,
+      **LIMITS, **OPTIONS.fetch(name, {})
     ) do
       lambda do |env|
         case env["PATH_INFO"]
@@ -119,6 +126,48 @@ class TestServerLimits < Minitest::Test
     [nil, 0.5].each { |value| new_server(request_timeout: value) }
   end
 
+  # The 503s within refusal_log_interval (1 second here) of the first make
+  # one line, logged once it has passed.
+  def test_refusals_are_logged_once_refusal_log_interval_has_passed
+    held = hold_request
+    second = connect
+    ids = Array.new(2) { second.request(:post, "/", body: "y" * 4_000, fin: false) }
+    second.pump_until { ids.all? { |id| second.response(id).finished? } }
+    assert_equal [503, 503], ids.map { |id| second.response(id).status }
+    assert_empty refusal_lines
+    finish_held(*held)
+
+    eventually(timeout: 5) { refusal_lines.empty? && raise("not logged yet") }
+    assert_equal ["requests_refused status=503 count=2 seconds=1"], refusal_lines
+  end
+
+  # What has been counted is logged when the server stops, before
+  # refusal_log_interval (60 seconds by default) has passed.
+  def test_refusals_are_logged_when_the_server_stops
+    held = hold_request
+    second = connect
+    assert_equal 503, post(second, "y" * 4_000).status
+    finish_held(*held)
+
+    # Closed, or the drain would wait for the client to acknowledge the
+    # responses, and it pumps no more.
+    @clients.each(&:close)
+    status = stop_server(@pid)
+    @pid = nil
+    assert_predicate status, :success?
+    lines = refusal_lines
+    assert_equal 1, lines.size, lines.inspect
+    assert_match(/\Arequests_refused status=503 count=1 seconds=\d+\z/, lines.first)
+  end
+
+  def test_refusal_log_interval_is_checked
+    [0, -1, "60", nil].each do |value|
+      error = assert_raises(ArgumentError, value.inspect) { new_server(refusal_log_interval: value) }
+      assert_equal "refusal_log_interval must be a positive number of seconds (got #{value.inspect})", error.message
+    end
+    [1, 0.5].each { |value| new_server(refusal_log_interval: value) }
+  end
+
   def test_send_limits_are_checked
     {
       {send_buffer_size: 0} => "send_buffer_size must be a positive Integer (got 0)",
@@ -177,6 +226,27 @@ class TestServerLimits < Minitest::Test
     id = client.request(:post, "/", body: body)
     client.pump_until { client.response(id).finished? }
     client.response(id)
+  end
+
+  # A request held open on a new connection, with too much for another
+  # one to fit in the total buffer; returns [client, id].
+  def hold_request
+    client = connect
+    id = client.request(:post, "/", body: "x" * 4_000, fin: false)
+    pump_for(client, 0.2)
+    [client, id]
+  end
+
+  # Finish a request hold_request held, before it runs out of time.
+  def finish_held(client, id)
+    client.finish(id)
+    client.pump_until { client.response(id).finished? }
+    assert_equal 200, client.response(id).status
+  end
+
+  # The requests_refused lines of the server's log so far.
+  def refusal_lines
+    File.read(@log_path).scan(/requests_refused[^\n]*/)
   end
 
   # Pump for a while, so that the server gets what the client sent.

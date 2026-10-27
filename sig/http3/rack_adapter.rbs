@@ -25,5 +25,9 @@ module HTTP3
     # raises InvalidResponse from next once it passes content-length or ends
     # short of it.
     def call: (Request request, remote: Addrinfo) -> Response
+
+    # The 400s and 501s #call answered since the last call, as
+    # {status => count}; the count starts over.
+    def take_refusals: () -> Hash[Integer, Integer]
   end
 end

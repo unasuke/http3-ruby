@@ -64,6 +64,7 @@ Other options, with their defaults:
 | `max_connection_send_buffer:` | `1_048_576` | Bytes of array and `each` response bodies a connection may have queued but unsent; more waits |
 | `max_total_send_buffer:` | `67_108_864` | The same over all connections |
 | `request_timeout:` | `30` | Seconds a request may take to come in full, counted from its headers; later gets 408. `nil` for no limit |
+| `refusal_log_interval:` | `60` | Seconds between the `requests_refused` log lines, which count the requests answered without the application (400, 408, 413, 431, 501, 503) |
 | `shutdown_timeout:` | `30` | Seconds a graceful stop waits for the requests under way |
 | `qlog_dir:` | `nil` | Directory for one qlog file per connection |
 | `transport_params:` | `QUIC::TransportParams.default` | QUIC transport parameters |

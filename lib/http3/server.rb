@@ -19,7 +19,11 @@ module HTTP3
   #
   # Only failures are logged, one line each: the event, then key=value
   # pairs. Requests are not logged; use Rack::CommonLogger for that. Query
-  # strings and header values never appear in the log.
+  # strings and header values never appear in the log. Those answered
+  # without the application (400, 408, 413, 431, 501, 503) are counted
+  # instead: refusal_log_interval seconds after the first of them, and when
+  # #run ends, a warn line per status tells how many there were since,
+  # such as "requests_refused status=503 count=1234 seconds=60".
   class Server
     ALPN = ["h3"].freeze
 
@@ -53,16 +57,18 @@ module HTTP3
     # connection, and max_total_send_buffer those of every connection; a
     # body waits for room. Each has to be at least the one before. A request
     # not received in full within request_timeout seconds of the start of
-    # its headers gets 408; nil is no limit.
+    # its headers gets 408; nil is no limit. refusal_log_interval is the
+    # seconds between the requests_refused lines (see above).
     def initialize(app:, bind:, certificate_path:, private_key_path:, transport_params: nil, settings: nil,
       qlog_dir: nil, max_connections: 1024, max_request_body: 1_048_576, max_field_section_size: 65_536,
       max_connection_request_buffer: 4_194_304, max_total_request_buffer: 67_108_864,
       send_buffer_size: 65_536, max_connection_send_buffer: 1_048_576, max_total_send_buffer: 67_108_864,
-      request_timeout: 30, shutdown_timeout: 30, logger: Logger.new($stderr))
+      request_timeout: 30, refusal_log_interval: 60, shutdown_timeout: 30, logger: Logger.new($stderr))
       check_request_limits(max_request_body, max_field_section_size, max_connection_request_buffer,
         max_total_request_buffer)
       check_send_limits(send_buffer_size, max_connection_send_buffer, max_total_send_buffer)
       check_request_timeout(request_timeout)
+      check_refusal_log_interval(refusal_log_interval)
       @adapter = RackAdapter.new(app)
       @bind_address = parse_bind(bind)
       @certificate_path = certificate_path
@@ -82,6 +88,7 @@ module HTTP3
       @max_connection_send_buffer = max_connection_send_buffer
       @max_total_send_buffer = max_total_send_buffer
       @request_timeout = request_timeout
+      @refusal_log_interval = refusal_log_interval
       @shutdown_timeout = shutdown_timeout
       @logger = logger
     end
@@ -102,10 +109,15 @@ module HTTP3
       @blocked_send = nil
       @phase = :serving
       @drain_deadline = nil
+      # {status => count} of the requests answered without the
+      # application, since @refusals_since.
+      @refusals = Hash.new(0)
+      @refusals_since = nil
       old_traps = install_traps(sig_w)
 
       turn(sig_r) until finished?
       close_connections
+      log_refusals
       nil
     ensure
       restore_traps(old_traps) if old_traps
@@ -128,6 +140,7 @@ module HTTP3
       receive if readable&.include?(@sock)
       expire_requests
       serve_requests
+      log_refusals if refusals_due?
       fill_bodies(room)
       @endpoint.handle_expiry if due?(@endpoint.expiry)
       flush
@@ -142,9 +155,9 @@ module HTTP3
       end
     end
 
-    # Until the next timer, the next request to run out of time or the end
-    # of the drain, but no wait at all while a body could take more within
-    # the send buffers.
+    # Until the next timer, the next request to run out of time, the next
+    # requests_refused lines or the end of the drain, but no wait at all
+    # while a body could take more within the send buffers.
     def select_timeout(room)
       wants_fill = @sessions.each_value.any? { |session|
         session.wants_fill?(@send_buffer_size, connection_limit: @max_connection_send_buffer, room: room)
@@ -156,6 +169,7 @@ module HTTP3
       timeouts << [(expiry - now_ns) / 1e9, 0.0].max if expiry
       deadline = @sessions.each_value.filter_map(&:next_request_deadline).min
       timeouts << [deadline - now, 0.0].max if deadline
+      timeouts << [refusal_log_at - now, 0.0].max if refusal_log_at
       timeouts << [@drain_deadline - now, 0.0].max if @drain_deadline
       timeouts.min
     end
@@ -207,6 +221,7 @@ module HTTP3
     def serve_requests
       @sessions.each do |conn, session|
         session.take_requests.each do |request, status|
+          count_refusal(status) if status
           response = status ? Response.new(status: status, headers: [], body: nil) : call_app(conn, request)
           begin
             session.respond(request, response) { |error| log_body_error(conn, request, error) }
@@ -216,6 +231,7 @@ module HTTP3
           end
         end
       end
+      @adapter.take_refusals.each { |status, count| count_refusal(status, count) }
     end
 
     def call_app(conn, request)
@@ -223,6 +239,35 @@ module HTTP3
     rescue => e
       log_app_error(conn, request, e)
       Response.new(status: 500, headers: [], body: nil)
+    end
+
+    def count_refusal(status, count = 1)
+      @refusals_since ||= now
+      @refusals[status] += count
+    end
+
+    # When the refusals counted are due to be logged; nil while there are
+    # none.
+    def refusal_log_at
+      @refusals_since && @refusals_since + @refusal_log_interval
+    end
+
+    def refusals_due?
+      at = refusal_log_at
+      !at.nil? && at <= now
+    end
+
+    # One line per status, in ascending order, with the seconds since the
+    # first of them; the count starts over.
+    def log_refusals
+      return if @refusals_since.nil?
+
+      seconds = (now - @refusals_since).round
+      @refusals.sort.each do |status, count|
+        log(:warn, "requests_refused", status: status, count: count, seconds: seconds)
+      end
+      @refusals.clear
+      @refusals_since = nil
     end
 
     # The connections are filled in the order they came, so that while the
@@ -394,6 +439,13 @@ module HTTP3
       return if (request_timeout.is_a?(Integer) || request_timeout.is_a?(Float)) && request_timeout.positive?
 
       raise ArgumentError, "request_timeout must be nil or a positive number of seconds (got #{request_timeout.inspect})"
+    end
+
+    def check_refusal_log_interval(refusal_log_interval)
+      return if (refusal_log_interval.is_a?(Integer) || refusal_log_interval.is_a?(Float)) && refusal_log_interval.positive?
+
+      raise ArgumentError,
+        "refusal_log_interval must be a positive number of seconds (got #{refusal_log_interval.inspect})"
     end
 
     def parse_bind(bind)
