@@ -1,7 +1,7 @@
 PATH
   remote: .
   specs:
-    http3 (0.0.3)
+    http3 (0.0.4)
       logger
       mini_portile2 (~> 2.8)
       quic (~> 0.0.5)
