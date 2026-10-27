@@ -63,7 +63,7 @@ at once.
 
 ```sh
 bundle exec ruby test/interop/hold_requests.rb [--connections 20] [--streams 100] \
-  [--bytes 1_000_000] [--timeout 120]
+  [--bytes 1_000_000] [--timeout 120] [--request-timeout SECONDS]
 ```
 
 It prints the server's resident set size before and after, and how the
@@ -72,6 +72,13 @@ It exits non-zero unless some request got 503, the server is still running,
 and a GET on a new connection gets 200 afterwards, or when it takes more than
 `--timeout` seconds. The resident set size should grow by about 64 MiB, not by
 the 2 GB sent; it varies from run to run, so the script checks no threshold.
+
+`--request-timeout` is passed on to `server.rb` as the server's
+`request_timeout` (30 seconds by default, longer than the script waits). With
+it, the script also waits for the requests held open to run out of time and
+exits non-zero unless every one of them gets 408. With `--request-timeout 5`,
+134 got 408: the 67 held at first, then 67 more whose bodies were still on
+their way when the first ones let go of the buffer.
 
 ## Responses not read
 

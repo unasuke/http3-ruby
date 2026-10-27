@@ -10,8 +10,9 @@ module HTTP3
   # requests, answers them, keeps the bodies flowing and lets go of what
   # the streams no longer need.
   class Session
-    # A request still coming in.
-    Incoming = Struct.new(:pseudo, :fields, :body)
+    # A request still coming in; started is when its headers began
+    # (CLOCK_MONOTONIC).
+    Incoming = Struct.new(:pseudo, :fields, :body, :started)
 
     # A response whose body is being sent.
     Outgoing = Struct.new(:request, :body, :done)
@@ -59,10 +60,15 @@ module HTTP3
     # for 431 and bodies by their bytes, and those of every Session given
     # the same shared_buffer (Session.shared_buffer) its limit; a request
     # that would pass either is answered with 503.
+    #
+    # A request not received in full within request_timeout seconds of the
+    # start of its headers is answered with 408 (#expire_requests); nil is
+    # no limit.
     def self.attach(quic_conn, max_request_body:, max_field_section_size:,
-      max_connection_request_buffer: 4_194_304, shared_buffer: nil)
+      max_connection_request_buffer: 4_194_304, shared_buffer: nil, request_timeout: nil)
       session = _attach(quic_conn, max_field_section_size)
-      session.send(:setup, max_request_body, Budget.new(max_connection_request_buffer, parent: shared_buffer))
+      session.send(:setup, max_request_body, Budget.new(max_connection_request_buffer, parent: shared_buffer),
+        request_timeout)
       session
     end
 
@@ -83,6 +89,27 @@ module HTTP3
       @done = []
       done.each { |request, _| release_held(request.stream_id) }
       done
+    end
+
+    # Refuse with 408 the requests still coming in whose request_timeout
+    # has passed at now (CLOCK_MONOTONIC); #take_requests hands them out.
+    def expire_requests(now)
+      return if @request_timeout.nil?
+
+      @incoming.each do |id, request|
+        next if @rejected[id] || request.started + @request_timeout > now
+
+        reject(id, request, 408)
+      end
+    end
+
+    # When the next request still coming in runs out of time
+    # (CLOCK_MONOTONIC), or nil.
+    def next_request_deadline
+      return nil if @request_timeout.nil?
+
+      started = @incoming.filter_map { |id, request| request.started unless @rejected[id] }.min
+      started && started + @request_timeout
     end
 
     # Send response to request. Its body, if any, is kept until the stream
@@ -185,7 +212,7 @@ module HTTP3
 
     def on_begin_headers(id)
       @open[id] = true
-      @incoming[id] = Incoming.new([], [], "".b)
+      @incoming[id] = Incoming.new([], [], "".b, Process.clock_gettime(Process::CLOCK_MONOTONIC))
     end
 
     def on_header(id, name, value)
@@ -241,9 +268,10 @@ module HTTP3
 
     private
 
-    def setup(max_request_body, budget)
+    def setup(max_request_body, budget, request_timeout)
       @max_request_body = max_request_body
       @budget = budget
+      @request_timeout = request_timeout
       @held = {}
       @incoming = {}
       @done = []

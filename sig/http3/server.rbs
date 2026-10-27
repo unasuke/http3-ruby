@@ -27,6 +27,7 @@ module HTTP3
       ?send_buffer_size: Integer,
       ?max_connection_send_buffer: Integer,
       ?max_total_send_buffer: Integer,
+      ?request_timeout: (Integer | Float)?,
       ?shutdown_timeout: Numeric,
       ?logger: Logger
     ) -> void

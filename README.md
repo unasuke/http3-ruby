@@ -63,6 +63,7 @@ Other options, with their defaults:
 | `send_buffer_size:` | `65_536` | Bytes of a response body queued but unsent per stream |
 | `max_connection_send_buffer:` | `1_048_576` | Bytes of array and `each` response bodies a connection may have queued but unsent; more waits |
 | `max_total_send_buffer:` | `67_108_864` | The same over all connections |
+| `request_timeout:` | `30` | Seconds a request may take to come in full, counted from its headers; later gets 408. `nil` for no limit |
 | `shutdown_timeout:` | `30` | Seconds a graceful stop waits for the requests under way |
 | `qlog_dir:` | `nil` | Directory for one qlog file per connection |
 | `transport_params:` | `QUIC::TransportParams.default` | QUIC transport parameters |

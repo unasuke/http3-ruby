@@ -13,9 +13,12 @@ module HTTP3
     # body get 413, over max_field_section_size bytes of headers 431, as
     # soon as they pass the limit; the rest of them is not read. Requests
     # not yet taken may hold max_connection_request_buffer bytes, and those
-    # of every Session sharing shared_buffer its limit; more gets 503.
+    # of every Session sharing shared_buffer its limit; more gets 503. One
+    # not in full within request_timeout seconds of its headers gets 408
+    # (#expire_requests); nil is no limit.
     def self.attach: (QUIC::Connection::Server quic_conn, max_request_body: Integer, max_field_section_size: Integer,
-                      ?max_connection_request_buffer: Integer, ?shared_buffer: shared_buffer?) -> Session
+                      ?max_connection_request_buffer: Integer, ?shared_buffer: shared_buffer?,
+                      ?request_timeout: (Integer | Float)?) -> Session
 
     # A limit of limit bytes for the requests of every Session given it.
     def self.shared_buffer: (Integer limit) -> shared_buffer
@@ -23,10 +26,17 @@ module HTTP3
     def self._attach: (QUIC::Connection::Server quic_conn, Integer max_field_section_size) -> Session
 
     # Finished requests, each with the status to answer it with directly
-    # (413, 431) or nil for the application to answer it. One answered
-    # directly comes out as soon as it is refused, with neither headers nor
-    # body.
+    # (408, 413, 431, 503) or nil for the application to answer it. One
+    # answered directly comes out as soon as it is refused, with neither
+    # headers nor body.
     def take_requests: () -> Array[[Request, Integer?]]
+
+    # Refuse with 408 the requests still coming in whose request_timeout
+    # has passed at now (CLOCK_MONOTONIC).
+    def expire_requests: (Float now) -> void
+
+    # When the next request still coming in runs out of time, or nil.
+    def next_request_deadline: () -> Float?
 
     # Send response. Yields the exception of a file body whose descriptor
     # could not be duplicated; its stream is aborted. Raises

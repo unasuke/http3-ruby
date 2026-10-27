@@ -51,15 +51,18 @@ module HTTP3
     # bounds the bytes of a response body queued but unsent per stream,
     # max_connection_send_buffer those of the array and each bodies of a
     # connection, and max_total_send_buffer those of every connection; a
-    # body waits for room. Each has to be at least the one before.
+    # body waits for room. Each has to be at least the one before. A request
+    # not received in full within request_timeout seconds of the start of
+    # its headers gets 408; nil is no limit.
     def initialize(app:, bind:, certificate_path:, private_key_path:, transport_params: nil, settings: nil,
       qlog_dir: nil, max_connections: 1024, max_request_body: 1_048_576, max_field_section_size: 65_536,
       max_connection_request_buffer: 4_194_304, max_total_request_buffer: 67_108_864,
       send_buffer_size: 65_536, max_connection_send_buffer: 1_048_576, max_total_send_buffer: 67_108_864,
-      shutdown_timeout: 30, logger: Logger.new($stderr))
+      request_timeout: 30, shutdown_timeout: 30, logger: Logger.new($stderr))
       check_request_limits(max_request_body, max_field_section_size, max_connection_request_buffer,
         max_total_request_buffer)
       check_send_limits(send_buffer_size, max_connection_send_buffer, max_total_send_buffer)
+      check_request_timeout(request_timeout)
       @adapter = RackAdapter.new(app)
       @bind_address = parse_bind(bind)
       @certificate_path = certificate_path
@@ -78,6 +81,7 @@ module HTTP3
       @send_buffer_size = send_buffer_size
       @max_connection_send_buffer = max_connection_send_buffer
       @max_total_send_buffer = max_total_send_buffer
+      @request_timeout = request_timeout
       @shutdown_timeout = shutdown_timeout
       @logger = logger
     end
@@ -122,6 +126,7 @@ module HTTP3
       handle_signals(sig_r) if readable&.include?(sig_r)
       flush if writable&.include?(@sock)
       receive if readable&.include?(@sock)
+      expire_requests
       serve_requests
       fill_bodies(room)
       @endpoint.handle_expiry if due?(@endpoint.expiry)
@@ -137,8 +142,9 @@ module HTTP3
       end
     end
 
-    # Until the next timer or the end of the drain, but no wait at all while
-    # a body could take more within the send buffers.
+    # Until the next timer, the next request to run out of time or the end
+    # of the drain, but no wait at all while a body could take more within
+    # the send buffers.
     def select_timeout(room)
       wants_fill = @sessions.each_value.any? { |session|
         session.wants_fill?(@send_buffer_size, connection_limit: @max_connection_send_buffer, room: room)
@@ -148,6 +154,8 @@ module HTTP3
       timeouts = []
       expiry = @endpoint.expiry
       timeouts << [(expiry - now_ns) / 1e9, 0.0].max if expiry
+      deadline = @sessions.each_value.filter_map(&:next_request_deadline).min
+      timeouts << [deadline - now, 0.0].max if deadline
       timeouts << [@drain_deadline - now, 0.0].max if @drain_deadline
       timeouts.min
     end
@@ -176,7 +184,8 @@ module HTTP3
     def attach_session(conn, sender)
       @sessions[conn] = Session.attach(
         conn, max_request_body: @max_request_body, max_field_section_size: @max_field_section_size,
-        max_connection_request_buffer: @max_connection_request_buffer, shared_buffer: @request_buffer
+        max_connection_request_buffer: @max_connection_request_buffer, shared_buffer: @request_buffer,
+        request_timeout: @request_timeout
       )
       @remotes[conn] = sender
     rescue => e
@@ -186,6 +195,13 @@ module HTTP3
       rescue QUIC::Error
         nil
       end
+    end
+
+    # Refuse with 408 the requests that ran out of time; serve_requests
+    # answers them.
+    def expire_requests
+      at = now
+      @sessions.each_value { |session| session.expire_requests(at) }
     end
 
     def serve_requests
@@ -371,6 +387,13 @@ module HTTP3
         raise ArgumentError, "max_total_send_buffer (#{max_total_send_buffer}) must be at least " \
           "max_connection_send_buffer (#{max_connection_send_buffer})"
       end
+    end
+
+    def check_request_timeout(request_timeout)
+      return if request_timeout.nil?
+      return if (request_timeout.is_a?(Integer) || request_timeout.is_a?(Float)) && request_timeout.positive?
+
+      raise ArgumentError, "request_timeout must be nil or a positive number of seconds (got #{request_timeout.inspect})"
     end
 
     def parse_bind(bind)

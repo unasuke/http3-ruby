@@ -14,10 +14,18 @@ class TestSessionLimits < Minitest::Test
   # Room for one request at both limits above, not for two.
   MAX_CONNECTION_REQUEST_BUFFER = 5_000
 
+  # The request_timeout of the tests that have one; the others hold
+  # requests open for as long as they need.
+  REQUEST_TIMEOUTS = {
+    "test_408_once_the_request_has_taken_too_long" => 0.2,
+    "test_request_ending_in_time_is_answered" => 2
+  }.freeze
+
   def setup
     # Generated here, before the server thread could race the main thread
     # to it.
     credentials
+    @request_timeout = REQUEST_TIMEOUTS[name]
     @sock = UDPSocket.new(Socket::AF_INET)
     @sock.bind("127.0.0.1", 0)
     @stop = false
@@ -128,6 +136,41 @@ class TestSessionLimits < Minitest::Test
     assert_equal 200, @client.response(id).status
   end
 
+  # A request not received in full within request_timeout of its headers
+  # gets 408, with neither headers nor body, and the server reads no more
+  # of it; the bytes come back, so that a request at the limits gets
+  # through after it.
+  def test_408_once_the_request_has_taken_too_long
+    held = @client.request(:post, "/echo", body: "x" * MAX_REQUEST_BODY, fin: false)
+    @client.pump_until { @client.response(held).finished? }
+    assert_equal 408, @client.response(held).status
+    assert_empty @client.response(held).headers.to_h
+    @client.pump_until { @client.closed?(held) }
+
+    id = @client.request(:post, "/echo", body: "x" * MAX_REQUEST_BODY)
+    @client.pump_until { @client.response(id).finished? }
+    assert_equal 200, @client.response(id).status
+  end
+
+  def test_request_ending_in_time_is_answered
+    id = @client.request(:post, "/echo", body: "x" * MAX_REQUEST_BODY, fin: false)
+    pump_for(0.2)
+    @client.finish(id)
+    @client.pump_until { @client.response(id).finished? }
+    assert_equal 200, @client.response(id).status
+  end
+
+  # Without request_timeout, a request may stay open past where it would
+  # have run out of time.
+  def test_no_limit_without_request_timeout
+    id = @client.request(:post, "/echo", body: "x" * MAX_REQUEST_BODY, fin: false)
+    pump_for(0.5)
+    refute @client.response(id).status
+    @client.finish(id)
+    @client.pump_until { @client.response(id).finished? }
+    assert_equal 200, @client.response(id).status
+  end
+
   private
 
   # Pump for a while, giving the server the chance to answer early.
@@ -153,7 +196,8 @@ class TestSessionLimits < Minitest::Test
     )
     session = HTTP3::Session.attach(
       conn, max_request_body: MAX_REQUEST_BODY, max_field_section_size: MAX_FIELD_SECTION_SIZE,
-      max_connection_request_buffer: MAX_CONNECTION_REQUEST_BUFFER, shared_buffer: HTTP3::Session.shared_buffer(1_000_000)
+      max_connection_request_buffer: MAX_CONNECTION_REQUEST_BUFFER, shared_buffer: HTTP3::Session.shared_buffer(1_000_000),
+      request_timeout: @request_timeout
     )
     aborts = @aborts
     session.define_singleton_method(:abort_stream) do |id, code|
@@ -162,6 +206,7 @@ class TestSessionLimits < Minitest::Test
     end
     until @stop
       conn.pump_once(timeout: 0.002)
+      session.expire_requests(Process.clock_gettime(Process::CLOCK_MONOTONIC))
       session.take_requests.each { |request, status| session.respond(request, response_to(request, status)) }
       session.fill_bodies(65_536)
       session.release_closed
