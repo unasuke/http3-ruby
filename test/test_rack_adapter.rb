@@ -93,6 +93,21 @@ class TestRackAdapter < Minitest::Test
     refute adapter_called
   end
 
+  # The 400s and 501s the adapter answers itself are counted until
+  # take_refusals; a 400 from the application is not.
+  def test_refusals_are_counted_until_taken
+    adapter = HTTP3::RackAdapter.new(->(_env) { [400, {}, []] })
+    connect = HTTP3::Request.new(stream_id: 0, headers: [[":method", "CONNECT"], [":authority", "example.com:443"]],
+      body: "".b)
+    assert_equal 501, adapter.call(connect, remote: REMOTE).status
+    assert_equal 400, adapter.call(request([[":scheme", "ftp"], [":path", "/"], [":authority", "localhost"]]),
+      remote: REMOTE).status
+    assert_equal 400, adapter.call(request([[":path", "/"], [":authority", "localhost"]]), remote: REMOTE).status
+
+    assert_equal({400 => 1, 501 => 1}, adapter.take_refusals)
+    assert_empty adapter.take_refusals
+  end
+
   def test_repeated_fields_are_joined_and_cookies_with_semicolons
     env = env_for([["accept", "a"], ["accept", "b"], ["cookie", "x=1"], ["cookie", "y=2"],
       ["content-type", "text/plain"]])

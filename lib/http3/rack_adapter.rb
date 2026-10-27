@@ -36,30 +36,44 @@ module HTTP3
 
     def initialize(app)
       @app = app
+      @refusals = Hash.new(0)
     end
 
     # remote is the client's address, an Addrinfo. CONNECT is answered with
     # 501, and a request the Rack env cannot carry with 400, without calling
-    # the application. Raises whatever the application raises, and
-    # InvalidResponse for a response that cannot be sent; the Rack body is
-    # closed in both cases.
+    # the application; #take_refusals counts them. Raises whatever the
+    # application raises, and InvalidResponse for a response that cannot be
+    # sent; the Rack body is closed in both cases.
     def call(request, remote:)
       # The server cannot open a tunnel (RFC 9114 section 4.4), and a
       # CONNECT request has neither :scheme nor :path, so the env would be
       # made up. The Session leaves nghttp3's enable_connect_protocol off,
       # so nghttp3 refuses the :protocol of an extended CONNECT (RFC 9220).
-      return Response.new(status: 501, headers: [], body: nil) if request.headers.assoc(":method")&.last == "CONNECT"
+      return refuse(501) if request.headers.assoc(":method")&.last == "CONNECT"
 
       env = env_for(request, remote)
     rescue BadRequest
       # Not logged: the client sent it, the server did not fail.
-      Response.new(status: 400, headers: [], body: nil)
+      refuse(400)
     else
       status, headers, body = @app.call(env)
       response_for(request, status, headers, body)
     end
 
+    # The requests answered without the application since the last call,
+    # as {status => count}; the count starts over.
+    def take_refusals
+      refusals = @refusals
+      @refusals = Hash.new(0)
+      refusals
+    end
+
     private
+
+    def refuse(status)
+      @refusals[status] += 1
+      Response.new(status: status, headers: [], body: nil)
+    end
 
     # Raises BadRequest for what Rack does not allow, or allows in a form
     # the application might read differently from the client, in this
