@@ -1,4 +1,4 @@
-## [Unreleased]
+## [0.0.4] - 2026-10-27
 
 ### Added
 - quic-interop-runner's http3 test case runs against http3-ruby with `test/interop/run_interop_runner.sh`. The runner's ns-3 network simulator passes no packets under rootless podman, so the script runs the runner on `test/interop/quic-interop-runner.yml`, its compose with a stand-in (`test/interop/sim/`) that forwards with plain Linux routing; it makes the networks afresh before and after each run. CI runs it against the clients of ngtcp2, quic-go, quiche, neqo, aioquic, picoquic, lsquic, s2n-quic and quinn. ([#10](https://github.com/unasuke/http3-ruby/pull/10))
