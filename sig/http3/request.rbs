@@ -1,11 +1,12 @@
 module HTTP3
   # A request as a Session put it together. headers holds [name, value]
-  # pairs with lowercase names, the pseudo-headers first.
+  # pairs with lowercase names, the pseudo-headers first. input is the
+  # body, a binary IO at its start, which becomes rack.input.
   class Request < Data
     attr_reader stream_id: Integer
     attr_reader headers: Array[[String, String]]
-    attr_reader body: String
+    attr_reader input: StringIO
 
-    def self.new: (stream_id: Integer, headers: Array[[String, String]], body: String) -> Request
+    def self.new: (stream_id: Integer, headers: Array[[String, String]], input: StringIO) -> Request
   end
 end

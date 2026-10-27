@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "stringio"
+
 module HTTP3
   # HTTP/3 on one QUIC connection. The C part (ext/http3/session.c) runs
   # nghttp3 inside the connection's packet I/O and calls the on_* methods
@@ -133,7 +135,7 @@ module HTTP3
       # Only the pseudo-headers stay, for the log, while the body is sent:
       # the request body would otherwise be held all along, uncounted.
       pseudo = request.headers.select { |name, _| name.start_with?(":") }
-      @outgoing[id] = Outgoing.new(Request.new(stream_id: id, headers: pseudo, body: "".b), body, false)
+      @outgoing[id] = Outgoing.new(Request.new(stream_id: id, headers: pseudo, input: empty_input), body, false)
       return unless body.is_a?(Body::File)
 
       begin
@@ -251,7 +253,7 @@ module HTTP3
 
       request = @incoming.delete(id) or return
       headers = request.pseudo + request.fields
-      @done << [Request.new(stream_id: id, headers: headers, body: request.body), nil]
+      @done << [Request.new(stream_id: id, headers: headers, input: StringIO.new(request.body)), nil]
     end
 
     # The client reset its side of the stream. A request it had not
@@ -310,7 +312,7 @@ module HTTP3
       request.body = "".b
       release_held(id)
       @rejected[id] = true
-      @done << [Request.new(stream_id: id, headers: [], body: "".b), status]
+      @done << [Request.new(stream_id: id, headers: [], input: empty_input), status]
     end
 
     # Queue chunks of out's body while its stream has less than limit bytes
@@ -347,6 +349,11 @@ module HTTP3
       # released when its close comes through.
       out.done = true
       queued
+    end
+
+    # An input with no body, for the requests that keep none.
+    def empty_input
+      StringIO.new("".b)
     end
 
     def release(id)

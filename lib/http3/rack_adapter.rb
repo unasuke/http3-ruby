@@ -125,7 +125,7 @@ module HTTP3
         "REMOTE_ADDR" => remote.ip_address,
         "HTTP_HOST" => authority,
         "rack.url_scheme" => scheme,
-        "rack.input" => StringIO.new(request.body.b),
+        "rack.input" => request.input,
         "rack.errors" => $stderr
       }
       fields.each do |name, values|
