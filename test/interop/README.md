@@ -54,31 +54,40 @@ protocol error closes only that connection (the server logs
 ## Requests held open
 
 `hold_requests.rb` checks that clients holding requests open cannot make the
-server use up its memory. It starts `server.rb` on a temporary directory and
-certificate, opens 20 connections, and on each sends 100 requests whose
-1,000,000-byte bodies never end (no FIN). With its default limits the server
-holds no more than 4 MiB of them per connection (`max_connection_request_buffer`)
-and 64 MiB in all (`max_total_request_buffer`), and answers the rest with 503
-at once.
+server use up its memory or its disk. It starts `server.rb` on a temporary
+directory and certificate, opens 20 connections, and on each sends 100
+requests whose 1,000,000-byte bodies never end (no FIN). With its default
+limits the server holds no more than 4 MiB of them in memory per connection
+(`max_connection_request_buffer`) and 64 MiB in all
+(`max_total_request_buffer`). A body over 64 KiB (`request_body_buffer_size`)
+goes to a temporary file, of which it holds no more than 16 MiB and 16 files
+per connection (`max_connection_request_spool`,
+`max_connection_request_spool_files`) and 1 GiB and 256 files in all
+(`max_total_request_spool`, `max_total_request_spool_files`). It answers the
+rest with 503 at once.
 
 ```sh
 bundle exec ruby test/interop/hold_requests.rb [--connections 20] [--streams 100] \
   [--bytes 1_000_000] [--timeout 120] [--request-timeout SECONDS]
 ```
 
-It prints the server's resident set size before and after, and how the
-requests were answered: with the defaults, 67 held open and 1933 with 503.
-It exits non-zero unless some request got 503, the server is still running,
-and a GET on a new connection gets 200 afterwards, or when it takes more than
-`--timeout` seconds. The resident set size should grow by about 64 MiB, not by
-the 2 GB sent; it varies from run to run, so the script checks no threshold.
+It prints the server's resident set size before and after, the temporary
+files it holds, and how the requests were answered: with the defaults, 256
+held open, in 256 files of about 1 MB, and 1744 with 503. It exits non-zero
+unless some request got 503, the temporary files stay within 16 files and
+16 MiB per connection and 256 files and 1 GiB in all, the server is still
+running, and a GET on a new connection gets 200
+afterwards, or when it takes more than `--timeout` seconds. The resident set
+size should grow by tens of MiB, not by the 2 GB sent; it varies from run to
+run, so the script checks no threshold.
 
 `--request-timeout` is passed on to `server.rb` as the server's
 `request_timeout` (30 seconds by default, longer than the script waits). With
 it, the script also waits for the requests held open to run out of time and
-exits non-zero unless every one of them gets 408. With `--request-timeout 5`,
-134 got 408: the 67 held at first, then 67 more whose bodies were still on
-their way when the first ones let go of the buffer.
+exits non-zero unless every one of them gets 408 and no temporary file is
+left open afterwards. With `--request-timeout 5`, 512 got 408: the 256 held
+at first, then 256 more whose bodies were still on their way when the first
+ones let go of their files.
 
 ## Responses not read
 

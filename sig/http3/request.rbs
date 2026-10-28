@@ -1,12 +1,13 @@
 module HTTP3
   # A request as a Session put it together. headers holds [name, value]
   # pairs with lowercase names, the pseudo-headers first. input is the
-  # body, a binary IO at its start, which becomes rack.input.
+  # body, a binary IO at its start, which becomes rack.input: a StringIO,
+  # or a temporary File once the body is past request_body_buffer_size.
   class Request < Data
     attr_reader stream_id: Integer
     attr_reader headers: Array[[String, String]]
-    attr_reader input: StringIO
+    attr_reader input: StringIO | ::File
 
-    def self.new: (stream_id: Integer, headers: Array[[String, String]], input: StringIO) -> Request
+    def self.new: (stream_id: Integer, headers: Array[[String, String]], input: StringIO | ::File) -> Request
   end
 end

@@ -10,9 +10,7 @@ It is not suited for production yet:
 
 - The application is called on the thread that drives every connection, one
   request at a time, so a slow request holds up all the others.
-- A request body is read in full, up to `max_request_body:` (1 MiB), before
-  the application is called, and streaming response bodies are not
-  supported.
+- Streaming response bodies (`call`) are not supported.
 - CI runs it on Ruby 4.0 alone, not on 3.3, the oldest it installs on. It is
   checked against curl and the clients of quic-interop-runner, over links
   with no loss or delay, and has not been run under load or over lossy
@@ -64,8 +62,13 @@ Other options, with their defaults:
 | `max_connections:` | `1024` | Connections at once; more are refused with CONNECTION_REFUSED |
 | `max_request_body:` | `1_048_576` | Bytes of request body; more gets 413 |
 | `max_field_section_size:` | `65_536` | Bytes of request headers (RFC 9114 §4.2.2); more gets 431 |
-| `max_connection_request_buffer:` | `4_194_304` | Bytes a connection's requests may hold before they reach the application (headers counted as RFC 9114 §4.2.2 does, and bodies); more gets 503 |
+| `max_connection_request_buffer:` | `4_194_304` | Bytes of memory a connection's requests may hold before they reach the application (headers counted as RFC 9114 §4.2.2 does, and bodies up to `request_body_buffer_size:`); more gets 503 |
 | `max_total_request_buffer:` | `67_108_864` | The same over all connections; more gets 503 |
+| `request_body_buffer_size:` | `65_536` | Bytes of a request body kept in memory; a longer body goes to a temporary file, all of it |
+| `max_connection_request_spool:` | `16_777_216` | Bytes of request bodies a connection may hold in temporary files; more gets 503 |
+| `max_total_request_spool:` | `1_073_741_824` | The same over all connections |
+| `max_connection_request_spool_files:` | `16` | Request bodies a connection may hold in temporary files at once; more gets 503 |
+| `max_total_request_spool_files:` | `256` | The same over all connections |
 | `send_buffer_size:` | `65_536` | Bytes of a response body queued but unsent per stream |
 | `max_connection_send_buffer:` | `1_048_576` | Bytes of array and `each` response bodies a connection may have queued but unsent; more waits |
 | `max_total_send_buffer:` | `67_108_864` | The same over all connections |
@@ -77,11 +80,23 @@ Other options, with their defaults:
 | `settings:` | `QUIC::Settings.default` | QUIC settings (the ALPN is always `h3`) |
 | `logger:` | `Logger.new($stderr)` | Where failures are logged |
 
-`max_connection_request_buffer:` has to be at least `max_request_body:` plus
-`max_field_section_size:`, and `max_total_request_buffer:` at least
-`max_connection_request_buffer:`, so that a request within the limits never
-gets 503 from an idle server; otherwise `HTTP3::Server.new` raises
-`ArgumentError`.
+A request body over `request_body_buffer_size:` is written to an unnamed
+file in `Dir.tmpdir` (`TMPDIR`, or `/tmp`), on the thread that drives every
+connection. Where `/tmp` is a tmpfs, as on Debian 13 and Fedora, that file
+is in memory; set `TMPDIR` to a directory on disk. A body still has to
+arrive within `request_timeout:`, so raise it together with
+`max_request_body:`.
+
+`max_connection_request_buffer:` has to be at least `max_field_section_size:`
+plus `max_request_body:`, or `request_body_buffer_size:` if that is smaller;
+`max_total_request_buffer:` at least `max_connection_request_buffer:`; when
+a body may go to a file, `max_connection_request_spool:` at least
+`max_request_body:`; `max_total_request_spool:` at least
+`max_connection_request_spool:`; and `max_total_request_spool_files:` at
+least `max_connection_request_spool_files:`. That way a request within the
+limits never gets 503 from an idle server; otherwise `HTTP3::Server.new`
+raises `ArgumentError`. When a body may go to a file, `HTTP3::Server.new`
+also makes one in `Dir.tmpdir`, and raises what that raises.
 
 A request gets 413, 431 or 503 as soon as it passes a limit, without waiting
 for the rest of it, and the server reads no more of it (STOP_SENDING with

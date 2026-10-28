@@ -197,7 +197,23 @@ class TestServerLimits < Minitest::Test
       {max_request_body: 4_000, max_field_section_size: 1_000, max_connection_request_buffer: 4_000} =>
         "max_connection_request_buffer (4000) must be at least max_request_body + max_field_section_size (5000)",
       {max_total_request_buffer: 1_000} =>
-        "max_total_request_buffer (1000) must be at least max_connection_request_buffer (4194304)"
+        "max_total_request_buffer (1000) must be at least max_connection_request_buffer (4194304)",
+      {request_body_buffer_size: 0} => "request_body_buffer_size must be a positive Integer (got 0)",
+      {max_connection_request_spool: nil} => "max_connection_request_spool must be a positive Integer (got nil)",
+      {max_total_request_spool: -1} => "max_total_request_spool must be a positive Integer (got -1)",
+      {max_connection_request_spool_files: 0} => "max_connection_request_spool_files must be a positive Integer (got 0)",
+      {max_total_request_spool_files: 1.0} => "max_total_request_spool_files must be a positive Integer (got 1.0)",
+      # A body over request_body_buffer_size goes to a file, so memory has
+      # to hold only that much of it.
+      {max_request_body: 4_000, max_field_section_size: 1_000, request_body_buffer_size: 1_000,
+       max_connection_request_buffer: 1_500} =>
+        "max_connection_request_buffer (1500) must be at least request_body_buffer_size + max_field_section_size (2000)",
+      {max_request_body: 20_000_000} =>
+        "max_connection_request_spool (16777216) must be at least max_request_body (20000000)",
+      {max_total_request_spool: 1_000} =>
+        "max_total_request_spool (1000) must be at least max_connection_request_spool (16777216)",
+      {max_total_request_spool_files: 8} =>
+        "max_total_request_spool_files (8) must be at least max_connection_request_spool_files (16)"
     }.each do |options, message|
       error = assert_raises(ArgumentError, options.inspect) do
         HTTP3::Server.new(
@@ -207,6 +223,8 @@ class TestServerLimits < Minitest::Test
       end
       assert_equal message, error.message
     end
+    # No body goes to a file, so the spool needs no room.
+    new_server(max_request_body: 4_000, max_connection_request_spool: 1, max_total_request_spool: 1)
   end
 
   private

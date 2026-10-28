@@ -5,6 +5,9 @@ module HTTP3
     # What .shared_buffer returns, to be passed to .attach as it is.
     type shared_buffer = Object
 
+    # What .shared_spool returns, to be passed to .attach as it is.
+    type shared_spool = Object
+
     # What a field counts for besides its name and value (RFC 9114 section
     # 4.2.2).
     FIELD_OVERHEAD: Integer
@@ -15,21 +18,43 @@ module HTTP3
     # not yet taken may hold max_connection_request_buffer bytes, and those
     # of every Session sharing shared_buffer its limit; more gets 503. One
     # not in full within request_timeout seconds of its headers gets 408
-    # (#expire_requests); nil is no limit.
+    # (#expire_requests); nil is no limit. A body past
+    # request_body_buffer_size bytes goes to a temporary file, all of it
+    # (.spool_file). The files, until they are closed once the response
+    # body is done, may hold max_connection_request_spool bytes and be
+    # max_connection_request_spool_files many; those of every Session
+    # sharing shared_spool count against its limits. More, or a file that
+    # cannot be made or written, gets 503.
     def self.attach: (QUIC::Connection::Server quic_conn, max_request_body: Integer, max_field_section_size: Integer,
                       ?max_connection_request_buffer: Integer, ?shared_buffer: shared_buffer?,
-                      ?request_timeout: (Integer | Float)?) -> Session
+                      ?request_timeout: (Integer | Float)?, ?request_body_buffer_size: Integer,
+                      ?max_connection_request_spool: Integer, ?max_connection_request_spool_files: Integer,
+                      ?shared_spool: shared_spool?) -> Session
 
     # A limit of limit bytes for the requests of every Session given it.
     def self.shared_buffer: (Integer limit) -> shared_buffer
+
+    # Limits of limit bytes in temporary files, and of files open at once,
+    # for the requests of every Session given it.
+    def self.shared_spool: (Integer limit, files: Integer) -> shared_spool
+
+    # A temporary file without a name in Dir.tmpdir, in binary mode.
+    # Raises SystemCallError when none can be had.
+    def self.spool_file: () -> ::File
 
     def self._attach: (QUIC::Connection::Server quic_conn, Integer max_field_section_size) -> Session
 
     # Finished requests, each with the status to answer it with directly
     # (408, 413, 431, 503) or nil for the application to answer it. One
     # answered directly comes out as soon as it is refused, with neither
-    # headers nor body.
+    # headers nor body. Their bytes in memory no longer count; the
+    # temporary file of a request stays open, and counts with its bytes,
+    # until its response body is done.
     def take_requests: () -> Array[[Request, Integer?]]
+
+    # The first exception a temporary file raised since the last call (its
+    # request got 503), or nil.
+    def take_spool_error: () -> Exception?
 
     # Refuse with 408 the requests still coming in whose request_timeout
     # has passed at now (CLOCK_MONOTONIC).
