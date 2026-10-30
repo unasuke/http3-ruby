@@ -3,9 +3,9 @@ module HTTP3
   class Response < Data
     attr_reader status: Integer
     attr_reader headers: Array[[String, String]]
-    attr_reader body: Body::File | Body::Chunks | nil
+    attr_reader body: Body::File | Body::Chunks | Body::Pipe | nil
 
-    def self.new: (status: Integer, headers: Array[[String, String]], body: Body::File | Body::Chunks | nil) -> Response
+    def self.new: (status: Integer, headers: Array[[String, String]], body: Body::File | Body::Chunks | Body::Pipe | nil) -> Response
   end
 
   module Body

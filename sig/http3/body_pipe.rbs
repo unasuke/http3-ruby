@@ -1,0 +1,42 @@
+module HTTP3
+  # The stream a response was being sent on is gone (reset by the client,
+  # its connection ended, or the server stopped).
+  class StreamClosed < IOError
+  end
+
+  module Body
+    # A response body written by the thread that runs the application and
+    # taken by the server's I/O loop. wake is called, with no lock held,
+    # each time the body goes from having nothing to take to having
+    # something.
+    class Pipe
+      def initialize: (capacity: Integer, wake: ^() -> void) -> void
+
+      # Queue chunk, waiting while capacity bytes or more are queued.
+      # Returns its size. Raises StreamClosed once the body was given up on,
+      # and IOError once it has ended.
+      def write: (String chunk) -> Integer
+
+      # End the body and wait until all of it has been taken.
+      def finish: () -> nil
+
+      # End the body with error, once what is queued has been taken, and
+      # wait until it has; does nothing once it has ended or been given up
+      # on.
+      def fail: (Exception error) -> nil
+
+      # Wait until every chunk queued has been taken.
+      def flush: () -> self
+
+      # A chunk; once they have all been taken, :eof, or the exception given
+      # to #fail; nil while there is nothing yet. Never waits.
+      def take: () -> (String | :eof | Exception | nil)
+
+      # True when #take has something other than nil to return.
+      def ready?: () -> bool
+
+      # Give up on the body: the writer's calls raise StreamClosed.
+      def cancel: () -> nil
+    end
+  end
+end
