@@ -107,6 +107,7 @@ class TestSendLimits < Minitest::Test
       session.take_refusals.each { |request, _status| session.respond(request, big_response) }
       while (request = session.next_request)
         session.respond(request, big_response)
+        session.finish(request.stream_id)
       end
       room = @total && @total - session.unsent_total
       session.fill_bodies(STREAM_LIMIT, connection_limit: @connection_limit, room: room)

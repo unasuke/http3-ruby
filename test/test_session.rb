@@ -222,6 +222,10 @@ class TestSession < Minitest::Test
     response = response_to(request, status)
     session.respond(request, response) { |error| @body_errors << error }
     @answerable << [request.stream_id, answerable, session.answerable?(request.stream_id)]
+    # Done with the request, as a worker is once its body is generated:
+    # these bodies need nothing more of it.
+    request.input.close
+    session.finish(request.stream_id)
     # A refused request has no headers.
     if request.headers.assoc(":path")&.last == "/twice"
       begin

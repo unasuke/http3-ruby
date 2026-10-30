@@ -28,9 +28,9 @@ class TestRackAdapter < Minitest::Test
     env = env_for([[":path", "/"], [":authority", "localhost"]], input: input)
     assert_same input, env["rack.input"]
 
-    adapter = HTTP3::RackAdapter.new(Rack::Lint.new(->(e) { [200, {}, [e["rack.input"].read]] }))
+    adapter = new_adapter(Rack::Lint.new(->(e) { [200, {}, [e["rack.input"].read]] }))
     request = request([[":path", "/"], [":authority", "localhost"]], method: "POST", input: StringIO.new("payload".b))
-    response = adapter.call(request, remote: REMOTE)
+    response, = adapter.call(request, remote: REMOTE)
     assert_equal 200, response.status
     assert_equal ["payload"], response.body.enum.to_a
   end
@@ -95,29 +95,30 @@ class TestRackAdapter < Minitest::Test
   # :path, gets 501 before anything else is looked at.
   def test_connect_gets_501
     adapter_called = false
-    adapter = HTTP3::RackAdapter.new(lambda do |_env|
+    adapter = new_adapter(lambda do |_env|
       adapter_called = true
       [200, {}, []]
     end)
     request = HTTP3::Request.new(stream_id: 0, headers: [[":method", "CONNECT"], [":authority", "example.com:443"]],
       input: StringIO.new("".b))
-    response = adapter.call(request, remote: REMOTE)
+    response, fill = adapter.call(request, remote: REMOTE)
     assert_equal 501, response.status
     assert_empty response.headers
     assert_nil response.body
+    assert_nil fill
     refute adapter_called
   end
 
   # The 400s and 501s the adapter answers itself are counted until
   # take_refusals; a 400 from the application is not.
   def test_refusals_are_counted_until_taken
-    adapter = HTTP3::RackAdapter.new(->(_env) { [400, {}, []] })
+    adapter = new_adapter(->(_env) { [400, {}, []] })
     connect = HTTP3::Request.new(stream_id: 0, headers: [[":method", "CONNECT"], [":authority", "example.com:443"]],
       input: StringIO.new("".b))
-    assert_equal 501, adapter.call(connect, remote: REMOTE).status
+    assert_equal 501, adapter.call(connect, remote: REMOTE).first.status
     assert_equal 400, adapter.call(request([[":scheme", "ftp"], [":path", "/"], [":authority", "localhost"]]),
-      remote: REMOTE).status
-    assert_equal 400, adapter.call(request([[":path", "/"], [":authority", "localhost"]]), remote: REMOTE).status
+      remote: REMOTE).first.status
+    assert_equal 400, adapter.call(request([[":path", "/"], [":authority", "localhost"]]), remote: REMOTE).first.status
 
     assert_equal({400 => 1, 501 => 1}, adapter.take_refusals)
     assert_empty adapter.take_refusals
@@ -215,23 +216,91 @@ class TestRackAdapter < Minitest::Test
     assert_equal "body chunk must be a String (got Integer)", error.message
   end
 
-  # A body read with each is counted as it is read: the next that goes past
-  # content-length raises, and so does the last one of a body that ends
-  # short of it.
+  # A body read with each goes through a Body::Pipe, which fill, on the
+  # worker, writes it to; fill closes the Rack body once it is done.
+  def test_each_body_goes_through_a_pipe
+    body = CountingBody.new(["ab", "cd"], 0, 0)
+    response, fill = respond_with_fill([200, {}, body])
+    assert_kind_of HTTP3::Body::Pipe, response.body
+    assert_equal 0, body.closes
+    assert_equal [["ab", "cd"], :eof], drain(response, fill)
+    assert_equal 1, body.closes
+  end
+
+  # fill counts the body as it reads it: the chunk that takes it past
+  # content-length fails the pipe, and so does an end short of it. The
+  # stream is aborted then, since the headers have gone.
   def test_each_body_is_counted_against_content_length
-    enum = respond([200, {"content-length" => "3"}, EachBody.new(["ab", "cd"])]).body.enum
-    assert_equal "ab", enum.next
-    error = assert_raises(HTTP3::RackAdapter::InvalidResponse) { enum.next }
-    assert_equal "the body is at least 4 bytes but content-length says otherwise", error.message
+    {"3" => [["ab"], "the body is at least 4 bytes but content-length says otherwise"],
+     "5" => [["ab", "cd"], "the body is 4 bytes but content-length says otherwise"]}.each do |length, (chunks, message)|
+      body = CountingBody.new(["ab", "cd"], 0, 0)
+      sent, ended = drain(*respond_with_fill([200, {"content-length" => length}, body]))
+      assert_equal chunks, sent, length
+      assert_kind_of HTTP3::RackAdapter::InvalidResponse, ended
+      assert_equal message, ended.message
+      assert_equal 1, body.closes, length
+    end
+    body = CountingBody.new(["ab", "cd"], 0, 0)
+    assert_equal [["ab", "cd"], :eof], drain(*respond_with_fill([200, {"content-length" => "4"}, body]))
+  end
 
-    enum = respond([200, {"content-length" => "5"}, EachBody.new(["ab", "cd"])]).body.enum
-    assert_equal ["ab", "cd"], [enum.next, enum.next]
-    error = assert_raises(HTTP3::RackAdapter::InvalidResponse) { enum.next }
-    assert_equal "the body is 4 bytes but content-length says otherwise", error.message
+  def test_each_body_chunks_must_be_strings
+    body = CountingBody.new(["ab", 1], 0, 0)
+    sent, ended = drain(*respond_with_fill([200, {}, body]))
+    assert_equal ["ab"], sent
+    assert_kind_of HTTP3::RackAdapter::InvalidResponse, ended
+    assert_equal "body chunk must be a String (got Integer)", ended.message
+    assert_equal 1, body.closes
+  end
 
-    enum = respond([200, {"content-length" => "4"}, EachBody.new(["ab", "cd"])]).body.enum
-    assert_equal ["ab", "cd"], [enum.next, enum.next]
-    assert_raises(StopIteration) { enum.next }
+  def test_each_that_raises_fails_the_pipe
+    body = FailingBody.new(0)
+    sent, ended = drain(*respond_with_fill([200, {}, body]))
+    assert_equal ["ab"], sent
+    assert_kind_of RuntimeError, ended
+    assert_equal "each failed", ended.message
+    assert_equal 1, body.closes
+  end
+
+  # Once the server has given up on the stream (the client reset it, say),
+  # the next write raises StreamClosed, and fill stops there without
+  # failing; the Rack body is closed all the same.
+  def test_fill_stops_once_the_stream_is_gone
+    body = CountingBody.new(["ab", "cd", "ef"], 0, 0)
+    response, fill = respond_with_fill([200, {}, body])
+    failures = []
+    response.body.define_singleton_method(:fail) { |error| failures << error }
+    response.body.cancel
+    assert_nil fill.call
+    assert_empty failures
+    assert_equal 1, body.yielded
+    assert_equal 1, body.closes
+  end
+
+  # Only an each body leaves its close to fill: a file, an Array and no
+  # body at all have none, and their Rack bodies are closed by the time
+  # call returns.
+  def test_other_bodies_are_closed_by_call
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "file")
+      File.write(path, "content")
+      body = CountedPathBody.new(path, 0)
+      response, fill = respond_with_fill([200, {}, body])
+      assert_nil fill
+      assert_equal 1, body.closes
+      assert_nil response.body.rack_body
+      response.body.io.close
+    end
+    body = ArrayBody.new(["a"], 0)
+    response, fill = respond_with_fill([200, {}, body])
+    assert_nil fill
+    assert_equal 1, body.closes
+    assert_nil response.body.rack_body
+    body = CountingBody.new(["x"], 0, 0)
+    response, fill = respond_with_fill([204, {}, body])
+    assert_nil fill
+    assert_nil response.body
+    assert_equal 1, body.closes
   end
 
   # No body is sent for HEAD, 204 or 304, so content-length is not held
@@ -251,7 +320,7 @@ class TestRackAdapter < Minitest::Test
 
   def test_body_kinds
     assert_kind_of HTTP3::Body::Chunks, respond([200, {}, ["a", "b"]]).body
-    assert_kind_of HTTP3::Body::Chunks, respond([200, {}, ClosableBody.new]).body
+    assert_kind_of HTTP3::Body::Pipe, respond([200, {}, ClosableBody.new]).body
     Dir.mktmpdir do |dir|
       path = File.join(dir, "file")
       File.write(path, "content")
@@ -306,10 +375,30 @@ class TestRackAdapter < Minitest::Test
     end
   end
 
-  # A body read with each only.
-  EachBody = Struct.new(:chunks) do
-    def each(&)
-      chunks.each(&)
+  # A body read with each only, which counts the chunks it yields and its
+  # closes.
+  CountingBody = Struct.new(:chunks, :yielded, :closes) do
+    def each
+      chunks.each do |chunk|
+        self.yielded += 1
+        yield chunk
+      end
+    end
+
+    def close
+      self.closes += 1
+    end
+  end
+
+  # A body whose each raises after its first chunk.
+  FailingBody = Struct.new(:closes) do
+    def each
+      yield "ab"
+      raise "each failed"
+    end
+
+    def close
+      self.closes += 1
     end
   end
 
@@ -331,16 +420,16 @@ class TestRackAdapter < Minitest::Test
   # or nil if it was not called.
   def exchange(headers)
     env = nil
-    adapter = HTTP3::RackAdapter.new(lambda do |e|
+    adapter = new_adapter(lambda do |e|
       env = e
       [200, {}, []]
     end)
-    [adapter.call(request(headers), remote: REMOTE), env]
+    [adapter.call(request(headers), remote: REMOTE).first, env]
   end
 
   def env_for(headers, input: StringIO.new("".b))
     env = nil
-    adapter = HTTP3::RackAdapter.new(lambda do |e|
+    adapter = new_adapter(lambda do |e|
       env = e
       [200, {}, []]
     end)
@@ -359,7 +448,39 @@ class TestRackAdapter < Minitest::Test
   end
 
   def respond(triple, method: "GET")
-    adapter = HTTP3::RackAdapter.new(->(_env) { triple })
+    respond_with_fill(triple, method: method).first
+  end
+
+  # [response, fill] for the application's triple.
+  def respond_with_fill(triple, method: "GET")
+    adapter = new_adapter(->(_env) { triple })
     adapter.call(request([[":path", "/"], [":authority", "localhost"]], method: method), remote: REMOTE)
+  end
+
+  def new_adapter(app)
+    HTTP3::RackAdapter.new(app, pipe_capacity: 65_536, wake: -> {})
+  end
+
+  # Call fill on a thread of its own, as a worker does, and take what it
+  # writes to the response's pipe until the end: [the chunks, :eof or the
+  # exception that ended the body].
+  def drain(response, fill)
+    pipe = response.body
+    filler = Thread.new(&fill)
+    chunks = []
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+    loop do
+      taken = pipe.take
+      case taken
+      when String then chunks << taken
+      when nil
+        raise "the body did not end" if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+
+        sleep 0.001
+      else
+        filler.join(5)
+        return [chunks, taken]
+      end
+    end
   end
 end

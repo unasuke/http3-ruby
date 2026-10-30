@@ -31,8 +31,9 @@ class TestSessionSpool < Minitest::Test
     "test_503_over_the_spool" => {max_connection_request_spool: MAX_REQUEST_BODY},
     "test_reset_while_spooling_gives_everything_back" => {max_connection_request_spool: MAX_REQUEST_BODY},
     "test_413_while_spooling_gives_everything_back" => {max_connection_request_spool: MAX_REQUEST_BODY},
-    "test_spool_counts_until_the_response_body_is_done" =>
+    "test_spool_counts_until_finish" =>
       {max_connection_request_spool: MAX_REQUEST_BODY, max_connection_request_spool_files: 2},
+    "test_spool_counts_after_the_stream_closes_until_finish" => {max_connection_request_spool: MAX_REQUEST_BODY},
     "test_503_over_the_spool_files" => {max_connection_request_spool_files: 2},
     # Just the room in memory a request at the limits needs once its body
     # goes to a file.
@@ -57,11 +58,14 @@ class TestSessionSpool < Minitest::Test
     @limits = DEFAULTS.merge(LIMITS.fetch(name, {}))
     @session_class = (name == "test_503_when_no_file_can_be_made") ? FullDiskSession : HTTP3::Session
     # What the server thread saw: [class, external encoding, file name] of
-    # each input, the inputs of /read-later, and take_spool_error's
-    # exceptions.
+    # each input, the inputs of /read-later and of /hold, and
+    # take_spool_error's exceptions.
     @inputs = Thread::Queue.new
     @read_later = Thread::Queue.new
+    @held_inputs = Thread::Queue.new
     @spool_errors = Thread::Queue.new
+    # The streams of the /hold requests the server is to be done with.
+    @release = Thread::Queue.new
     # The temporary files other tests may have left for the GC to close.
     @spool_baseline = all_spool_descriptors
     @sock = UDPSocket.new(Socket::AF_INET)
@@ -106,8 +110,9 @@ class TestSessionSpool < Minitest::Test
     assert_empty spool_descriptors
   end
 
-  # The spool holds a request's bytes only until it is handed out: a
-  # second request at max_request_body fits after the first.
+  # The spool holds a request's bytes only until the server is done with
+  # it (#finish): a second request at max_request_body fits after the
+  # first.
   def test_spooled_bytes_come_back_for_the_next_request
     2.times { assert_equal 200, post("/digest", "x" * MAX_REQUEST_BODY).status }
   end
@@ -157,12 +162,13 @@ class TestSessionSpool < Minitest::Test
     assert_equal 200, post("/digest", "x" * MAX_REQUEST_BODY).status
   end
 
-  # A request handed out keeps its file open, and counted with its bytes,
-  # until its response body is done, so that the spool bounds the disk the
-  # files take: while the client reads none of /big, a second request
-  # finds no room in the spool (though a file would fit) and gets 503;
-  # once /big has been read, the next one gets through.
-  def test_spool_counts_until_the_response_body_is_done
+  # A request handed out keeps its file counted, with its bytes, until
+  # finish, which the server here calls once the response body is done, so
+  # that the spool bounds the disk the files take: while the client reads
+  # none of /big, a second request finds no room in the spool (though a
+  # file would fit) and gets 503; once /big has been read, the next one
+  # gets through.
+  def test_spool_counts_until_finish
     big = @client.request(:post, "/big", body: "x" * MAX_REQUEST_BODY)
     @client.pause(big)
     wait_for_spool_files(1)
@@ -177,8 +183,8 @@ class TestSessionSpool < Minitest::Test
     assert_equal 200, post("/digest", "y" * MAX_REQUEST_BODY).status
   end
 
-  # The input stays open until the response body is done, so a body may
-  # read it as it goes; it is closed then.
+  # The Session leaves the input open, so a body may read it as it goes;
+  # the server here closes it once the body is done.
   def test_body_reads_the_spooled_input_as_it_goes
     body = "later" * 700
     response = post("/read-later", body)
@@ -188,12 +194,21 @@ class TestSessionSpool < Minitest::Test
     assert_predicate input, :closed?
   end
 
-  # The application may close the input itself: the Session closes it only
-  # if it is still open, and goes on.
-  def test_input_the_application_closed
-    assert_equal 204, post("/close-input", "x" * 2_000).status
-    assert_empty spool_descriptors
-    assert_equal 200, post("/digest", "x" * 2_000).status
+  # What a request handed out holds counts until finish, even once its
+  # stream has closed, and the Session leaves its input open for the
+  # caller to close.
+  def test_spool_counts_after_the_stream_closes_until_finish
+    held = @client.request(:post, "/hold", body: "x" * MAX_REQUEST_BODY)
+    @client.pump_until { @client.response(held).finished? }
+    @client.pump_until { @client.closed?(held) }
+    input = @held_inputs.pop(timeout: 5)
+    pump_for(0.2)
+    assert_equal 503, post("/digest", "y" * 2_000).status
+    refute_predicate input, :closed?
+
+    @release << held
+    @client.pump_until { input.closed? }
+    assert_equal 200, post("/digest", "y" * MAX_REQUEST_BODY).status
   end
 
   # A file that cannot be made gets the request 503; take_spool_error
@@ -267,11 +282,21 @@ class TestSessionSpool < Minitest::Test
       conn, max_request_body: MAX_REQUEST_BODY, max_field_section_size: MAX_FIELD_SECTION_SIZE,
       request_body_buffer_size: REQUEST_BODY_BUFFER_SIZE, **@limits
     )
+    # stream_id => the input of each request handed out and not finished,
+    # and of the /hold ones among them
+    @handed = {}
+    @held = {}
     until @stop
       conn.pump_once(timeout: 0.002)
       session.take_refusals.each { |request, status| session.respond(request, response_to(request, status)) }
       while (request = session.next_request)
-        session.respond(request, response_to(request, nil))
+        answer(session, request)
+      end
+      until @release.empty?
+        id = @release.pop
+        @held.delete(id)
+        @handed.delete(id).close
+        session.finish(id)
       end
       session.fill_bodies(65_536)
       session.release_closed
@@ -281,14 +306,39 @@ class TestSessionSpool < Minitest::Test
   rescue QUIC::Error::Closed, IOError, Errno::ECONNREFUSED
     # The client went away, or teardown closed the socket.
   ensure
-    # The files of the requests still open, such as /big's.
+    # The files of the requests still under way, such as /big's.
+    @handed&.each_value(&:close)
     session&.release_all
+  end
+
+  # Answer request; once its response body is done, close its input and
+  # finish it, as the server's workers do. A /hold request is answered at
+  # once, and left for the test to let go of (@release).
+  def answer(session, request)
+    @handed[request.stream_id] = request.input
+    done = lambda do
+      @handed.delete(request.stream_id).close
+      session.finish(request.stream_id)
+    end
+    response = response_to(request, nil)
+    if request.headers.assoc(":path").last == "/hold"
+      session.respond(request, HTTP3::Response.new(status: 200, headers: [], body: nil))
+      @held[request.stream_id] = request.input
+      @held_inputs << request.input
+      return
+    end
+    enum = response.body.enum
+    ending = Enumerator.new do |y|
+      loop { y << enum.next }
+      done.call
+    end
+    session.respond(request, response.with(body: response.body.with(enum: ending)))
   end
 
   # /digest answers with the size and SHA-256 of the body, read 256 bytes
   # at a time; /big with far more than the client reads; /read-later with
-  # the body, read only as the response is sent; /close-input closes the
-  # input and answers 204.
+  # the body, read only as the response is sent; /hold with nothing (see
+  # #answer).
   def response_to(request, status)
     return HTTP3::Response.new(status: status, headers: [], body: nil) if status
 
@@ -307,9 +357,7 @@ class TestSessionSpool < Minitest::Test
     when "/read-later"
       @read_later << input
       Enumerator.new { |y| y << input.read }
-    when "/close-input"
-      input.close
-      return HTTP3::Response.new(status: 204, headers: [], body: nil)
+    when "/hold" then [].each
     end
     HTTP3::Response.new(status: 200, headers: [], body: HTTP3::Body::Chunks.new(enum: enum, rack_body: nil))
   end

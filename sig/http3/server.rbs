@@ -1,7 +1,7 @@
 module HTTP3
   # An HTTP/3 server for a Rack 3 application on one UDP address. #run
   # serves until SIGTERM or SIGINT, then drains; SIGHUP reloads the
-  # certificate and key.
+  # certificate and key. The application runs on threads worker threads.
   class Server
     ALPN: Array[String]
     SIGNALS: Hash[String, String]
@@ -20,6 +20,7 @@ module HTTP3
       ?settings: QUIC::Settings?,
       ?qlog_dir: (String | _ToPath)?,
       ?max_connections: Integer,
+      ?threads: Integer,
       ?max_request_body: Integer,
       ?max_field_section_size: Integer,
       ?max_connection_request_buffer: Integer,

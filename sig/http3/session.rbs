@@ -15,16 +15,18 @@ module HTTP3
     # Take over quic_conn's streams. Requests over max_request_body bytes of
     # body get 413, over max_field_section_size bytes of headers 431, as
     # soon as they pass the limit; the rest of them is not read. Requests
-    # not yet taken may hold max_connection_request_buffer bytes, and those
-    # of every Session sharing shared_buffer its limit; more gets 503. One
-    # not in full within request_timeout seconds of its headers gets 408
+    # may hold max_connection_request_buffer bytes, and those of every
+    # Session sharing shared_buffer its limit; more gets 503. One not in
+    # full within request_timeout seconds of its headers gets 408, and one
+    # not handed out within request_timeout seconds of its end 503
     # (#expire_requests); nil is no limit. A body past
     # request_body_buffer_size bytes goes to a temporary file, all of it
-    # (.spool_file). The files, until they are closed once the response
-    # body is done, may hold max_connection_request_spool bytes and be
-    # max_connection_request_spool_files many; those of every Session
-    # sharing shared_spool count against its limits. More, or a file that
-    # cannot be made or written, gets 503.
+    # (.spool_file). The files may hold max_connection_request_spool bytes
+    # and be max_connection_request_spool_files many; those of every
+    # Session sharing shared_spool count against its limits. More, or a
+    # file that cannot be made or written, gets 503. A request counts until
+    # its stream closes, or, once handed out, until #finish, though its
+    # stream or connection has gone.
     def self.attach: (QUIC::Connection::Server quic_conn, max_request_body: Integer, max_field_section_size: Integer,
                       ?max_connection_request_buffer: Integer, ?shared_buffer: shared_buffer?,
                       ?request_timeout: (Integer | Float)?, ?request_body_buffer_size: Integer,
@@ -49,10 +51,15 @@ module HTTP3
     # as it is refused, with neither headers nor body.
     def take_refusals: () -> Array[[Request, Integer]]
 
-    # The next request received in full, for the application, or nil. Its
-    # bytes in memory no longer count; its temporary file stays open, and
-    # counts with its bytes, until its response body is done.
+    # The next request received in full, for the application, or nil. The
+    # caller closes its input, and calls #finish, once done with it; what
+    # it holds counts until then, even after its stream has closed.
     def next_request: () -> Request?
+
+    # The caller is done with a request #next_request handed out: what it
+    # held no longer counts, though its stream or connection has gone.
+    # Calling it again does nothing.
+    def finish: (Integer stream_id) -> void
 
     # True while the request on stream_id can still be answered: its stream
     # is open, and it has been neither reset by the client, nor refused,
@@ -64,10 +71,12 @@ module HTTP3
     def take_spool_error: () -> Exception?
 
     # Refuse with 408 the requests still coming in whose request_timeout
-    # has passed at now (CLOCK_MONOTONIC).
+    # has passed at now (CLOCK_MONOTONIC), and with 503 those that have
+    # waited that long to be handed out.
     def expire_requests: (Float now) -> void
 
-    # When the next request still coming in runs out of time, or nil.
+    # When the next request still coming in, or waiting to be handed out,
+    # runs out of time, or nil.
     def next_request_deadline: () -> Float?
 
     # Send response. Yields the exception of a file body whose descriptor
@@ -75,27 +84,33 @@ module HTTP3
     # Nghttp3::InvalidStateError for a request already answered.
     def respond: (Request request, Response response) ?{ (SystemCallError error) -> void } -> void
 
-    # Queue more of each Body::Chunks body, up to limit unsent bytes per
-    # stream, connection_limit on the connection, and room bytes queued now
-    # (nil for no limit); a chunk may pass a limit. Returns the bytes
-    # queued. Yields the request (its pseudo-headers only, without body)
-    # and exception of a body that raised.
+    # Queue more of each Body::Chunks and Body::Pipe body, up to limit
+    # unsent bytes per stream, connection_limit on the connection, and room
+    # bytes queued now (nil for no limit); a chunk may pass a limit.
+    # Returns the bytes queued. Yields the request (its pseudo-headers
+    # only, without body) and exception of a body that raised or failed.
     def fill_bodies: (Integer limit, ?connection_limit: Integer?, ?room: Integer?) ?{ (Request request, Exception error) -> void } -> Integer
 
+    # True when a Body::Chunks body, or a Body::Pipe with something to
+    # take, could take more.
     def wants_fill?: (Integer limit, ?connection_limit: Integer?, ?room: Integer?) -> bool
 
-    # Bytes of the Body::Chunks bodies queued but not taken by nghttp3 yet.
+    # Bytes of the Body::Chunks and Body::Pipe bodies queued but not taken
+    # by nghttp3 yet.
     def unsent_total: () -> Integer
 
-    # True while a request stream is open.
+    # True while a request stream is open, or a request waits to be handed
+    # out.
     def busy?: () -> bool
 
-    # Let go of closed streams; yields a body close that raised. Resets our
-    # side of the requests the client reset before their end
-    # (H3_REQUEST_INCOMPLETE).
+    # Let go of closed streams (a Body::Pipe is cancelled); yields a body
+    # close that raised. Resets our side of the requests the client reset
+    # before their end (H3_REQUEST_INCOMPLETE), and of those it reset while
+    # they waited to be handed out (H3_REQUEST_CANCELLED).
     def release_closed: () ?{ (Integer stream_id, Exception error) -> void } -> void
 
-    # Close every body still held.
+    # Close every body still held. What the requests handed out hold counts
+    # until #finish.
     def release_all: () ?{ (Integer stream_id, Exception error) -> void } -> void
 
     # Called inside nghttp3, or inside the QUIC connection's packet

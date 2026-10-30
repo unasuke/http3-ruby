@@ -210,6 +210,9 @@ class TestSessionLimits < Minitest::Test
       session.take_refusals.each { |request, status| session.respond(request, response_to(request, status)) }
       while (request = session.next_request)
         session.respond(request, response_to(request, nil))
+        # The body has what it needs of the request.
+        request.input.close
+        session.finish(request.stream_id)
       end
       session.fill_bodies(65_536)
       session.release_closed

@@ -27,6 +27,10 @@ module HTTP3
     # section 4.2.2 counts it, and as the C part does for 431.
     FIELD_OVERHEAD = 32
 
+    # What #next_chunk returns at the end of a body.
+    END_OF_BODY = Object.new.freeze
+    private_constant :END_OF_BODY
+
     # Bytes the requests coming in may hold: a connection's, and through
     # parent the server's. Only the server's I/O loop, one thread, calls
     # it, so it takes no lock.
@@ -71,21 +75,23 @@ module HTTP3
     # bytes; past that, all of it goes to a temporary file
     # (Session.spool_file).
     #
-    # The requests not yet handed out (#next_request) may hold
-    # max_connection_request_buffer bytes of memory in all, header fields
-    # counted as for 431 and bodies by their bytes, and those of every
-    # Session given the same shared_buffer (Session.shared_buffer) its
-    # limit. The requests whose temporary files are open may hold
-    # max_connection_request_spool bytes in them, and
-    # max_connection_request_spool_files of them, and those of every
-    # Session given the same shared_spool (Session.shared_spool) its
-    # limits; a file stays open until the response body is done (see
-    # #next_request). A request that would pass any of these limits, or
-    # whose file cannot be made or written, is answered with 503.
+    # The requests may hold max_connection_request_buffer bytes of memory in
+    # all, header fields counted as for 431 and bodies by their bytes, and
+    # those of every Session given the same shared_buffer
+    # (Session.shared_buffer) its limit. Their temporary files may hold
+    # max_connection_request_spool bytes, and be
+    # max_connection_request_spool_files many, and those of every Session
+    # given the same shared_spool (Session.shared_spool) its limits. A
+    # request counts until its stream closes, or, once handed out
+    # (#next_request), until #finish, though its stream or connection has
+    # gone. A request that would pass any of
+    # these limits, or whose file cannot be made or written, is answered
+    # with 503.
     #
     # A request not received in full within request_timeout seconds of the
-    # start of its headers is answered with 408 (#expire_requests); nil is
-    # no limit.
+    # start of its headers is answered with 408, and one not handed out
+    # within request_timeout seconds of its end with 503
+    # (#expire_requests); nil is no limit.
     def self.attach(quic_conn, max_request_body:, max_field_section_size:,
       max_connection_request_buffer: 4_194_304, shared_buffer: nil, request_timeout: nil,
       request_body_buffer_size: 65_536, max_connection_request_spool: 16_777_216,
@@ -144,19 +150,25 @@ module HTTP3
     end
 
     # The next request received in full, for the application to answer, or
-    # nil. The bytes it held in memory no longer count for the limits.
-    #
-    # Its temporary file, if it has one, stays open, and counts for the
-    # spool's limits with its bytes, until its response body is done: once
-    # #respond returns for a response without a body or with a Body::File,
-    # once #fill_bodies has queued all of a Body::Chunks body, or when its
-    # stream closes. The application, or a body that reads rack.input as it
-    # goes, may read it until then. It is closed then, unless it is closed
-    # already.
+    # nil. The Session no longer closes its input: the caller closes it once
+    # done with the request, its response body included, and then calls
+    # #finish. What the request holds, in memory and in its temporary file,
+    # counts for the limits until then, even after its stream has closed.
     def next_request
-      request = @ready.shift or return nil
-      release_held(request.stream_id)
+      request, = @ready.shift
+      return nil if request.nil?
+
+      @handed[request.stream_id] = true
       request
+    end
+
+    # The caller is done with the request on stream_id that #next_request
+    # handed out: what it held no longer counts for the limits. Its stream
+    # and its connection may have gone already. Calling it again does
+    # nothing.
+    def finish(stream_id)
+      @handed.delete(stream_id) or return
+      release_budget(stream_id)
     end
 
     # True while the request on stream_id can still be answered: its stream
@@ -175,7 +187,9 @@ module HTTP3
     end
 
     # Refuse with 408 the requests still coming in whose request_timeout
-    # has passed at now (CLOCK_MONOTONIC); #take_refusals hands them out.
+    # has passed at now (CLOCK_MONOTONIC), and with 503 those received in
+    # full that have waited that long for #next_request; #take_refusals
+    # hands them out.
     def expire_requests(now)
       return if @request_timeout.nil?
 
@@ -184,15 +198,20 @@ module HTTP3
 
         reject(id, request, 408)
       end
+      # In the order they ended, so the first are the oldest.
+      while (ended = @ready.first&.last) && ended + @request_timeout <= now
+        request, = @ready.shift
+        refuse_waiting(request, 503)
+      end
     end
 
-    # When the next request still coming in runs out of time
-    # (CLOCK_MONOTONIC), or nil.
+    # When the next request still coming in, or waiting for #next_request,
+    # runs out of time (CLOCK_MONOTONIC), or nil.
     def next_request_deadline
       return nil if @request_timeout.nil?
 
       started = @incoming.filter_map { |id, request| request.started unless @rejected[id] }.min
-      started && started + @request_timeout
+      [started, @ready.first&.last].compact.min&.+(@request_timeout)
     end
 
     # Send response to request. Its body, if any, is kept until the stream
@@ -206,15 +225,13 @@ module HTTP3
       id = request.stream_id
       raise Nghttp3::InvalidStateError, "stream #{id} has been answered" if @answered[id]
 
-      stop_reading(id) if @rejected[id]
+      # Refused while it was still coming in (#reject keeps its Incoming).
+      stop_reading(id) if @rejected[id] && @incoming.key?(id)
       headers = [[":status", response.status.to_s], *response.headers]
       body = response.body
       submit_response(id, headers, !body.nil?)
       @answered[id] = true
-      if body.nil?
-        finish_input(id)
-        return
-      end
+      return if body.nil?
 
       # Only the pseudo-headers stay, for the log, while the body is sent:
       # the request body would otherwise be held all along, uncounted.
@@ -229,69 +246,78 @@ module HTTP3
         yield e if block_given?
       ensure
         body.io.close
-        finish_input(id)
       end
     end
 
-    # Queue more of each Body::Chunks body until limit bytes wait unsent on
-    # its stream, connection_limit on the whole connection (#unsent_total),
-    # and room more bytes have been queued; nil is no limit. A chunk may
-    # take any of them past its limit, by less than its size. Returns the
-    # bytes queued.
+    # Queue more of each Body::Chunks and Body::Pipe body until limit bytes
+    # wait unsent on its stream, connection_limit on the whole connection
+    # (#unsent_total), and room more bytes have been queued; nil is no
+    # limit. A chunk may take any of them past its limit, by less than its
+    # size. Returns the bytes queued.
     #
-    # A body whose enum raises is the application failing after its headers
-    # went out: the stream is aborted with H3_INTERNAL_ERROR and the block
-    # gets (request, exception). That request has only the pseudo-headers,
-    # and no body.
+    # A body whose enum raises, or whose Pipe failed, is the application
+    # failing after its headers went out: the stream is aborted with
+    # H3_INTERNAL_ERROR and the block gets (request, exception). That
+    # request has only the pseudo-headers, and no body.
     def fill_bodies(limit, connection_limit: nil, room: nil)
       left = [room, connection_limit && connection_limit - unsent_total].compact.min
       queued = 0
       @outgoing.each_value do |out|
-        next if out.done || !out.body.is_a?(Body::Chunks)
+        next if out.done || !generated?(out.body)
         break if left && queued >= left
 
         queued += fill_body(out, limit, left && left - queued) { |error| yield out.request, error if block_given? }
-        finish_input(out.request.stream_id) if out.done
       end
       queued
     end
 
-    # True when a Body::Chunks body could take more right now, with the
-    # limits of #fill_bodies.
+    # True when a Body::Chunks body, or a Body::Pipe with something to take,
+    # could take more right now, with the limits of #fill_bodies.
     def wants_fill?(limit, connection_limit: nil, room: nil)
       return false if room && room <= 0
       return false if connection_limit && unsent_total >= connection_limit
 
       @outgoing.any? do |id, out|
-        !out.done && out.body.is_a?(Body::Chunks) && unsent_bytes(id) < limit
+        next false if out.done || !generated?(out.body)
+        next false if out.body.is_a?(Body::Pipe) && !out.body.ready?
+
+        unsent_bytes(id) < limit
       end
     end
 
-    # Bytes of the Body::Chunks bodies queued but not taken by nghttp3 yet,
-    # on every stream; a body that has ended may still have some.
+    # Bytes of the Body::Chunks and Body::Pipe bodies queued but not taken
+    # by nghttp3 yet, on every stream; a body that has ended may still have
+    # some.
     def unsent_total
-      @outgoing.sum { |id, out| out.body.is_a?(Body::Chunks) ? unsent_bytes(id) : 0 }
+      @outgoing.sum { |id, out| generated?(out.body) ? unsent_bytes(id) : 0 }
     end
 
-    # True while a request stream is open: received in part, waiting for
-    # its answer, or with a response still being sent.
+    # True while a request stream is open: received in part, waiting to be
+    # handed out or answered, or with a response still being sent.
     def busy?
-      !@open.empty?
+      !@open.empty? || !@ready.empty?
     end
 
-    # Let go of the streams nghttp3 closed: their requests are dropped and
-    # their bodies closed. The block gets (stream_id, exception) for a body
-    # whose close raised. First, the requests the client reset before their
-    # end (#on_reset) get our side of their streams reset too, with
+    # Let go of the streams nghttp3 closed: their requests are dropped, the
+    # inputs of those not handed out closed, and their bodies closed (a
+    # Body::Pipe cancelled). What a request handed out holds still counts,
+    # until #finish. The block gets (stream_id, exception) for a body whose
+    # close raised. First, the requests the client reset before their end
+    # (#on_reset) get our side of their streams reset too, with
     # H3_REQUEST_INCOMPLETE as RFC 9114 section 4.1 says, so that the
-    # streams close.
+    # streams close; those it reset while they waited to be handed out, with
+    # H3_REQUEST_CANCELLED.
     def release_closed(&block)
       @incomplete.each { |id| abort_stream(id, Nghttp3::H3_REQUEST_INCOMPLETE) }
       @incomplete.clear
+      @cancelled.each { |id| abort_stream(id, Nghttp3::H3_REQUEST_CANCELLED) }
+      @cancelled.clear
       take_closed.each { |id| release(id, &block) }
     end
 
-    # The connection is gone: close every body still held.
+    # The connection is gone: close every body still held. What the
+    # requests handed out hold still counts, until #finish, since the
+    # caller still has them.
     def release_all(&block)
       (@open.keys | @outgoing.keys).each { |id| release(id, &block) }
     end
@@ -350,25 +376,30 @@ module HTTP3
         return reject(id, request, 503)
       end
       @incoming.delete(id)
-      @spool_inputs[id] = input if input.is_a?(File)
       headers = request.pseudo + request.fields
-      @ready << Request.new(stream_id: id, headers: headers, input: input)
+      @ready << [Request.new(stream_id: id, headers: headers, input: input),
+        Process.clock_gettime(Process::CLOCK_MONOTONIC)]
     end
 
     # The client reset its side of the stream, and the request is no longer
-    # #answerable?. A request it had not finished is dropped with the bytes
-    # it held, and #release_closed resets our side; one received in full,
-    # or refused, is answered as it would have been. Inside a callback, so
-    # it calls no C.
+    # #answerable?. A request it had not finished is dropped with what it
+    # held, and #release_closed resets our side with H3_REQUEST_INCOMPLETE;
+    # one waiting to be handed out likewise, with H3_REQUEST_CANCELLED, so
+    # that nobody answers what nobody reads. One handed out, or refused, is
+    # answered as it would have been. Inside a callback, so it calls no C.
     def on_reset(id)
       @reset[id] = true if @open.key?(id)
+      if (waiting = take_waiting(id))
+        close_input(waiting.input)
+        release_budget(id)
+        @cancelled << id
+        return
+      end
       return unless @incoming.key?(id) && !@rejected[id]
 
       request = @incoming.delete(id)
       close_input(request.body)
-      release_held(id)
-      release_spooled(id)
-      release_spool_file(id)
+      release_budget(id)
       @incomplete << id
     end
 
@@ -386,15 +417,15 @@ module HTTP3
       @spooled = {}
       # stream_id => true for a request whose file counts in @spool.files
       @spool_files = {}
-      # stream_id => the temporary file of a request handed out, until its
-      # response body is done
-      @spool_inputs = {}
       @spool_error = nil
       @incoming = {}
       # [request, status] of the requests refused, until #take_refusals
       @refused = []
-      # The requests received in full, until #next_request
+      # [request, when it ended (CLOCK_MONOTONIC)] of the requests received
+      # in full, until #next_request
       @ready = []
+      # stream_id => true for a request handed out, until #finish
+      @handed = {}
       @outgoing = {}
       @open = {}
       # stream_id => true for a stream the client has reset
@@ -402,6 +433,8 @@ module HTTP3
       @rejected = {}
       @answered = {}
       @incomplete = []
+      # The requests the client reset while they waited to be handed out
+      @cancelled = []
     end
 
     # Count n more bytes for the request on id, if the budget has room.
@@ -480,14 +513,29 @@ module HTTP3
       @spool.files.release(1)
     end
 
-    # The response body of the request on id is done: its temporary file,
-    # if it has one, is closed, and it and its bytes no longer count.
-    # Calling it again does nothing.
-    def finish_input(id)
-      input = @spool_inputs.delete(id) or return
-      close_input(input)
+    # Nothing the request on id holds counts any more: bytes in memory, in
+    # its temporary file, and the file. Calling it again does nothing.
+    def release_budget(id)
+      release_held(id)
       release_spooled(id)
       release_spool_file(id)
+    end
+
+    # Take the request on id out of those waiting to be handed out; nil if
+    # it is not one of them.
+    def take_waiting(id)
+      index = @ready.index { |request, _| request.stream_id == id } or return nil
+      @ready.delete_at(index).first
+    end
+
+    # Answer a request received in full, but not handed out, with status at
+    # once, as #reject does one still coming in.
+    def refuse_waiting(request, status)
+      id = request.stream_id
+      close_input(request.input)
+      release_budget(id)
+      @rejected[id] = true
+      @refused << [Request.new(stream_id: id, headers: [], input: empty_input), status]
     end
 
     # Close input unless the application has; a file that cannot be flushed
@@ -511,9 +559,7 @@ module HTTP3
       close_input(request.body)
       request.body = empty_input
       request.received = 0
-      release_held(id)
-      release_spooled(id)
-      release_spool_file(id)
+      release_budget(id)
       @rejected[id] = true
       @refused << [Request.new(stream_id: id, headers: [], input: empty_input), status]
     end
@@ -525,23 +571,18 @@ module HTTP3
       queued = 0
       id = out.request.stream_id
       while unsent_bytes(id) < limit && (room.nil? || queued < room)
-        begin
-          chunk = out.body.enum.next
-        rescue StopIteration
-          out.done = true
-          push_eof(id)
-          return queued
-        rescue => e
-          out.done = true
-          abort_stream(id, Nghttp3::H3_INTERNAL_ERROR)
-          yield e
-          return queued
-        end
+        chunk = next_chunk(out.body)
+        break if chunk.nil?
+
         unless chunk.is_a?(String)
           out.done = true
-          abort_stream(id, Nghttp3::H3_INTERNAL_ERROR)
-          yield TypeError.new("body chunk must be a String (got #{chunk.class})")
-          return queued
+          if chunk.equal?(END_OF_BODY)
+            push_eof(id)
+          else
+            abort_stream(id, Nghttp3::H3_INTERNAL_ERROR)
+            yield chunk
+          end
+          break
         end
         push_chunk(id, chunk)
         queued += chunk.bytesize
@@ -554,24 +595,46 @@ module HTTP3
       queued
     end
 
+    # The next chunk of body, a String; END_OF_BODY at its end; the
+    # exception that ends it otherwise; or nil while a Body::Pipe has
+    # nothing yet.
+    def next_chunk(body)
+      if body.is_a?(Body::Pipe)
+        chunk = body.take
+        return chunk.equal?(:eof) ? END_OF_BODY : chunk
+      end
+      chunk = body.enum.next
+      chunk.is_a?(String) ? chunk : TypeError.new("body chunk must be a String (got #{chunk.class})")
+    rescue StopIteration
+      END_OF_BODY
+    rescue => e
+      e
+    end
+
+    # The bodies the Session sends as they are generated, rather than read
+    # by the C part (Body::File).
+    def generated?(body)
+      body.is_a?(Body::Chunks) || body.is_a?(Body::Pipe)
+    end
+
     # An input with no body, for the requests that keep none.
     def empty_input
       StringIO.new("".b)
     end
 
+    # The input of a request handed out is the caller's to close, and what
+    # it holds counts until #finish.
     def release(id)
       @open.delete(id)
       incoming = @incoming.delete(id)
       close_input(incoming.body) if incoming
-      release_held(id)
-      release_spooled(id)
-      finish_input(id)
-      release_spool_file(id)
+      waiting = take_waiting(id)
+      close_input(waiting.input) if waiting
+      release_budget(id) unless @handed.key?(id)
       @reset.delete(id)
       @rejected.delete(id)
       @answered.delete(id)
       @refused.reject! { |request, _| request.stream_id == id }
-      @ready.reject! { |request| request.stream_id == id }
       out = @outgoing.delete(id) or return
 
       close_body(out.body)
@@ -579,10 +642,16 @@ module HTTP3
       yield id, e if block_given?
     end
 
+    # A Body::Pipe is cancelled, so that its writer stops; a Body::File's
+    # own IO is closed; a rack_body other than nil is closed.
     def close_body(body)
-      body.io.close if body.is_a?(Body::File) && !body.io.closed?
+      case body
+      when Body::Pipe then body.cancel
+      when Body::File then body.io.close unless body.io.closed?
+      end
     ensure
-      body.rack_body.close if body.rack_body.respond_to?(:close)
+      rack_body = body.rack_body if body.respond_to?(:rack_body)
+      rack_body.close if rack_body.respond_to?(:close)
     end
   end
 end

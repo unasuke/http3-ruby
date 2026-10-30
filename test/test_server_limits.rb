@@ -126,6 +126,14 @@ class TestServerLimits < Minitest::Test
     [nil, 0.5].each { |value| new_server(request_timeout: value) }
   end
 
+  def test_threads_is_checked
+    [0, -1, 1.5, "3", nil].each do |value|
+      error = assert_raises(ArgumentError, value.inspect) { new_server(threads: value) }
+      assert_equal "threads must be a positive Integer (got #{value.inspect})", error.message
+    end
+    new_server(threads: 1)
+  end
+
   # The 503s within refusal_log_interval (1 second here) of the first make
   # one line, logged once it has passed.
   def test_refusals_are_logged_once_refusal_log_interval_has_passed
