@@ -1,5 +1,8 @@
 # http3-ruby
 
+[![CI](https://github.com/unasuke/http3-ruby/actions/workflows/main.yml/badge.svg?branch=main)](https://github.com/unasuke/http3-ruby/actions/workflows/main.yml)
+[![interop](https://github.com/unasuke/http3-ruby/actions/workflows/interop.yml/badge.svg?branch=main)](https://github.com/unasuke/http3-ruby/actions/workflows/interop.yml)
+
 `http3` serves Rack 3 applications over HTTP/3. It runs QUIC through the
 [quic gem](https://github.com/unasuke/quic-ruby) and HTTP/3 through
 [nghttp3](https://github.com/ngtcp2/nghttp3), which it builds from source and
