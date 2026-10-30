@@ -41,6 +41,11 @@ class TestSession < Minitest::Test
     @body_errors = Thread::Queue.new
     @second_responses = Thread::Queue.new
     @fill_errors = Thread::Queue.new
+    # [stream_id, answerable? before respond, answerable? after it] of each
+    # request answered
+    @answerable = Thread::Queue.new
+    # [stream_id, answerable?] right after each on_reset
+    @resets = Thread::Queue.new
     @sock = UDPSocket.new(Socket::AF_INET)
     @sock.bind("127.0.0.1", 0)
     @stop = false
@@ -135,6 +140,31 @@ class TestSession < Minitest::Test
     assert_equal "stream #{id} has been answered", error.message
   end
 
+  def test_answerable_until_answered
+    id = @client.request(:get, "/hello")
+    @client.pump_until { @client.response(id).finished? }
+    assert_equal [id, true, false], @answerable.pop(timeout: 5)
+  end
+
+  # A refused request is answered with its status by whoever takes the
+  # refusals, never by the application.
+  def test_refused_request_is_not_answerable
+    id = @client.request(:post, "/echo", body: "x" * (MAX_REQUEST_BODY + 1), fin: false)
+    @client.pump_until { @client.response(id).finished? }
+    assert_equal 413, @client.response(id).status
+    assert_equal [id, false, false], @answerable.pop(timeout: 5)
+  end
+
+  # Once the client has reset a request, it is not answerable, though its
+  # stream is still open.
+  def test_reset_request_is_not_answerable
+    id = @client.request(:post, "/echo", body: "x", fin: false)
+    pump_for(0.2)
+    @client.cancel(id, stop_sending: false)
+    @client.pump_until { @client.closed?(id) }
+    assert_equal [id, false], @resets.pop(timeout: 5)
+  end
+
   # submit_response converts every field before it takes a pointer into
   # any: a GC that compacts the heap inside a name's to_str moves nothing
   # nghttp3 is about to copy.
@@ -168,9 +198,17 @@ class TestSession < Minitest::Test
       settings: QUIC::Settings.default.with(alpn: ["h3"])
     )
     session = HTTP3::Session.attach(conn, max_request_body: MAX_REQUEST_BODY, max_field_section_size: 65_536)
+    resets = @resets
+    session.define_singleton_method(:on_reset) do |id|
+      super(id)
+      resets << [id, answerable?(id)]
+    end
     until @stop
       conn.pump_once(timeout: 0.002)
-      session.take_requests.each { |request, status| answer(session, request, status) }
+      session.take_refusals.each { |request, status| answer(session, request, status) }
+      while (request = session.next_request)
+        answer(session, request, nil)
+      end
       session.fill_bodies(65_536) { |request, error| @fill_errors << [request, error] }
       session.release_closed
       error = session.take_error and raise error
@@ -180,9 +218,12 @@ class TestSession < Minitest::Test
   end
 
   def answer(session, request, status)
+    answerable = session.answerable?(request.stream_id)
     response = response_to(request, status)
     session.respond(request, response) { |error| @body_errors << error }
-    if request.headers.assoc(":path").last == "/twice"
+    @answerable << [request.stream_id, answerable, session.answerable?(request.stream_id)]
+    # A refused request has no headers.
+    if request.headers.assoc(":path")&.last == "/twice"
       begin
         session.respond(request, HTTP3::Response.new(status: 500, headers: [], body: nil))
       rescue => e
@@ -197,6 +238,12 @@ class TestSession < Minitest::Test
       io_closed: body.io.closed?,
       close_on_exec: descriptors_of(@file_path).map { |fd| IO.for_fd(fd, autoclose: false).close_on_exec? }
     }
+  end
+
+  # Pump for a while, so that the server gets what the client sent.
+  def pump_for(seconds)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + seconds
+    @client.pump while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
   end
 
   # The descriptors of this process open on path (Linux).

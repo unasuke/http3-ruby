@@ -123,6 +123,9 @@ module HTTP3
       )
       @sessions = {}
       @remotes = {}
+      # The index in @sessions of the connection whose turn it is to hand a
+      # request to the application (#next_request).
+      @next_turn = 0
       @request_buffer = Session.shared_buffer(@max_total_request_buffer)
       @request_spool = Session.shared_spool(@max_total_request_spool, files: @max_total_request_spool_files)
       # When request_spool_failed was last logged; nil until then.
@@ -241,20 +244,45 @@ module HTTP3
       @sessions.each_value { |session| session.expire_requests(at) }
     end
 
+    # Answer the refused requests at once, then call the application for
+    # those received in full, one at a time (#next_request).
     def serve_requests
       @sessions.each do |conn, session|
-        session.take_requests.each do |request, status|
-          count_refusal(status) if status
-          response = status ? Response.new(status: status, headers: [], body: nil) : call_app(conn, request)
-          begin
-            session.respond(request, response) { |error| log_body_error(conn, request, error) }
-          rescue Nghttp3::Error
-            # The stream went away while the application ran.
-            discard_body(response.body)
-          end
+        session.take_refusals.each do |request, status|
+          count_refusal(status)
+          respond(conn, session, request, Response.new(status: status, headers: [], body: nil))
         end
       end
+      loop do
+        conn, request = next_request
+        break if request.nil?
+
+        respond(conn, @sessions[conn], request, call_app(conn, request))
+      end
       @adapter.take_refusals.each { |status, count| count_refusal(status, count) }
+    end
+
+    # The next request for the application and its connection, or nil. The
+    # connections take turns, one request each, and the turns go on from
+    # one call to the next, across turns of the loop: counted from the
+    # first connection every time, the oldest ones would always go first.
+    def next_request
+      conns = @sessions.keys
+      conns.size.times do
+        @next_turn = 0 if @next_turn >= conns.size
+        conn = conns[@next_turn]
+        @next_turn += 1
+        request = @sessions[conn].next_request
+        return [conn, request] if request
+      end
+      nil
+    end
+
+    def respond(conn, session, request, response)
+      session.respond(request, response) { |error| log_body_error(conn, request, error) }
+    rescue Nghttp3::Error
+      # The stream went away while the application ran.
+      discard_body(response.body)
     end
 
     def call_app(conn, request)

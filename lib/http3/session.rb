@@ -71,7 +71,7 @@ module HTTP3
     # bytes; past that, all of it goes to a temporary file
     # (Session.spool_file).
     #
-    # The requests not yet handed out (#take_requests) may hold
+    # The requests not yet handed out (#next_request) may hold
     # max_connection_request_buffer bytes of memory in all, header fields
     # counted as for 431 and bodies by their bytes, and those of every
     # Session given the same shared_buffer (Session.shared_buffer) its
@@ -80,7 +80,7 @@ module HTTP3
     # max_connection_request_spool_files of them, and those of every
     # Session given the same shared_spool (Session.shared_spool) its
     # limits; a file stays open until the response body is done (see
-    # #take_requests). A request that would pass any of these limits, or
+    # #next_request). A request that would pass any of these limits, or
     # whose file cannot be made or written, is answered with 503.
     #
     # A request not received in full within request_timeout seconds of the
@@ -133,25 +133,37 @@ module HTTP3
       file
     end
 
-    # The requests received in full since the last call, each as
-    # [request, status]: status is nil for the application to answer the
-    # request, or the status to answer it with directly. A request answered
-    # directly comes out as soon as it is refused, before the rest of it
-    # has arrived, with neither headers nor body. The bytes they held in
-    # memory no longer count for the limits.
+    # The requests refused since the last call, each as [request, status]:
+    # the status (408, 413, 431, 503) to answer it with directly. A request
+    # comes out as soon as it is refused, before the rest of it has arrived,
+    # with neither headers nor body.
+    def take_refusals
+      refused = @refused
+      @refused = []
+      refused
+    end
+
+    # The next request received in full, for the application to answer, or
+    # nil. The bytes it held in memory no longer count for the limits.
     #
-    # The temporary file of a request for the application stays open, and
-    # counts for the spool's limits with its bytes, until its response body
-    # is done: once #respond returns for a response without a body or with
-    # a Body::File, once #fill_bodies has queued all of a Body::Chunks
-    # body, or when its stream closes. The application, or a body that
-    # reads rack.input as it goes, may read it until then. It is closed
-    # then, unless it is closed already.
-    def take_requests
-      done = @done
-      @done = []
-      done.each { |request, _| release_held(request.stream_id) }
-      done
+    # Its temporary file, if it has one, stays open, and counts for the
+    # spool's limits with its bytes, until its response body is done: once
+    # #respond returns for a response without a body or with a Body::File,
+    # once #fill_bodies has queued all of a Body::Chunks body, or when its
+    # stream closes. The application, or a body that reads rack.input as it
+    # goes, may read it until then. It is closed then, unless it is closed
+    # already.
+    def next_request
+      request = @ready.shift or return nil
+      release_held(request.stream_id)
+      request
+    end
+
+    # True while the request on stream_id can still be answered: its stream
+    # is open, the client has not reset it, it has not been refused, and it
+    # has not been answered.
+    def answerable?(stream_id)
+      @open.key?(stream_id) && !@reset[stream_id] && !@rejected[stream_id] && !@answered[stream_id]
     end
 
     # The first exception a temporary file raised since the last call, or
@@ -163,7 +175,7 @@ module HTTP3
     end
 
     # Refuse with 408 the requests still coming in whose request_timeout
-    # has passed at now (CLOCK_MONOTONIC); #take_requests hands them out.
+    # has passed at now (CLOCK_MONOTONIC); #take_refusals hands them out.
     def expire_requests(now)
       return if @request_timeout.nil?
 
@@ -340,14 +352,16 @@ module HTTP3
       @incoming.delete(id)
       @spool_inputs[id] = input if input.is_a?(File)
       headers = request.pseudo + request.fields
-      @done << [Request.new(stream_id: id, headers: headers, input: input), nil]
+      @ready << Request.new(stream_id: id, headers: headers, input: input)
     end
 
-    # The client reset its side of the stream. A request it had not
-    # finished is dropped with the bytes it held, and #release_closed
-    # resets our side; one received in full, or refused, is answered as it
-    # would have been. Inside a callback, so it calls no C.
+    # The client reset its side of the stream, and the request is no longer
+    # #answerable?. A request it had not finished is dropped with the bytes
+    # it held, and #release_closed resets our side; one received in full,
+    # or refused, is answered as it would have been. Inside a callback, so
+    # it calls no C.
     def on_reset(id)
+      @reset[id] = true if @open.key?(id)
       return unless @incoming.key?(id) && !@rejected[id]
 
       request = @incoming.delete(id)
@@ -377,9 +391,14 @@ module HTTP3
       @spool_inputs = {}
       @spool_error = nil
       @incoming = {}
-      @done = []
+      # [request, status] of the requests refused, until #take_refusals
+      @refused = []
+      # The requests received in full, until #next_request
+      @ready = []
       @outgoing = {}
       @open = {}
+      # stream_id => true for a stream the client has reset
+      @reset = {}
       @rejected = {}
       @answered = {}
       @incomplete = []
@@ -496,7 +515,7 @@ module HTTP3
       release_spooled(id)
       release_spool_file(id)
       @rejected[id] = true
-      @done << [Request.new(stream_id: id, headers: [], input: empty_input), status]
+      @refused << [Request.new(stream_id: id, headers: [], input: empty_input), status]
     end
 
     # Queue chunks of out's body while its stream has less than limit bytes
@@ -548,9 +567,11 @@ module HTTP3
       release_spooled(id)
       finish_input(id)
       release_spool_file(id)
+      @reset.delete(id)
       @rejected.delete(id)
       @answered.delete(id)
-      @done.reject! { |request, _| request.stream_id == id }
+      @refused.reject! { |request, _| request.stream_id == id }
+      @ready.reject! { |request| request.stream_id == id }
       out = @outgoing.delete(id) or return
 
       close_body(out.body)

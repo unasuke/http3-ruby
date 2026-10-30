@@ -44,13 +44,20 @@ module HTTP3
 
     def self._attach: (QUIC::Connection::Server quic_conn, Integer max_field_section_size) -> Session
 
-    # Finished requests, each with the status to answer it with directly
-    # (408, 413, 431, 503) or nil for the application to answer it. One
-    # answered directly comes out as soon as it is refused, with neither
-    # headers nor body. Their bytes in memory no longer count; the
-    # temporary file of a request stays open, and counts with its bytes,
-    # until its response body is done.
-    def take_requests: () -> Array[[Request, Integer?]]
+    # The requests refused since the last call, each with the status to
+    # answer it with directly (408, 413, 431, 503). One comes out as soon
+    # as it is refused, with neither headers nor body.
+    def take_refusals: () -> Array[[Request, Integer]]
+
+    # The next request received in full, for the application, or nil. Its
+    # bytes in memory no longer count; its temporary file stays open, and
+    # counts with its bytes, until its response body is done.
+    def next_request: () -> Request?
+
+    # True while the request on stream_id can still be answered: its stream
+    # is open, and it has been neither reset by the client, nor refused,
+    # nor answered.
+    def answerable?: (Integer stream_id) -> bool
 
     # The first exception a temporary file raised since the last call (its
     # request got 503), or nil.
