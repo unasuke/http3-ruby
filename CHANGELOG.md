@@ -1,3 +1,16 @@
+## [Unreleased]
+
+### Added
+- `HTTP3::Server` takes `request_body_buffer_size` (64 KiB): a request body that grows past it goes, all of it, to an unnamed temporary file in `Dir.tmpdir` (O_TMPFILE, or a file with a random name unlinked at once where the file system does not take that), which the application reads as `rack.input`. `max_connection_request_buffer` and `max_total_request_buffer` count only the bodies in memory. Where `/tmp` is a tmpfs, the files are in memory too; set `TMPDIR` to a directory on disk. ([#22](https://github.com/unasuke/http3-ruby/pull/22))
+- `HTTP3::Server` takes `max_connection_request_spool` (16 MiB) and `max_total_request_spool` (1 GiB), the bytes of request bodies in temporary files on one connection and over all connections, and `max_connection_request_spool_files` (16) and `max_total_request_spool_files` (256), the files open at once. A request that would pass one of them gets 503, with neither headers nor body. A temporary file stays open, and counts with its bytes, until the response body is done, so that an `each` body may read `rack.input` as it goes. ([#22](https://github.com/unasuke/http3-ruby/pull/22))
+- A request whose temporary file cannot be made or written (`ENOSPC`, `EMFILE`, `EFBIG`, ...) gets 503, and the failure is logged as `request_spool_failed remote=... error=... message=...`, at most once per `refusal_log_interval`. ([#22](https://github.com/unasuke/http3-ruby/pull/22))
+- `HTTP3::Session.attach` takes `request_body_buffer_size:`, `max_connection_request_spool:`, `max_connection_request_spool_files:` and `shared_spool:`, made with `HTTP3::Session.shared_spool(limit, files:)`. `HTTP3::Session#take_spool_error` returns the first failure to make or write a temporary file since the last call. ([#22](https://github.com/unasuke/http3-ruby/pull/22))
+
+### Changed
+- `HTTP3::Request#body`, a binary String, is now `#input`, a binary IO at its start: a `StringIO`, or the temporary `File` of a body past `request_body_buffer_size`. `HTTP3::RackAdapter` puts it in `rack.input` as it is, instead of a copy. ([#22](https://github.com/unasuke/http3-ruby/pull/22))
+- `HTTP3::Server.new` raises `ArgumentError` unless the five new options are positive Integers, `max_total_request_spool` is at least `max_connection_request_spool` and `max_total_request_spool_files` at least `max_connection_request_spool_files`. When a body may go to a temporary file (`max_request_body` over `request_body_buffer_size`), `max_connection_request_buffer` has to be at least `request_body_buffer_size + max_field_section_size` instead of `max_request_body + max_field_section_size`, and `max_connection_request_spool` at least `max_request_body`. ([#22](https://github.com/unasuke/http3-ruby/pull/22))
+- When a body may go to a temporary file, `HTTP3::Server.new` makes one in `Dir.tmpdir` and raises what that raises, such as `Errno::EACCES`. ([#22](https://github.com/unasuke/http3-ruby/pull/22))
+
 ## [0.0.4] - 2026-10-27
 
 ### Added
