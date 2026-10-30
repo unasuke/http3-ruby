@@ -1,22 +1,27 @@
 # frozen_string_literal: true
 
 # A manual check that requests held open cannot make HTTP3::Server use up
-# its memory. Every connection opens requests and sends their bodies
-# without FIN, so that the server has to hold them; with its default limits
-# it holds no more than max_connection_request_buffer (4 MiB) per
-# connection and max_total_request_buffer (64 MiB) in all, and answers the
-# rest with 503.
+# its memory or its disk. Every connection opens requests and sends their
+# bodies without FIN, so that the server has to hold them; with its default
+# limits it holds no more than max_connection_request_buffer (4 MiB) per
+# connection and max_total_request_buffer (64 MiB) in all in memory, and
+# writes a body over request_body_buffer_size (64 KiB) to a temporary file,
+# of which it holds no more than 16 MiB and 16 files per connection and
+# max_total_request_spool (1 GiB) and max_total_request_spool_files (256)
+# in all. It answers the rest with 503.
 #
 #   bundle exec ruby test/interop/hold_requests.rb [--connections 20] \
 #     [--streams 100] [--bytes 1_000_000] [--timeout 120] \
 #     [--request-timeout SECONDS]
 #
 # Starts server.rb on a temporary directory and certificate, and prints the
-# server's resident set size before and after. Exits non-zero unless some
-# request got 503, the server is still running, and a GET on a new
-# connection gets 200 afterwards, or when it takes more than --timeout
-# seconds. With --request-timeout, passed on to server.rb, every request
-# held open has to get 408 once that has passed, too. Needs the extension
+# server's resident set size before and after, and the temporary files it
+# holds. Exits non-zero unless some request got 503, the temporary files
+# stay within the limits of every connection and of the server, the server
+# is still running, and a GET on a new connection gets 200 afterwards, or
+# when it takes more than --timeout seconds. With --request-timeout, passed
+# on to server.rb, every request held open has to get 408 once that has
+# passed, and no temporary file be left open, too. Needs the extension
 # compiled (bundle exec rake compile) and Linux, for /proc.
 
 $LOAD_PATH.unshift File.expand_path("../../lib", __dir__)
@@ -42,6 +47,19 @@ end.parse!
 
 def rss_kib(pid)
   File.read("/proc/#{pid}/status")[/^VmRSS:\s+(\d+)/, 1].to_i
+end
+
+# The temporary files without a name that process pid holds in
+# Dir.tmpdir, as [count, bytes] (Linux).
+def spool_files(pid)
+  sizes = Dir.children("/proc/#{pid}/fd").filter_map do |fd|
+    path = "/proc/#{pid}/fd/#{fd}"
+    target = File.readlink(path)
+    File.stat(path).size if target.start_with?(Dir.tmpdir) && target.end_with?(" (deleted)")
+  rescue Errno::ENOENT
+    nil
+  end
+  [sizes.size, sizes.sum]
 end
 
 def alive?(pid)
@@ -107,22 +125,33 @@ Dir.mktmpdir("http3-hold-") do |work|
         ids[client] = Array.new(options[:streams]) { client.request(:post, "/", body: body, fin: false) }
         client.pump
       end
-      # Pump until no answer has come for a second: a 503 for every
-      # request that did not fit, none for those held open.
+      # Pump until no answer has come for a second, once some have: a 503
+      # for every request that did not fit, none for those held open. The
+      # first 503s come only once a connection has filled its limits, which
+      # with bodies going to temporary files takes the server seconds.
       answered = nil
       loop do
         quiet_until = now + 1
         clients.each(&:pump) while now < quiet_until
         count = ids.sum { |client, list| list.count { |id| client.response(id).status } }
-        break if count == answered
+        break if count == answered && count.positive?
 
         answered = count
       end
       statuses = ids.flat_map { |client, list| list.map { |id| client.response(id).status } }.tally
       puts "answers: #{statuses.map { |status, n| "#{status || "none (held open)"} x #{n}" }.join(", ")}"
       puts "server RSS after: #{rss_kib(pid)} KiB"
+      files, bytes = spool_files(pid)
+      puts "server temporary files: #{files}, #{bytes / 1024} KiB"
 
       check.call("some requests got 503", statuses.key?(503))
+      # Every connection holds no more than 16 files and 16 MiB in them
+      # (max_connection_request_spool_files, max_connection_request_spool),
+      # and the server no more than 256 files and 1 GiB.
+      connections = options[:connections]
+      check.call("the temporary files stay within the limits",
+        files <= [16 * connections, 256].min && bytes <= [16 * 1_024 * 1_024 * connections, 1_073_741_824].min,
+        "#{files} files, #{bytes} bytes")
       check.call("the server is running", alive?(pid))
       if options[:request_timeout]
         # Those not refused at once: still held, or already past the time.
@@ -134,6 +163,8 @@ Dir.mktmpdir("http3-hold-") do |work|
         timed_out = held.sum { |client, list| list.count { |id| client.response(id).status == 408 } }
         count = held.sum { |_, list| list.size }
         check.call("the requests held open got 408", count.positive? && timed_out == count, "#{timed_out} of #{count}")
+        files, bytes = spool_files(pid)
+        check.call("no temporary file is left open", files.zero?, "#{files} files, #{bytes} bytes")
       end
       client = connect(port, credentials.ca_file).tap { |c| clients << c }
       id = client.request(:get, "/index.html")

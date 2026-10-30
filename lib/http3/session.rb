@@ -1,5 +1,9 @@
 # frozen_string_literal: true
 
+require "stringio"
+require "tempfile"
+require "tmpdir"
+
 module HTTP3
   # HTTP/3 on one QUIC connection. The C part (ext/http3/session.c) runs
   # nghttp3 inside the connection's packet I/O and calls the on_* methods
@@ -11,8 +15,10 @@ module HTTP3
   # the streams no longer need.
   class Session
     # A request still coming in; started is when its headers began
-    # (CLOCK_MONOTONIC).
-    Incoming = Struct.new(:pseudo, :fields, :body, :started)
+    # (CLOCK_MONOTONIC). body is a StringIO, or a File once the body has
+    # gone past request_body_buffer_size (#spool); received is how many
+    # bytes of body have come.
+    Incoming = Struct.new(:pseudo, :fields, :body, :started, :received)
 
     # A response whose body is being sent.
     Outgoing = Struct.new(:request, :body, :done)
@@ -50,25 +56,45 @@ module HTTP3
     end
     private_constant :Budget
 
+    # The limits on what the requests of a connection, and through their
+    # parents the server's, hold in temporary files: bytes, and files open
+    # at once.
+    Spool = Struct.new(:bytes, :files)
+    private_constant :Spool
+
     # Take over quic_conn's streams. A request body over max_request_body
     # bytes is answered with 413, a header section over
     # max_field_section_size bytes (RFC 9114 section 4.2.2) with 431, as
     # soon as the request passes the limit; the rest of it is not read.
     #
+    # A request body is kept in memory up to request_body_buffer_size
+    # bytes; past that, all of it goes to a temporary file
+    # (Session.spool_file).
+    #
     # The requests not yet handed out (#take_requests) may hold
-    # max_connection_request_buffer bytes in all, header fields counted as
-    # for 431 and bodies by their bytes, and those of every Session given
-    # the same shared_buffer (Session.shared_buffer) its limit; a request
-    # that would pass either is answered with 503.
+    # max_connection_request_buffer bytes of memory in all, header fields
+    # counted as for 431 and bodies by their bytes, and those of every
+    # Session given the same shared_buffer (Session.shared_buffer) its
+    # limit. The requests whose temporary files are open may hold
+    # max_connection_request_spool bytes in them, and
+    # max_connection_request_spool_files of them, and those of every
+    # Session given the same shared_spool (Session.shared_spool) its
+    # limits; a file stays open until the response body is done (see
+    # #take_requests). A request that would pass any of these limits, or
+    # whose file cannot be made or written, is answered with 503.
     #
     # A request not received in full within request_timeout seconds of the
     # start of its headers is answered with 408 (#expire_requests); nil is
     # no limit.
     def self.attach(quic_conn, max_request_body:, max_field_section_size:,
-      max_connection_request_buffer: 4_194_304, shared_buffer: nil, request_timeout: nil)
+      max_connection_request_buffer: 4_194_304, shared_buffer: nil, request_timeout: nil,
+      request_body_buffer_size: 65_536, max_connection_request_spool: 16_777_216,
+      max_connection_request_spool_files: 16, shared_spool: nil)
       session = _attach(quic_conn, max_field_section_size)
+      spool = Spool.new(Budget.new(max_connection_request_spool, parent: shared_spool&.bytes),
+        Budget.new(max_connection_request_spool_files, parent: shared_spool&.files))
       session.send(:setup, max_request_body, Budget.new(max_connection_request_buffer, parent: shared_buffer),
-        request_timeout)
+        request_timeout, request_body_buffer_size, spool)
       session
     end
 
@@ -78,17 +104,62 @@ module HTTP3
       Budget.new(limit)
     end
 
+    # Limits of limit bytes in temporary files, and of files open at once,
+    # for the requests on every Session given it as attach's shared_spool.
+    def self.shared_spool(limit, files:)
+      Spool.new(Budget.new(limit), Budget.new(files))
+    end
+
+    # A temporary file in Dir.tmpdir for a request body, without a name and
+    # in binary mode. O_TMPFILE makes it without one; where the file system
+    # does not take that (overlayfs, NFS), a file made with a random name is
+    # unlinked at once. Raises SystemCallError when no file can be had.
+    def self.spool_file
+      dir = Dir.tmpdir
+      file = begin
+        File.open(dir, File::RDWR | File::TMPFILE, 0o600)
+      rescue Errno::EOPNOTSUPP, Errno::EISDIR, Errno::EINVAL
+        named = Tempfile.create(["http3-body-", ""], dir)
+        begin
+          File.unlink(named.path)
+        rescue SystemCallError
+          named.close
+          raise
+        end
+        named
+      end
+      # File::BINARY is 0 on Linux: only binmode makes the file ASCII-8BIT.
+      file.binmode
+      file
+    end
+
     # The requests received in full since the last call, each as
     # [request, status]: status is nil for the application to answer the
     # request, or the status to answer it with directly. A request answered
     # directly comes out as soon as it is refused, before the rest of it
-    # has arrived, with neither headers nor body. The bytes they held no
-    # longer count for the limits.
+    # has arrived, with neither headers nor body. The bytes they held in
+    # memory no longer count for the limits.
+    #
+    # The temporary file of a request for the application stays open, and
+    # counts for the spool's limits with its bytes, until its response body
+    # is done: once #respond returns for a response without a body or with
+    # a Body::File, once #fill_bodies has queued all of a Body::Chunks
+    # body, or when its stream closes. The application, or a body that
+    # reads rack.input as it goes, may read it until then. It is closed
+    # then, unless it is closed already.
     def take_requests
       done = @done
       @done = []
       done.each { |request, _| release_held(request.stream_id) }
       done
+    end
+
+    # The first exception a temporary file raised since the last call, or
+    # nil. The request it was for has been answered with 503.
+    def take_spool_error
+      error = @spool_error
+      @spool_error = nil
+      error
     end
 
     # Refuse with 408 the requests still coming in whose request_timeout
@@ -128,12 +199,15 @@ module HTTP3
       body = response.body
       submit_response(id, headers, !body.nil?)
       @answered[id] = true
-      return if body.nil?
+      if body.nil?
+        finish_input(id)
+        return
+      end
 
       # Only the pseudo-headers stay, for the log, while the body is sent:
       # the request body would otherwise be held all along, uncounted.
       pseudo = request.headers.select { |name, _| name.start_with?(":") }
-      @outgoing[id] = Outgoing.new(Request.new(stream_id: id, headers: pseudo, body: "".b), body, false)
+      @outgoing[id] = Outgoing.new(Request.new(stream_id: id, headers: pseudo, input: empty_input), body, false)
       return unless body.is_a?(Body::File)
 
       begin
@@ -143,6 +217,7 @@ module HTTP3
         yield e if block_given?
       ensure
         body.io.close
+        finish_input(id)
       end
     end
 
@@ -164,6 +239,7 @@ module HTTP3
         break if left && queued >= left
 
         queued += fill_body(out, limit, left && left - queued) { |error| yield out.request, error if block_given? }
+        finish_input(out.request.stream_id) if out.done
       end
       queued
     end
@@ -212,7 +288,7 @@ module HTTP3
 
     def on_begin_headers(id)
       @open[id] = true
-      @incoming[id] = Incoming.new([], [], "".b, Process.clock_gettime(Process::CLOCK_MONOTONIC))
+      @incoming[id] = Incoming.new([], [], empty_input, Process.clock_gettime(Process::CLOCK_MONOTONIC), 0)
     end
 
     def on_header(id, name, value)
@@ -237,21 +313,34 @@ module HTTP3
       request = @incoming[id] or return
       return if @rejected[id]
 
-      if request.body.bytesize + bytes.bytesize > @max_request_body
+      if request.received + bytes.bytesize > @max_request_body
         reject(id, request, 413)
+      elsif @spool_files.key?(id) || request.received + bytes.bytesize > @request_body_buffer_size
+        spool(id, request, bytes)
       elsif !hold(id, bytes.bytesize)
         reject(id, request, 503)
       else
-        request.body << bytes
+        request.body.write(bytes)
+        request.received += bytes.bytesize
       end
     end
 
     def on_end_stream(id)
       return if @rejected[id]
 
-      request = @incoming.delete(id) or return
+      request = @incoming[id] or return
+      input = request.body
+      begin
+        input.flush
+        input.rewind
+      rescue => e
+        @spool_error ||= e
+        return reject(id, request, 503)
+      end
+      @incoming.delete(id)
+      @spool_inputs[id] = input if input.is_a?(File)
       headers = request.pseudo + request.fields
-      @done << [Request.new(stream_id: id, headers: headers, body: request.body), nil]
+      @done << [Request.new(stream_id: id, headers: headers, input: input), nil]
     end
 
     # The client reset its side of the stream. A request it had not
@@ -261,18 +350,32 @@ module HTTP3
     def on_reset(id)
       return unless @incoming.key?(id) && !@rejected[id]
 
-      @incoming.delete(id)
+      request = @incoming.delete(id)
+      close_input(request.body)
       release_held(id)
+      release_spooled(id)
+      release_spool_file(id)
       @incomplete << id
     end
 
     private
 
-    def setup(max_request_body, budget, request_timeout)
+    def setup(max_request_body, budget, request_timeout, request_body_buffer_size, spool)
       @max_request_body = max_request_body
       @budget = budget
       @request_timeout = request_timeout
+      @request_body_buffer_size = request_body_buffer_size
+      @spool = spool
       @held = {}
+      # stream_id => bytes of the request's body counted in @spool.bytes,
+      # until its file is closed
+      @spooled = {}
+      # stream_id => true for a request whose file counts in @spool.files
+      @spool_files = {}
+      # stream_id => the temporary file of a request handed out, until its
+      # response body is done
+      @spool_inputs = {}
+      @spool_error = nil
       @incoming = {}
       @done = []
       @outgoing = {}
@@ -297,6 +400,85 @@ module HTTP3
       @budget.release(n)
     end
 
+    # Write bytes to the temporary file of the request on id, making it
+    # first if it has none: what the request has in memory goes to the
+    # file, and from the memory budget to the spool's. The request is
+    # answered with 503 if the spool limits have no room for it, or if its
+    # file cannot be made or written; the exception then waits for
+    # #take_spool_error. Inside a callback, so it lets nothing out.
+    def spool(id, request, bytes)
+      unless @spool_files.key?(id)
+        return reject(id, request, 503) unless @spool.files.reserve(1)
+
+        @spool_files[id] = true
+        in_memory = request.received
+        return reject(id, request, 503) unless reserve_spooled(id, in_memory)
+
+        file = open_spool
+        begin
+          file.write(request.body.string)
+        rescue
+          close_input(file)
+          raise
+        end
+        request.body = file
+        @held[id] = @held.fetch(id, 0) - in_memory
+        @budget.release(in_memory)
+      end
+      return reject(id, request, 503) unless reserve_spooled(id, bytes.bytesize)
+
+      request.body.write(bytes)
+      request.received += bytes.bytesize
+    rescue => e
+      @spool_error ||= e
+      reject(id, request, 503)
+    end
+
+    # The temporary file for a request body; tests replace it.
+    def open_spool
+      Session.spool_file
+    end
+
+    # Count n more bytes of the request on id in the spool, if it has room.
+    def reserve_spooled(id, n)
+      return false unless @spool.bytes.reserve(n)
+
+      @spooled[id] = @spooled.fetch(id, 0) + n
+      true
+    end
+
+    # The request on id holds no bytes in the spool any more. Calling it
+    # again does nothing.
+    def release_spooled(id)
+      n = @spooled.delete(id) or return
+      @spool.bytes.release(n)
+    end
+
+    # The temporary file of the request on id is closed: it no longer
+    # counts as open. Calling it again does nothing.
+    def release_spool_file(id)
+      @spool_files.delete(id) or return
+      @spool.files.release(1)
+    end
+
+    # The response body of the request on id is done: its temporary file,
+    # if it has one, is closed, and it and its bytes no longer count.
+    # Calling it again does nothing.
+    def finish_input(id)
+      input = @spool_inputs.delete(id) or return
+      close_input(input)
+      release_spooled(id)
+      release_spool_file(id)
+    end
+
+    # Close input unless the application has; a file that cannot be flushed
+    # is given up on all the same.
+    def close_input(input)
+      input.close unless input.closed?
+    rescue IOError, SystemCallError
+      nil
+    end
+
     # Answer the request on id with status, at once, instead of passing it
     # on: what has come of it is dropped, with the bytes it held, and
     # #respond stops reading the rest. Its Incoming stays in @incoming,
@@ -307,10 +489,14 @@ module HTTP3
     def reject(id, request, status)
       request.pseudo.clear
       request.fields.clear
-      request.body = "".b
+      close_input(request.body)
+      request.body = empty_input
+      request.received = 0
       release_held(id)
+      release_spooled(id)
+      release_spool_file(id)
       @rejected[id] = true
-      @done << [Request.new(stream_id: id, headers: [], body: "".b), status]
+      @done << [Request.new(stream_id: id, headers: [], input: empty_input), status]
     end
 
     # Queue chunks of out's body while its stream has less than limit bytes
@@ -349,10 +535,19 @@ module HTTP3
       queued
     end
 
+    # An input with no body, for the requests that keep none.
+    def empty_input
+      StringIO.new("".b)
+    end
+
     def release(id)
       @open.delete(id)
-      @incoming.delete(id)
+      incoming = @incoming.delete(id)
+      close_input(incoming.body) if incoming
       release_held(id)
+      release_spooled(id)
+      finish_input(id)
+      release_spool_file(id)
       @rejected.delete(id)
       @answered.delete(id)
       @done.reject! { |request, _| request.stream_id == id }

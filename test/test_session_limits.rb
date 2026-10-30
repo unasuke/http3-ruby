@@ -219,7 +219,7 @@ class TestSessionLimits < Minitest::Test
   def response_to(request, status)
     return HTTP3::Response.new(status: status, headers: [], body: nil) if status
 
-    body = (request.headers.assoc(":path").last == "/hello") ? "hello" : request.body
+    body = (request.headers.assoc(":path").last == "/hello") ? "hello" : request.input.read
     HTTP3::Response.new(status: 200, headers: [], body: HTTP3::Body::Chunks.new(enum: [body].each, rack_body: nil))
   end
 end

@@ -121,7 +121,7 @@ class TestSession < Minitest::Test
     assert_equal "body failed", error.message
     assert_equal id, request.stream_id
     assert_equal [":method", ":scheme", ":authority", ":path"], request.headers.map(&:first)
-    assert_empty request.body
+    assert_empty request.input.read
   end
 
   # nghttp3 would send a second response after the first, so respond
@@ -217,7 +217,7 @@ class TestSession < Minitest::Test
       body = (method == "HEAD") ? nil : HTTP3::Body::Chunks.new(enum: ["hel", "lo"].each, rack_body: nil)
       HTTP3::Response.new(status: 200, headers: [["content-type", "text/plain"]], body: body)
     when "/echo"
-      chunks = request.body.each_char.each_slice(16_384).map(&:join)
+      chunks = request.input.read.each_char.each_slice(16_384).map(&:join)
       HTTP3::Response.new(status: 200, headers: [], body: HTTP3::Body::Chunks.new(enum: chunks.each, rack_body: nil))
     when "/file"
       io = File.open(@file_path, "rb")

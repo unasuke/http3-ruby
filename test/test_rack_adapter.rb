@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "test_helper"
+require "rack/lint"
 require "socket"
 
 # HTTP3::RackAdapter's conversions, without a connection.
@@ -18,6 +19,20 @@ class TestRackAdapter < Minitest::Test
     assert_equal "https", env["rack.url_scheme"]
     assert_equal "HTTP/3", env["SERVER_PROTOCOL"]
     assert_equal "198.51.100.7", env["REMOTE_ADDR"]
+  end
+
+  # rack.input is the request's input itself, not a copy of it, and
+  # Rack::Lint takes it.
+  def test_rack_input_is_the_request_input
+    input = StringIO.new("payload".b)
+    env = env_for([[":path", "/"], [":authority", "localhost"]], input: input)
+    assert_same input, env["rack.input"]
+
+    adapter = HTTP3::RackAdapter.new(Rack::Lint.new(->(e) { [200, {}, [e["rack.input"].read]] }))
+    request = request([[":path", "/"], [":authority", "localhost"]], method: "POST", input: StringIO.new("payload".b))
+    response = adapter.call(request, remote: REMOTE)
+    assert_equal 200, response.status
+    assert_equal ["payload"], response.body.enum.to_a
   end
 
   # A request the Rack env cannot carry is answered with 400, and the
@@ -85,7 +100,7 @@ class TestRackAdapter < Minitest::Test
       [200, {}, []]
     end)
     request = HTTP3::Request.new(stream_id: 0, headers: [[":method", "CONNECT"], [":authority", "example.com:443"]],
-      body: "".b)
+      input: StringIO.new("".b))
     response = adapter.call(request, remote: REMOTE)
     assert_equal 501, response.status
     assert_empty response.headers
@@ -98,7 +113,7 @@ class TestRackAdapter < Minitest::Test
   def test_refusals_are_counted_until_taken
     adapter = HTTP3::RackAdapter.new(->(_env) { [400, {}, []] })
     connect = HTTP3::Request.new(stream_id: 0, headers: [[":method", "CONNECT"], [":authority", "example.com:443"]],
-      body: "".b)
+      input: StringIO.new("".b))
     assert_equal 501, adapter.call(connect, remote: REMOTE).status
     assert_equal 400, adapter.call(request([[":scheme", "ftp"], [":path", "/"], [":authority", "localhost"]]),
       remote: REMOTE).status
@@ -301,14 +316,14 @@ class TestRackAdapter < Minitest::Test
   private
 
   # A request with headers, and :method and :scheme ("https") unless headers
-  # has them.
-  def request(headers, method: "GET")
+  # has them, whose body is input.
+  def request(headers, method: "GET", input: StringIO.new("".b))
     defaults = [[":method", method], [":scheme", "https"]].reject { |name, _| headers.assoc(name) }
     HTTP3::Request.new(
       stream_id: 0,
       headers: [*defaults, *headers.select { |name, _| name.start_with?(":") },
         *headers.reject { |name, _| name.start_with?(":") }],
-      body: "".b
+      input: input
     )
   end
 
@@ -323,14 +338,14 @@ class TestRackAdapter < Minitest::Test
     [adapter.call(request(headers), remote: REMOTE), env]
   end
 
-  def env_for(headers)
+  def env_for(headers, input: StringIO.new("".b))
     env = nil
     adapter = HTTP3::RackAdapter.new(lambda do |e|
       env = e
       [200, {}, []]
     end)
     headers = [[":path", "/"], [":authority", "localhost"], *headers] unless headers.assoc(":path")
-    adapter.call(request(headers), remote: REMOTE)
+    adapter.call(request(headers, input: input), remote: REMOTE)
     env
   end
 

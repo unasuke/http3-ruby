@@ -46,12 +46,19 @@ module HTTP3
     # certificate_path is a PEM chain, leaf first; private_key_path a PEM key
     # without passphrase. qlog_dir writes one qlog file per connection.
     # max_request_body and max_field_section_size (bytes) bound a request's
-    # body (413 beyond) and header section (431 beyond).
-    # max_connection_request_buffer bounds the bytes the requests of a
-    # connection hold before they reach the application, and
-    # max_total_request_buffer those of every connection; a request that
-    # would pass either gets 503. They have to leave room for a request at
-    # the other two limits, or ArgumentError is raised. send_buffer_size
+    # body (413 beyond) and header section (431 beyond). A body over
+    # request_body_buffer_size bytes is written to a temporary file in
+    # Dir.tmpdir. max_connection_request_buffer bounds the bytes of memory
+    # the requests of a connection hold before they reach the application,
+    # and max_total_request_buffer those of every connection;
+    # max_connection_request_spool and max_total_request_spool bound the
+    # bytes in temporary files, which stay open until the response body is
+    # done, and max_connection_request_spool_files and
+    # max_total_request_spool_files the files open at once. A request that would pass any of them, or
+    # whose file cannot be made or written, gets 503. They have to leave
+    # room for a request at the limits on a server with nothing else under
+    # way, or ArgumentError is raised; and when bodies may go to files,
+    # Dir.tmpdir has to take one, or SystemCallError is. send_buffer_size
     # bounds the bytes of a response body queued but unsent per stream,
     # max_connection_send_buffer those of the array and each bodies of a
     # connection, and max_total_send_buffer those of every connection; a
@@ -62,10 +69,16 @@ module HTTP3
     def initialize(app:, bind:, certificate_path:, private_key_path:, transport_params: nil, settings: nil,
       qlog_dir: nil, max_connections: 1024, max_request_body: 1_048_576, max_field_section_size: 65_536,
       max_connection_request_buffer: 4_194_304, max_total_request_buffer: 67_108_864,
+      request_body_buffer_size: 65_536, max_connection_request_spool: 16_777_216,
+      max_total_request_spool: 1_073_741_824, max_connection_request_spool_files: 16,
+      max_total_request_spool_files: 256,
       send_buffer_size: 65_536, max_connection_send_buffer: 1_048_576, max_total_send_buffer: 67_108_864,
       request_timeout: 30, refusal_log_interval: 60, shutdown_timeout: 30, logger: Logger.new($stderr))
-      check_request_limits(max_request_body, max_field_section_size, max_connection_request_buffer,
-        max_total_request_buffer)
+      check_request_limits(max_request_body:, max_field_section_size:, max_connection_request_buffer:,
+        max_total_request_buffer:, request_body_buffer_size:, max_connection_request_spool:,
+        max_total_request_spool:, max_connection_request_spool_files:, max_total_request_spool_files:)
+      # Found out now rather than by the first large request.
+      Session.spool_file.close if max_request_body > request_body_buffer_size
       check_send_limits(send_buffer_size, max_connection_send_buffer, max_total_send_buffer)
       check_request_timeout(request_timeout)
       check_refusal_log_interval(refusal_log_interval)
@@ -84,6 +97,11 @@ module HTTP3
       @max_field_section_size = max_field_section_size
       @max_connection_request_buffer = max_connection_request_buffer
       @max_total_request_buffer = max_total_request_buffer
+      @request_body_buffer_size = request_body_buffer_size
+      @max_connection_request_spool = max_connection_request_spool
+      @max_total_request_spool = max_total_request_spool
+      @max_connection_request_spool_files = max_connection_request_spool_files
+      @max_total_request_spool_files = max_total_request_spool_files
       @send_buffer_size = send_buffer_size
       @max_connection_send_buffer = max_connection_send_buffer
       @max_total_send_buffer = max_total_send_buffer
@@ -106,6 +124,9 @@ module HTTP3
       @sessions = {}
       @remotes = {}
       @request_buffer = Session.shared_buffer(@max_total_request_buffer)
+      @request_spool = Session.shared_spool(@max_total_request_spool, files: @max_total_request_spool_files)
+      # When request_spool_failed was last logged; nil until then.
+      @spool_failure_logged_at = nil
       @blocked_send = nil
       @phase = :serving
       @drain_deadline = nil
@@ -199,7 +220,9 @@ module HTTP3
       @sessions[conn] = Session.attach(
         conn, max_request_body: @max_request_body, max_field_section_size: @max_field_section_size,
         max_connection_request_buffer: @max_connection_request_buffer, shared_buffer: @request_buffer,
-        request_timeout: @request_timeout
+        request_timeout: @request_timeout, request_body_buffer_size: @request_body_buffer_size,
+        max_connection_request_spool: @max_connection_request_spool,
+        max_connection_request_spool_files: @max_connection_request_spool_files, shared_spool: @request_spool
       )
       @remotes[conn] = sender
     rescue => e
@@ -312,6 +335,9 @@ module HTTP3
         if (error = session.take_error)
           log(:error, "session_error", remote: remote_of(conn), **error_fields(error))
         end
+        if (error = session.take_spool_error)
+          log_spool_failure(conn, error)
+        end
         session.release_closed { |stream_id, e| log_body_close_error(stream_id, e) }
       end
       @endpoint.take_closed.each do |conn|
@@ -391,11 +417,14 @@ module HTTP3
     end
 
     # Raise ArgumentError for the first request limit found wrong: each has
-    # to be an Integer in range, and the buffers have to let a request at
+    # to be an Integer in range, and the limits have to let a request at
     # max_request_body and max_field_section_size through on a server with
-    # nothing else under way.
-    def check_request_limits(max_request_body, max_field_section_size, max_connection_request_buffer,
-      max_total_request_buffer)
+    # nothing else under way. A body over request_body_buffer_size goes to a
+    # temporary file, so then memory has to hold only that much of it, and
+    # the spool all of it.
+    def check_request_limits(max_request_body:, max_field_section_size:, max_connection_request_buffer:,
+      max_total_request_buffer:, request_body_buffer_size:, max_connection_request_spool:,
+      max_total_request_spool:, max_connection_request_spool_files:, max_total_request_spool_files:)
       unless max_request_body.is_a?(Integer) && max_request_body >= 0
         raise ArgumentError, "max_request_body must be an Integer of 0 or more (got #{max_request_body.inspect})"
       end
@@ -404,17 +433,37 @@ module HTTP3
       unless max_field_section_size.is_a?(Integer) && (1...2**62).cover?(max_field_section_size)
         raise ArgumentError, "max_field_section_size must be 1..2**62-1 (got #{max_field_section_size.inspect})"
       end
-      {max_connection_request_buffer:, max_total_request_buffer:}.each do |name, value|
+      {max_connection_request_buffer:, max_total_request_buffer:, request_body_buffer_size:,
+       max_connection_request_spool:, max_total_request_spool:, max_connection_request_spool_files:,
+       max_total_request_spool_files:}.each do |name, value|
         raise ArgumentError, "#{name} must be a positive Integer (got #{value.inspect})" unless value.is_a?(Integer) && value.positive?
       end
-      request = max_request_body + max_field_section_size
+      spooled = max_request_body > request_body_buffer_size
+      in_memory, terms = if spooled
+        [request_body_buffer_size, "request_body_buffer_size + max_field_section_size"]
+      else
+        [max_request_body, "max_request_body + max_field_section_size"]
+      end
+      request = in_memory + max_field_section_size
       if max_connection_request_buffer < request
         raise ArgumentError, "max_connection_request_buffer (#{max_connection_request_buffer}) must be at least " \
-          "max_request_body + max_field_section_size (#{request})"
+          "#{terms} (#{request})"
       end
       if max_total_request_buffer < max_connection_request_buffer
         raise ArgumentError, "max_total_request_buffer (#{max_total_request_buffer}) must be at least " \
           "max_connection_request_buffer (#{max_connection_request_buffer})"
+      end
+      if spooled && max_connection_request_spool < max_request_body
+        raise ArgumentError, "max_connection_request_spool (#{max_connection_request_spool}) must be at least " \
+          "max_request_body (#{max_request_body})"
+      end
+      if max_total_request_spool < max_connection_request_spool
+        raise ArgumentError, "max_total_request_spool (#{max_total_request_spool}) must be at least " \
+          "max_connection_request_spool (#{max_connection_request_spool})"
+      end
+      if max_total_request_spool_files < max_connection_request_spool_files
+        raise ArgumentError, "max_total_request_spool_files (#{max_total_request_spool_files}) must be at least " \
+          "max_connection_request_spool_files (#{max_connection_request_spool_files})"
       end
     end
 
@@ -473,6 +522,18 @@ module HTTP3
       path = pseudo.fetch(":path", "")[/\A[^?]*/]
       log(:error, "app_error", remote: remote_of(conn), stream: request.stream_id, method: pseudo[":method"],
         path: path, **error_fields(error))
+    end
+
+    # A temporary file for a request body could not be made or written
+    # (the request got 503). While the disk is full every large request
+    # fails, so after one line, those within refusal_log_interval seconds
+    # are not logged.
+    def log_spool_failure(conn, error)
+      at = now
+      return if @spool_failure_logged_at && at < @spool_failure_logged_at + @refusal_log_interval
+
+      @spool_failure_logged_at = at
+      log(:error, "request_spool_failed", remote: remote_of(conn), error: error.class, message: error.message)
     end
 
     def log_body_error(conn, request, error)
