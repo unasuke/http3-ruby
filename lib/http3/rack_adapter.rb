@@ -5,7 +5,8 @@ require "uri"
 
 module HTTP3
   # Calls a Rack 3 application for an HTTP3::Request and turns what it
-  # returns into an HTTP3::Response.
+  # returns into an HTTP3::Response. Several threads may call it at once,
+  # each for a request of its own.
   class RackAdapter
     # The application's response breaks the Rack 3 specification; the
     # server answers 500 instead.
@@ -34,27 +35,38 @@ module HTTP3
     # specification).
     FORBIDDEN_IN_VALUE = /[\0\r\n]/
 
-    def initialize(app)
+    # A body read with each goes through a Body::Pipe of pipe_capacity
+    # bytes, whose wake is wake.
+    def initialize(app, pipe_capacity:, wake:)
       @app = app
+      @pipe_capacity = pipe_capacity
+      @wake = wake
       @refusals = Hash.new(0)
+      @refusals_lock = Thread::Mutex.new
     end
 
-    # remote is the client's address, an Addrinfo. CONNECT is answered with
-    # 501, and a request the Rack env cannot carry with 400, without calling
-    # the application; #take_refusals counts them. Raises whatever the
-    # application raises, and InvalidResponse for a response that cannot be
-    # sent; the Rack body is closed in both cases.
+    # Returns [response, fill]. remote is the client's address, an
+    # Addrinfo. CONNECT is answered with 501, and a request the Rack env
+    # cannot carry with 400, without calling the application;
+    # #take_refusals counts them. Raises whatever the application raises,
+    # and InvalidResponse for a response that cannot be sent; the Rack body
+    # is closed in both cases.
+    #
+    # fill is nil, the Rack body closed already, unless the body is read
+    # with each: its response has a Body::Pipe, and fill, called once the
+    # response has been handed over, writes the body to it and closes the
+    # Rack body.
     def call(request, remote:)
       # The server cannot open a tunnel (RFC 9114 section 4.4), and a
       # CONNECT request has neither :scheme nor :path, so the env would be
       # made up. The Session leaves nghttp3's enable_connect_protocol off,
       # so nghttp3 refuses the :protocol of an extended CONNECT (RFC 9220).
-      return refuse(501) if request.headers.assoc(":method")&.last == "CONNECT"
+      return [refuse(501), nil] if request.headers.assoc(":method")&.last == "CONNECT"
 
       env = env_for(request, remote)
     rescue BadRequest
       # Not logged: the client sent it, the server did not fail.
-      refuse(400)
+      [refuse(400), nil]
     else
       status, headers, body = @app.call(env)
       response_for(request, status, headers, body)
@@ -63,15 +75,17 @@ module HTTP3
     # The requests answered without the application since the last call,
     # as {status => count}; the count starts over.
     def take_refusals
-      refusals = @refusals
-      @refusals = Hash.new(0)
-      refusals
+      @refusals_lock.synchronize do
+        refusals = @refusals
+        @refusals = Hash.new(0)
+        refusals
+      end
     end
 
     private
 
     def refuse(status)
-      @refusals[status] += 1
+      @refusals_lock.synchronize { @refusals[status] += 1 }
       Response.new(status: status, headers: [], body: nil)
     end
 
@@ -151,10 +165,12 @@ module HTTP3
       end
     end
 
-    # The Rack body is closed here unless it goes on in the Response, or
-    # to_ary has closed it (body_for yields then).
+    # [response, fill]. The Rack body is closed here, before anything is
+    # sent, unless fill goes on with it, or to_ary has closed it (body_for
+    # yields then). Rack 3 only says it is closed "typically after" the
+    # body has been sent, and the Body::File reads the file through a
+    # descriptor of its own.
     def response_for(request, status, headers, body)
-      response = nil
       status = Integer(status)
       # A 1xx is no final response, which is all HTTP/3 can send here (Rack
       # Lint only asks for 100 or more).
@@ -168,15 +184,21 @@ module HTTP3
       length = content_length(headers)
 
       method = request.headers.assoc(":method")&.last
-      response = if method == "HEAD" || status == 204 || status == 304
+      if method == "HEAD" || status == 204 || status == 304
         # No body is sent, so content-length is not held against one.
-        close_rack_body(body)
-        Response.new(status: status, headers: headers, body: nil)
-      else
-        Response.new(status: status, headers: headers, body: body_for(body, length) { body = nil })
+        return [Response.new(status: status, headers: headers, body: nil), nil]
       end
+
+      sent, fill = body_for(body, length) { body = nil }
+      [Response.new(status: status, headers: headers, body: sent), fill]
     ensure
-      close_rack_body(body) if response.nil?
+      begin
+        close_rack_body(body)
+      rescue
+        # The response goes nowhere: a 500 replaces it.
+        sent.io.close if sent.is_a?(Body::File)
+        raise
+      end
     end
 
     # The content-length among headers, as an Integer, or nil if there is
@@ -214,9 +236,10 @@ module HTTP3
       pairs
     end
 
-    # The body to send. One whose length is known before it is sent, a file
-    # or an Array, is held against length, the content-length, now; one
-    # read with each, as it is read (#counted).
+    # [the body to send, fill]. One whose length is known before it is
+    # sent, a file or an Array, is held against length, the content-length,
+    # now; one read with each, as fill reads it. body_for yields when the
+    # Rack body is no longer for response_for to close.
     def body_for(body, length)
       if body.respond_to?(:to_path)
         io = ::File.open(body.to_path, "rb")
@@ -225,7 +248,7 @@ module HTTP3
           io.close
           raise length_mismatch(size)
         end
-        Body::File.new(io: io, offset: 0, length: io.size, rack_body: body)
+        [Body::File.new(io: io, offset: 0, length: io.size, rack_body: nil), nil]
       elsif body.respond_to?(:to_ary)
         # Rack 3 has to_ary close the body itself.
         chunks = body.to_ary
@@ -238,32 +261,45 @@ module HTTP3
         size = chunks.sum(&:bytesize)
         raise length_mismatch(size) if length && size != length
 
-        Body::Chunks.new(enum: chunks.each, rack_body: nil)
+        [Body::Chunks.new(enum: chunks.each, rack_body: nil), nil]
       elsif body.respond_to?(:each)
-        enum = length ? counted(body, length) : body.to_enum(:each)
-        Body::Chunks.new(enum: enum, rack_body: body)
+        pipe = Body::Pipe.new(capacity: @pipe_capacity, wake: @wake)
+        yield
+        [pipe, -> { fill(body, pipe, length) }]
       else
         raise InvalidResponse, "streaming bodies (#{body.class}) are not supported"
       end
     end
 
-    # The chunks of body's each, raising InvalidResponse from next once they
-    # pass length bytes, or end short of it. Session#fill_bodies aborts the
-    # stream then, since the headers have gone. A chunk that is not a String
-    # goes on to fill_bodies, which refuses it.
-    def counted(body, length)
-      Enumerator.new do |y|
-        size = 0
-        body.each do |chunk|
-          size += chunk.bytesize if chunk.is_a?(String)
-          if size > length
-            raise InvalidResponse, "the body is at least #{size} bytes but content-length says otherwise"
-          end
+    # Write the chunks of body's each to pipe, and end it. A chunk that is
+    # not a String, one that takes the body past length bytes, an end short
+    # of it, and an exception from each fail the pipe, and the stream is
+    # aborted then, since the headers have gone. A pipe the server has given
+    # up on (the client reset the stream, say) makes write raise
+    # StreamClosed, and the body stops there, without failing. The Rack
+    # body is closed in every case; an exception from its close is raised.
+    def fill(body, pipe, length)
+      size = 0
+      body.each do |chunk|
+        raise InvalidResponse, "body chunk must be a String (got #{chunk.class})" unless chunk.is_a?(String)
 
-          y << chunk
+        size += chunk.bytesize
+        if length && size > length
+          raise InvalidResponse, "the body is at least #{size} bytes but content-length says otherwise"
         end
-        raise length_mismatch(size) if size < length
+
+        pipe.write(chunk)
       end
+      raise length_mismatch(size) if length && size < length
+
+      pipe.finish
+    rescue StreamClosed
+      nil
+    rescue Exception => e # rubocop:disable Lint/RescueException
+      # Even exit, on a worker, ends only the body.
+      pipe.fail(e)
+    ensure
+      close_rack_body(body)
     end
 
     def length_mismatch(size)

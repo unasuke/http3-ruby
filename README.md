@@ -11,8 +11,16 @@ links in statically. The nghttp3 bindings are also there to use directly, as
 
 It is not suited for production yet:
 
-- The application is called on the thread that drives every connection, one
-  request at a time, so a slow request holds up all the others.
+- The application runs on `threads:` worker threads. A worker stays with a
+  request until its response body has been generated, so an `each` body
+  that its client reads slowly, or not at all, keeps the thread, with no
+  time limit; once every worker is taken, other requests wait, and get 503
+  after `request_timeout:`.
+- The workers share Ruby's GVL with the thread that drives every connection,
+  so an application busy on the CPU delays packet handling. Ruby 3.4 and
+  later can shorten that with `RUBY_THREAD_TIMESLICE`.
+- A request whose client goes away is not interrupted: the application runs
+  to its end.
 - Streaming response bodies (`call`) are not supported.
 - CI runs it on Ruby 4.0 alone, not on 3.3, the oldest it installs on. It is
   checked against curl and the clients of quic-interop-runner, over links
@@ -63,9 +71,10 @@ Other options, with their defaults:
 | Option | Default | |
 | --- | --- | --- |
 | `max_connections:` | `1024` | Connections at once; more are refused with CONNECTION_REFUSED |
+| `threads:` | `3` | Worker threads that call the application |
 | `max_request_body:` | `1_048_576` | Bytes of request body; more gets 413 |
 | `max_field_section_size:` | `65_536` | Bytes of request headers (RFC 9114 §4.2.2); more gets 431 |
-| `max_connection_request_buffer:` | `4_194_304` | Bytes of memory a connection's requests may hold before they reach the application (headers counted as RFC 9114 §4.2.2 does, and bodies up to `request_body_buffer_size:`); more gets 503 |
+| `max_connection_request_buffer:` | `4_194_304` | Bytes of memory a connection's requests may hold until the application is done with them (headers counted as RFC 9114 §4.2.2 does, and bodies up to `request_body_buffer_size:`); more gets 503 |
 | `max_total_request_buffer:` | `67_108_864` | The same over all connections; more gets 503 |
 | `request_body_buffer_size:` | `65_536` | Bytes of a request body kept in memory; a longer body goes to a temporary file, all of it |
 | `max_connection_request_spool:` | `16_777_216` | Bytes of request bodies a connection may hold in temporary files; more gets 503 |
@@ -75,7 +84,7 @@ Other options, with their defaults:
 | `send_buffer_size:` | `65_536` | Bytes of a response body queued but unsent per stream |
 | `max_connection_send_buffer:` | `1_048_576` | Bytes of array and `each` response bodies a connection may have queued but unsent; more waits |
 | `max_total_send_buffer:` | `67_108_864` | The same over all connections |
-| `request_timeout:` | `30` | Seconds a request may take to come in full, counted from its headers; later gets 408. `nil` for no limit |
+| `request_timeout:` | `30` | Seconds a request may take to come in full, counted from its headers (later gets 408), and then to wait for a worker (later gets 503). `nil` for no limit |
 | `refusal_log_interval:` | `60` | Seconds between the `requests_refused` log lines, which count the requests answered without the application (400, 408, 413, 431, 501, 503) |
 | `shutdown_timeout:` | `30` | Seconds a graceful stop waits for the requests under way |
 | `qlog_dir:` | `nil` | Directory for one qlog file per connection |

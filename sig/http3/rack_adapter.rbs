@@ -13,18 +13,23 @@ module HTTP3
     # What :authority, or host, must look like.
     AUTHORITY: Regexp
 
-    def initialize: (untyped app) -> void
+    # A body read with each goes through a Body::Pipe of pipe_capacity
+    # bytes, whose wake is wake.
+    def initialize: (untyped app, pipe_capacity: Integer, wake: ^() -> void) -> void
 
-    # Answers, without calling the application, CONNECT with 501, and with
-    # 400 a request whose scheme is not http or https, whose path has a
-    # fragment, or whose authority is malformed or differs from its host
-    # field. Raises what the application raises, and InvalidResponse for an
-    # answer that cannot be sent (among them a status outside 200..599, and
-    # a content-length that is malformed or that a file or array body does
-    # not have); the Rack body is closed either way. A body read with each
-    # raises InvalidResponse from next once it passes content-length or ends
-    # short of it.
-    def call: (Request request, remote: Addrinfo) -> Response
+    # Returns [response, fill]. Answers, without calling the application,
+    # CONNECT with 501, and with 400 a request whose scheme is not http or
+    # https, whose path has a fragment, or whose authority is malformed or
+    # differs from its host field. Raises what the application raises, and
+    # InvalidResponse for an answer that cannot be sent (among them a
+    # status outside 200..599, and a content-length that is malformed or
+    # that a file or array body does not have); the Rack body is closed
+    # either way. fill is nil, the Rack body closed already, unless the
+    # body is read with each: then the response has a Body::Pipe, and fill
+    # writes the body to it, fails it once the body passes content-length,
+    # ends short of it, yields a chunk that is not a String or raises, and
+    # closes the Rack body.
+    def call: (Request request, remote: Addrinfo) -> [Response, (^() -> void)?]
 
     # The 400s and 501s #call answered since the last call, as
     # {status => count}; the count starts over.

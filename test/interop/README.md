@@ -96,23 +96,57 @@ make the server use up its memory. It starts an `HTTP3::Server` of its own in
 a child process, since `server.rb` serves files, which the server reads only
 as it sends them. Its `/big` is a 10 MiB `each` body and `/small` a short one.
 The script opens 100 connections, and on each asks for `/big` 100 times and
-reads none of them. With its default limits the server keeps no more than
-1 MiB of them unsent per connection (`max_connection_send_buffer`) and 64 MiB
-in all (`max_total_send_buffer`). While the total is full, other connections'
-bodies wait too.
+reads none of them. A worker writes an `each` body as the connection takes
+it, so the first three `/big` keep the three workers waiting, with no more
+than `send_buffer_size` of each queued, and the other requests wait for a
+worker; so does a `/small` on another connection, until the connections not
+reading have gone. The workers wait with no time limit, as the README's
+limitations say.
 
 ```sh
 bundle exec ruby test/interop/stall_responses.rb [--connections 100] [--streams 100] \
   [--timeout 120]
 ```
 
-It prints the server's resident set size before and once the total is full.
+It prints the server's resident set size before and while the workers wait.
 It exits non-zero unless the server is still running, a `/small` on a new
-connection gets its status but not its body within 2 seconds while the total
-is full, and the rest of it once the connections not reading have closed; or
-when a connection fails, or it takes more than `--timeout` seconds. The
-resident set size should grow by about 64 MiB, not by the 100 GB asked for;
-without the limits it grew past 300 MiB, and the connections timed out.
+connection gets no answer within 2 seconds while the workers wait, and all of
+it once the connections not reading have closed; or when a connection fails,
+or it takes more than `--timeout` seconds. The resident set size should grow
+by about 50 MiB, mostly for the 10,000 requests waiting, not by the 100 GB
+asked for. Before the workers, when the thread that drives the connections
+read the bodies, the server kept no more than `max_connection_send_buffer`
+(1 MiB) of them per connection and `max_total_send_buffer` (64 MiB) in all,
+and the resident set size grew by about 64 MiB; without those limits it grew
+past 300 MiB, and the connections timed out.
+
+## Requests that keep the workers busy
+
+`slow_requests.rb` checks that requests keeping the workers busy do not hold
+up the thread that drives the connections. It starts an `HTTP3::Server` of
+its own in a child process, with `threads: 3`. One connection keeps a `/cpu`
+(2 seconds of busy loop, which holds Ruby's GVL) and a `/sleep` (5 seconds)
+under way all the while, which take two of the workers; on the third,
+another connection asks for `/small` again and again, and new connections
+are set up in between. One worker is left free, or `/small` would wait for
+it and the check measure the queue rather than the GVL.
+
+```sh
+bundle exec ruby test/interop/slow_requests.rb [--duration 10] [--max-latency 0.25] \
+  [--priority N] [--timeout 120]
+```
+
+It prints the median and the largest of the `/small` round trips and of the
+handshakes, and exits non-zero when the largest of either is over
+`--max-latency` seconds, when a request does not get 200, or when it takes
+more than `--timeout` seconds. `--priority` sets the workers' priority
+(`HTTP3::WorkerPool::WORKER_PRIORITY`, -3) to compare: on Ruby 4.0.9, a
+`/small` took 0.058 seconds at the median and up to 0.14 at -3, 0.30 and up
+to 0.60 at 0, the priority of the other threads; a handshake 0.021 and up to
+0.06, against 0.10 and 0.30. A round trip waits for the GVL a few times,
+each up to the busy worker's time slice, which Ruby 3.4 and later shorten
+with `RUBY_THREAD_TIMESLICE`: at 20 (milliseconds), a `/small` took 0.028
+and up to 0.05.
 
 ## quic-interop-runner
 

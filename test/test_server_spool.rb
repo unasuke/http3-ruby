@@ -27,6 +27,8 @@ class TestServerSpool < Minitest::Test
     "test_connections_share_the_total_spool" => {max_connection_request_spool: 4_000, max_total_request_spool: 4_000},
     "test_connections_share_the_total_spool_files" =>
       {max_connection_request_spool_files: 1, max_total_request_spool_files: 1},
+    "test_spool_counts_until_the_application_is_done_with_a_gone_connection" =>
+      {max_connection_request_spool: 4_000, max_total_request_spool: 4_000, max_connections: 1},
     "test_503_and_one_log_line_when_a_file_cannot_be_written" => {max_request_body: 200_000}
   }.freeze
 
@@ -38,9 +40,12 @@ class TestServerSpool < Minitest::Test
     @dir = Dir.mktmpdir("http3-spool-")
     @log_path = File.join(@dir, "server.log")
     @clients = []
-    # /block waits for a byte on this pipe before it reads its body.
+    # /block writes a byte to the second pipe, then waits for a byte on the
+    # first before it reads its body.
     @release_r, @release_w = IO.pipe
+    @started_r, @started_w = IO.pipe
     release_r = @release_r
+    started_w = @started_w
     limit_file_size = name == "test_503_and_one_log_line_when_a_file_cannot_be_written"
     @pid, @port = start_server(
       log_path: @log_path,
@@ -54,7 +59,10 @@ class TestServerSpool < Minitest::Test
         Process.setrlimit(:FSIZE, FILE_SIZE_LIMIT)
       end
       lambda do |env|
-        release_r.read(1) if env["PATH_INFO"] == "/block"
+        if env["PATH_INFO"] == "/block"
+          started_w.write("s")
+          release_r.read(1)
+        end
         input = env["rack.input"]
         digest = Digest::SHA256.new
         size = 0
@@ -72,12 +80,14 @@ class TestServerSpool < Minitest::Test
       end
     end
     @release_r.close
+    @started_w.close
   end
 
   def teardown
     @clients.each(&:close)
     @release_w.close
     stop_server(@pid) if @pid
+    @started_r.close
     FileUtils.remove_entry(@dir)
   end
 
@@ -142,6 +152,22 @@ class TestServerSpool < Minitest::Test
     eventually(timeout: 5) { assert_equal 200, post(connect, "y" * 2_000).status }
   end
 
+  # A request the application has still counts in the spool once its
+  # connection has gone, until the application is done with it: the
+  # worker still has its file. The server takes one connection at a time,
+  # so the second gets in once the first has gone.
+  def test_spool_counts_until_the_application_is_done_with_a_gone_connection
+    first = connect
+    first.request(:post, "/block", body: "x" * 4_000)
+    first.pump_until { @started_r.wait_readable(0) }
+    first.close
+    @clients.delete(first)
+    second = connect_once_free
+    assert_equal 503, post(second, "y" * 2_000).status
+    @release_w.write("x")
+    eventually(timeout: 5) { assert_equal 200, post(second, "y" * 2_000).status }
+  end
+
   # A file that cannot be written (here, past RLIMIT_FSIZE) gets the
   # request 503 and a request_spool_failed line; the next failure, within
   # refusal_log_interval, gets no line of its own.
@@ -200,6 +226,19 @@ class TestServerSpool < Minitest::Test
 
   def connect
     H3TestClient::QuicTransport.connect(@port, ca_file: credentials.ca_file).tap { |client| @clients << client }
+  end
+
+  # Connect, again and again while the server refuses the connection.
+  def connect_once_free
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
+    begin
+      connect
+    rescue QUIC::Error
+      raise if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+
+      sleep 0.1
+      retry
+    end
   end
 
   def post(client, body)

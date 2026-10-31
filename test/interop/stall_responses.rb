@@ -2,23 +2,24 @@
 
 # A manual check that responses clients do not read cannot make
 # HTTP3::Server use up its memory. Every connection asks for big each
-# bodies and reads none of them, so that the server has to stop sending
-# and keep what it queued; with its default limits it keeps no more than
-# max_connection_send_buffer (1 MiB) per connection and
-# max_total_send_buffer (64 MiB) in all. While the total is full, other
-# connections' bodies wait too.
+# bodies and reads none of them. A worker writes an each body as the
+# connection takes it, so the first three bodies keep the three workers
+# (threads) waiting, with no more than send_buffer_size of each queued,
+# and the other requests wait for a worker. A /small on another connection
+# waits too, until the connections not reading have gone. (The workers
+# wait with no time limit; the README says so.)
 #
 #   bundle exec ruby test/interop/stall_responses.rb [--connections 100] \
 #     [--streams 100] [--timeout 120]
 #
 # Starts an HTTP3::Server in a child process, with /big (10 MiB, 16 KiB at
 # a time) and /small, and prints the server's resident set size before and
-# once the total is full. Exits non-zero unless the server is still
-# running, a /small on a new connection gets its status but not its body
-# within 2 seconds while the total is full, and the rest of it once the
-# connections not reading have closed; or when a connection fails or it
-# takes more than --timeout seconds. Needs the extension compiled (bundle
-# exec rake compile) and Linux, for /proc.
+# while the workers wait. Exits non-zero unless the server is still
+# running, a /small on a new connection gets no answer within 2 seconds
+# while the workers wait, and all of it once the connections not reading
+# have closed; or when a connection fails or it takes more than --timeout
+# seconds. Needs the extension compiled (bundle exec rake compile) and
+# Linux, for /proc.
 
 $LOAD_PATH.unshift File.expand_path("../../lib", __dir__)
 require "http3"
@@ -123,23 +124,18 @@ Dir.mktmpdir("http3-stall-") do |work|
         client.pump
       end
 
-      # Until a /small on a new connection gets no body for 2 seconds, the
-      # total has room left: let the stalled connections take more.
-      small = id = nil
-      loop do
-        pump_for(stalled, 1)
-        small = connect(port, credentials.ca_file).tap { |c| others << c }
-        id = small.request(:get, "/small")
-        small.pump_until(timeout: 10) { small.response(id).status }
-        pump_for([small, *stalled], 2)
-        break unless small.response(id).finished?
-      end
-      puts "server RSS with the total full: #{rss_kib(pid)} KiB"
+      # For the workers to take the first bodies and stop.
+      pump_for(stalled, 1)
+      small = connect(port, credentials.ca_file).tap { |c| others << c }
+      id = small.request(:get, "/small")
+      pump_for([small, *stalled], 2)
+      puts "server RSS while the workers wait: #{rss_kib(pid)} KiB"
 
       check.call("the server is running", alive?(pid))
-      check.call("/small waits while the total is full", small.response(id).status == 200 && !small.response(id).finished?)
+      check.call("/small waits for a worker", small.response(id).nil? || small.response(id).status.nil?)
       stalled.each(&:close)
-      small.pump_until(timeout: 30) { small.response(id).finished? }
+      # Within request_timeout (30 seconds) of the request, or it gets 503.
+      small.pump_until(timeout: 20) { small.response(id)&.finished? }
       check.call("/small ends once those connections have closed", small.response(id).body == "small",
         small.response(id).status)
     end

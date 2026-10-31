@@ -207,7 +207,13 @@ class TestSessionLimits < Minitest::Test
     until @stop
       conn.pump_once(timeout: 0.002)
       session.expire_requests(Process.clock_gettime(Process::CLOCK_MONOTONIC))
-      session.take_requests.each { |request, status| session.respond(request, response_to(request, status)) }
+      session.take_refusals.each { |request, status| session.respond(request, response_to(request, status)) }
+      while (request = session.next_request)
+        session.respond(request, response_to(request, nil))
+        # The body has what it needs of the request.
+        request.input.close
+        session.finish(request.stream_id)
+      end
       session.fill_bodies(65_536)
       session.release_closed
       error = session.take_error and raise error

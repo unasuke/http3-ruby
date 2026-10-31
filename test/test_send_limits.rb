@@ -104,7 +104,11 @@ class TestSendLimits < Minitest::Test
     session = HTTP3::Session.attach(conn, max_request_body: 1_024, max_field_section_size: 4_096)
     until @stop
       conn.pump_once(timeout: 0.002)
-      session.take_requests.each { |request, _status| session.respond(request, big_response) }
+      session.take_refusals.each { |request, _status| session.respond(request, big_response) }
+      while (request = session.next_request)
+        session.respond(request, big_response)
+        session.finish(request.stream_id)
+      end
       room = @total && @total - session.unsent_total
       session.fill_bodies(STREAM_LIMIT, connection_limit: @connection_limit, room: room)
       unsent = session.unsent_total
