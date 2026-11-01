@@ -73,9 +73,9 @@ module HTTP3
     # bodies may go to files, Dir.tmpdir has to take one, or
     # SystemCallError is. send_buffer_size
     # bounds the bytes of a response body queued but unsent per stream,
-    # max_connection_send_buffer those of the array and each bodies of a
-    # connection, and max_total_send_buffer those of every connection; a
-    # body waits for room. Each has to be at least the one before. A request
+    # max_connection_send_buffer those of the array, each and streaming
+    # bodies of a connection, and max_total_send_buffer those of every
+    # connection; a body waits for room. Each has to be at least the one before. A request
     # not received in full within request_timeout seconds of the start of
     # its headers gets 408, and one that waits that long for a worker
     # afterwards 503; nil is no limit. refusal_log_interval is the seconds
@@ -363,21 +363,26 @@ module HTTP3
       end
       drop_body(body) unless sent
       begin
-        fill&.call
+        late_error = fill&.call
       rescue Exception => e # rubocop:disable Lint/RescueException
         # fill fails the pipe itself; what gets out of it is the close of
         # the Rack body, after the body has ended.
         body.fail(e)
         close_error = e
       end
+      # What the body raised once its stream could no longer be aborted
+      # (after it closed the stream, say): the response has been handed
+      # over, so it is only logged.
+      put_result(:error, job, late_error) if late_error
     ensure
       close_input(job.request.input)
       put_result(:done, job, close_error)
     end
 
     # From a worker: kind is :response (value the Response), :error (value
-    # what the application raised) or :done (value an exception from the
-    # close of the Rack body, or nil).
+    # what the application raised, or what its body raised after its
+    # response was handed over) or :done (value an exception from the close
+    # of the Rack body, or nil).
     def put_result(kind, job, value)
       @results << [kind, job, value]
       wake
@@ -424,6 +429,8 @@ module HTTP3
           deliver(job, value)
         when :error
           log_app_error(remote_label(job.remote), job.request, value)
+          # A request whose response came before finds it answered, and gets
+          # no 500.
           deliver(job, Response.new(status: 500, headers: [], body: nil))
         when :done
           @jobs.delete(job)
@@ -482,7 +489,8 @@ module HTTP3
       end
     end
 
-    # What max_total_send_buffer has left for array and each bodies.
+    # What max_total_send_buffer has left for array, each and streaming
+    # bodies.
     def send_room
       @max_total_send_buffer - @sessions.each_value.sum(&:unsent_total)
     end

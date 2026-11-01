@@ -12,16 +12,17 @@ links in statically. The nghttp3 bindings are also there to use directly, as
 It is not suited for production yet:
 
 - The application runs on `threads:` worker threads. A worker stays with a
-  request until its response body has been generated, so an `each` body
-  that its client reads slowly, or not at all, keeps the thread, with no
-  time limit; once every worker is taken, other requests wait, and get 503
-  after `request_timeout:`.
+  request until its response body has been generated, so an `each` or
+  streaming body keeps the thread for as long as it goes on: no more than
+  `threads:` long-lived responses, such as server-sent events, are sent at
+  once, and one that its client reads slowly, or not at all, keeps the
+  thread with no time limit. Once every worker is taken, other requests
+  wait, and get 503 after `request_timeout:`.
 - The workers share Ruby's GVL with the thread that drives every connection,
   so an application busy on the CPU delays packet handling. Ruby 3.4 and
   later can shorten that with `RUBY_THREAD_TIMESLICE`.
 - A request whose client goes away is not interrupted: the application runs
   to its end.
-- Streaming response bodies (`call`) are not supported.
 - CI runs it on Ruby 4.0 alone, not on 3.3, the oldest it installs on. It is
   checked against curl and the clients of quic-interop-runner, over links
   with no loss or delay, and has not been run under load or over lossy
@@ -82,7 +83,7 @@ Other options, with their defaults:
 | `max_connection_request_spool_files:` | `16` | Request bodies a connection may hold in temporary files at once; more gets 503 |
 | `max_total_request_spool_files:` | `256` | The same over all connections |
 | `send_buffer_size:` | `65_536` | Bytes of a response body queued but unsent per stream |
-| `max_connection_send_buffer:` | `1_048_576` | Bytes of array and `each` response bodies a connection may have queued but unsent; more waits |
+| `max_connection_send_buffer:` | `1_048_576` | Bytes of array, `each` and streaming response bodies a connection may have queued but unsent; more waits |
 | `max_total_send_buffer:` | `67_108_864` | The same over all connections |
 | `request_timeout:` | `30` | Seconds a request may take to come in full, counted from its headers (later gets 408), and then to wait for a worker (later gets 503). `nil` for no limit |
 | `refusal_log_interval:` | `60` | Seconds between the `requests_refused` log lines, which count the requests answered without the application (400, 408, 413, 431, 501, 503) |
@@ -120,9 +121,14 @@ or `host:port`, or its `:authority` and `host` field differ. `CONNECT` gets
 501: the server opens no tunnels.
 
 Response bodies may be files (`to_path`, sent 16 KiB at a time as the
-connection takes them), arrays or anything with `each`. These get 500:
-streaming bodies (`call`), which are not supported; a status outside
-200..599; response headers whose names are not lowercase tokens or whose
+connection takes them), arrays, anything with `each`, or streaming bodies
+(`call`). A streaming body is called with a stream whose `read` reads the
+request body, received in full; the body ends when `call` returns, so
+writing to the stream from another thread afterwards is not supported. Its
+stream is aborted (H3_INTERNAL_ERROR) once what it writes goes past
+`content-length` or ends short of it, and `write` raises
+`HTTP3::StreamClosed` (an `IOError`) once the client has reset the stream.
+These get 500: a status outside 200..599; response headers whose names are not lowercase tokens or whose
 values contain NUL, CR or LF; a `content-length` given more than once, not a
 number, or not the length of a file or array body; and an array body with a
 chunk that is not a String. A body read with `each` is counted as it is

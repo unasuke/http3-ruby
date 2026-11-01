@@ -1,0 +1,39 @@
+module HTTP3
+  module Body
+    # The stream a streaming body (Rack 3's call(stream)) is called with:
+    # writes go to a Body::Pipe, reads come from the request body. Its
+    # methods behave as IO's do. Once the stream has gone away, write and
+    # flush raise StreamClosed, and so do close_write and close, once;
+    # writing past length, the content-length, fails the pipe and raises
+    # StreamClosed too.
+    class Stream
+      def initialize: (pipe: Pipe, input: StringIO | ::File, length: Integer?) -> void
+
+      # Read from the request body, as IO#read does. Raises IOError after
+      # close_read.
+      def read: (?Integer? length, ?String outbuf) -> String?
+
+      # Write each of objects, as a String, waiting while the pipe is full.
+      # Returns the bytes written. Raises IOError after close_write.
+      def write: (*_ToS objects) -> Integer
+
+      def <<: (_ToS object) -> self
+
+      # Wait until what has been written has been taken to be sent. Raises
+      # IOError after close_write.
+      def flush: () -> self
+
+      # Close the request body; may be called again.
+      def close_read: () -> nil
+
+      # End the body, and wait until all of it has been taken; fail the pipe
+      # instead if it is short of length. May be called again, and does
+      # nothing then.
+      def close_write: () -> nil
+
+      def close: () -> nil
+
+      def closed?: () -> bool
+    end
+  end
+end

@@ -277,9 +277,120 @@ class TestRackAdapter < Minitest::Test
     assert_equal 1, body.closes
   end
 
-  # Only an each body leaves its close to fill: a file, an Array and no
-  # body at all have none, and their Rack bodies are closed by the time
-  # call returns.
+  # A streaming body is called, by fill, with a stream that writes to the
+  # response's Body::Pipe and reads the request body; fill closes the Rack
+  # body once it is done.
+  def test_streaming_body_goes_through_a_pipe
+    body = StreamingBody.new do |stream|
+      stream.write(stream.read.upcase, "!")
+      stream.close
+    end
+    response, fill = respond_with_fill([200, {}, body], input: StringIO.new("hello".b))
+    assert_kind_of HTTP3::Body::Pipe, response.body
+    assert_equal 0, body.closes
+    assert_equal [["HELLO", "!"], :eof], drain(response, fill)
+    assert_equal 1, body.closes
+  end
+
+  # A body that returns from call without closing the stream ends there.
+  def test_streaming_body_ends_when_call_returns
+    body = StreamingBody.new { |stream| stream << "a" }
+    assert_equal [["a"], :eof], drain(*respond_with_fill([200, {}, body]))
+    assert_equal 1, body.closes
+  end
+
+  # As with each: the write that takes the body past content-length fails
+  # the pipe, and so does an end short of it.
+  def test_streaming_body_is_counted_against_content_length
+    {"3" => [["ab"], "the body is at least 4 bytes but content-length says otherwise"],
+     "5" => [["ab", "cd"], "the body is 4 bytes but content-length says otherwise"]}.each do |length, (chunks, message)|
+      body = StreamingBody.new { |stream| stream.write("ab", "cd") }
+      sent, ended = drain(*respond_with_fill([200, {"content-length" => length}, body]))
+      assert_equal chunks, sent, length
+      assert_kind_of HTTP3::RackAdapter::InvalidResponse, ended
+      assert_equal message, ended.message
+      assert_equal 1, body.closes, length
+    end
+    body = StreamingBody.new { |stream| stream.write("ab", "cd") }
+    assert_equal [["ab", "cd"], :eof], drain(*respond_with_fill([200, {"content-length" => "4"}, body]))
+  end
+
+  def test_streaming_body_that_raises_fails_the_pipe
+    body = StreamingBody.new do |stream|
+      stream.write("ab")
+      raise "call failed"
+    end
+    sent, ended = drain(*respond_with_fill([200, {}, body]))
+    assert_equal ["ab"], sent
+    assert_kind_of RuntimeError, ended
+    assert_equal "call failed", ended.message
+    assert_equal 1, body.closes
+  end
+
+  # Once the server has given up on the stream, the next write raises
+  # StreamClosed in call, and fill stops there without failing.
+  def test_streaming_body_stops_once_the_stream_is_gone
+    written = 0
+    body = StreamingBody.new do |stream|
+      3.times do
+        stream.write("x")
+        written += 1
+      end
+    end
+    response, fill = respond_with_fill([200, {}, body])
+    failures = []
+    response.body.define_singleton_method(:fail) { |error| failures << error }
+    response.body.cancel
+    assert_nil fill.call
+    assert_empty failures
+    assert_equal 0, written
+    assert_equal 1, body.closes
+  end
+
+  # Rack::Lint takes the stream, and finds the body closed.
+  def test_streaming_body_passes_rack_lint
+    body = StreamingBody.new do |stream|
+      stream.write("lint")
+      stream.close
+    end
+    adapter = new_adapter(Rack::Lint.new(->(_env) { [200, {}, body] }))
+    response, fill = adapter.call(request([[":path", "/"], [":authority", "localhost"]]), remote: REMOTE)
+    assert_equal [["lint"], :eof], drain(response, fill)
+    assert_equal 1, body.closes
+  end
+
+  # An exception the pipe can no longer take, since the body has ended or
+  # the server has given up on it, is what fill returns, for the server to
+  # log: a streaming body that raises after it closed the stream, and an
+  # each body that raises something other than StreamClosed once the
+  # stream is gone.
+  def test_fill_returns_what_the_pipe_did_not_take
+    body = StreamingBody.new do |stream|
+      stream.write("ok")
+      stream.close
+      raise "after the end"
+    end
+    returned = nil
+    response, fill = respond_with_fill([200, {}, body])
+    assert_equal [["ok"], :eof], drain(response, -> { returned = fill.call })
+    assert_kind_of RuntimeError, returned
+    assert_equal "after the end", returned.message
+    assert_equal 1, body.closes
+
+    each_body = Object.new
+    def each_body.each
+      yield "x"
+    rescue HTTP3::StreamClosed
+      raise ArgumentError, "the stream is gone"
+    end
+    response, fill = respond_with_fill([200, {}, each_body])
+    response.body.cancel
+    assert_kind_of ArgumentError, fill.call
+  end
+
+  # Only an each body and a streaming body leave their close to fill: a
+  # file, an Array and no body at all have none, and their Rack bodies are
+  # closed by the time call returns.
   def test_other_bodies_are_closed_by_call
     Dir.mktmpdir do |dir|
       path = File.join(dir, "file")
@@ -318,6 +429,19 @@ class TestRackAdapter < Minitest::Test
     assert_nil respond([204, {}, ["ignored"]]).body
   end
 
+  # Nor is a streaming body called for HEAD, 204 or 304; it is closed.
+  def test_streaming_body_is_not_called_without_a_body_to_send
+    [["HEAD", 200], ["GET", 204], ["GET", 304]].each do |method, status|
+      called = false
+      body = StreamingBody.new { called = true }
+      response, fill = respond_with_fill([status, {}, body], method: method)
+      assert_nil response.body, method
+      assert_nil fill, method
+      refute called, method
+      assert_equal 1, body.closes, method
+    end
+  end
+
   def test_body_kinds
     assert_kind_of HTTP3::Body::Chunks, respond([200, {}, ["a", "b"]]).body
     assert_kind_of HTTP3::Body::Pipe, respond([200, {}, ClosableBody.new]).body
@@ -329,7 +453,14 @@ class TestRackAdapter < Minitest::Test
       assert_equal 7, body.length
       body.io.close
     end
-    assert_raises(HTTP3::RackAdapter::InvalidResponse) { respond([200, {}, ->(stream) {}]) }
+    assert_kind_of HTTP3::Body::Pipe, respond([200, {}, ->(stream) {}]).body
+    # Rack 3: a body with both each and call is read with each.
+    both = ClosableBody.new
+    both.define_singleton_method(:call) { |_stream| raise "call is not to be called" }
+    response, fill = respond_with_fill([200, {}, both])
+    assert_equal [["chunk"], :eof], drain(response, fill)
+    error = assert_raises(HTTP3::RackAdapter::InvalidResponse) { respond([200, {}, Object.new]) }
+    assert_equal "the body (Object) responds to neither each nor call", error.message
   end
 
   ClosableBody = Struct.new(:closed) do
@@ -387,6 +518,25 @@ class TestRackAdapter < Minitest::Test
 
     def close
       self.closes += 1
+    end
+  end
+
+  # A streaming body, which runs its block with the stream, and counts its
+  # closes. Not a Struct, which has each.
+  class StreamingBody
+    attr_reader :closes
+
+    def initialize(&block)
+      @block = block
+      @closes = 0
+    end
+
+    def call(stream)
+      @block.call(stream)
+    end
+
+    def close
+      @closes += 1
     end
   end
 
@@ -451,10 +601,11 @@ class TestRackAdapter < Minitest::Test
     respond_with_fill(triple, method: method).first
   end
 
-  # [response, fill] for the application's triple.
-  def respond_with_fill(triple, method: "GET")
+  # [response, fill] for the application's triple, to a request whose body
+  # is input.
+  def respond_with_fill(triple, method: "GET", input: StringIO.new("".b))
     adapter = new_adapter(->(_env) { triple })
-    adapter.call(request([[":path", "/"], [":authority", "localhost"]], method: method), remote: REMOTE)
+    adapter.call(request([[":path", "/"], [":authority", "localhost"]], method: method, input: input), remote: REMOTE)
   end
 
   def new_adapter(app)
@@ -482,5 +633,8 @@ class TestRackAdapter < Minitest::Test
         return [chunks, taken]
       end
     end
+  ensure
+    # A fill still waiting on the pipe, when the body did not end.
+    filler&.kill&.join(1)
   end
 end

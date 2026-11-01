@@ -65,7 +65,7 @@ class TestBodyPipe < Minitest::Test
     assert_same pipe, flusher.value
   end
 
-  # fail, the writer's last call, returns without raising.
+  # fail, the writer's last call, returns false without raising.
   def test_cancel_wakes_the_waiters_with_stream_closed
     full = new_pipe(capacity: 1)
     full.write("x")
@@ -82,7 +82,7 @@ class TestBodyPipe < Minitest::Test
     [writer, flusher, finisher].each do |thread|
       assert_raises(HTTP3::StreamClosed) { thread.value }
     end
-    assert_nil failer.value
+    assert_equal false, failer.value, "the exception was never taken"
   end
 
   def test_calls_after_cancel_raise_stream_closed
@@ -93,13 +93,13 @@ class TestBodyPipe < Minitest::Test
     assert_raises(HTTP3::StreamClosed) { pipe.write("") }
     assert_raises(HTTP3::StreamClosed) { pipe.flush }
     assert_raises(HTTP3::StreamClosed) { pipe.finish }
-    assert_nil pipe.fail(RuntimeError.new("too late"))
+    assert_equal false, pipe.fail(RuntimeError.new("too late"))
     assert_nil pipe.take
     refute pipe.ready?
   end
 
   # What was written before fail is taken first, then the exception, and
-  # fail waits until it has been.
+  # fail waits until it has been, and says so.
   def test_take_returns_the_exception_of_fail_after_the_chunks
     pipe = new_pipe
     pipe.write("a")
@@ -109,7 +109,7 @@ class TestBodyPipe < Minitest::Test
     assert_equal "a", pipe.take
     assert pipe.ready?
     assert_same error, pipe.take
-    assert_nil failer.value
+    assert_equal true, failer.value
     refute pipe.ready?
     assert_raises(IOError) { pipe.write("b") }
   end
@@ -119,6 +119,7 @@ class TestBodyPipe < Minitest::Test
     start { pipe.finish }
     assert_equal :eof, take_eventually(pipe)
     assert_raises(IOError) { pipe.write("a") }
+    assert_equal false, pipe.fail(RuntimeError.new("too late"))
   end
 
   def test_ready
@@ -158,7 +159,7 @@ class TestBodyPipe < Minitest::Test
     assert_equal 2, @wakes, "the pipe held a chunk already"
     assert_equal "c", pipe.take
     assert_kind_of RuntimeError, pipe.take
-    assert_nil failer.value
+    assert_equal true, failer.value
   end
 
   def test_the_end_wakes_an_empty_pipe

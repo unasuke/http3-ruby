@@ -16,7 +16,7 @@ module HTTP3
     # it has been taken. On the I/O loop's side, #take never waits, and
     # #cancel gives up on the body: from then on the writer's write, finish
     # and flush raise StreamClosed, those waiting included, and fail
-    # returns. Since a writer waits for the
+    # returns false. Since a writer waits for the
     # end of its body to be taken, the pipes holding chunks are no more than
     # the writers.
     #
@@ -74,8 +74,10 @@ module HTTP3
       end
 
       # End the body with error, for the I/O loop to abort the stream once
-      # it has taken what is queued, and wait until it has. Does nothing
-      # once the body has ended or been given up on.
+      # it has taken what is queued, and wait until it has. Returns true
+      # once the I/O loop has taken error, and false when it never will:
+      # the body had ended or been given up on, and fail did nothing, or it
+      # was given up on while fail waited.
       def fail(error)
         woke = @lock.synchronize do
           next nil if @cancelled || @finished || @error
@@ -83,11 +85,13 @@ module HTTP3
           @error = error
           @chunks.empty?
         end
-        return nil if woke.nil?
+        return false if woke.nil?
 
         @wake.call if woke
-        @lock.synchronize { wait_for_the_end }
-        nil
+        @lock.synchronize do
+          wait_for_the_end
+          @end_taken
+        end
       end
 
       # Wait until the I/O loop has taken every chunk queued.
