@@ -35,8 +35,8 @@ module HTTP3
     # specification).
     FORBIDDEN_IN_VALUE = /[\0\r\n]/
 
-    # A body read with each goes through a Body::Pipe of pipe_capacity
-    # bytes, whose wake is wake.
+    # A body read with each, and a streaming body, go through a Body::Pipe
+    # of pipe_capacity bytes, whose wake is wake.
     def initialize(app, pipe_capacity:, wake:)
       @app = app
       @pipe_capacity = pipe_capacity
@@ -52,10 +52,13 @@ module HTTP3
     # and InvalidResponse for a response that cannot be sent; the Rack body
     # is closed in both cases.
     #
-    # fill is nil, the Rack body closed already, unless the body is read
-    # with each: its response has a Body::Pipe, and fill, called once the
-    # response has been handed over, writes the body to it and closes the
-    # Rack body.
+    # fill is nil, the Rack body closed already, unless the response sends
+    # a body that is read with each or is a streaming body (call): its
+    # response has a Body::Pipe, and fill, called once the response has
+    # been handed over, writes the body to it and closes the Rack body.
+    # fill returns nil, or an exception the body raised that did not abort
+    # its stream, the body having ended or the server having given up on
+    # it, for the caller to log.
     def call(request, remote:)
       # The server cannot open a tunnel (RFC 9114 section 4.4), and a
       # CONNECT request has neither :scheme nor :path, so the env would be
@@ -189,7 +192,7 @@ module HTTP3
         return [Response.new(status: status, headers: headers, body: nil), nil]
       end
 
-      sent, fill = body_for(body, length) { body = nil }
+      sent, fill = body_for(body, length, request.input) { body = nil }
       [Response.new(status: status, headers: headers, body: sent), fill]
     ensure
       begin
@@ -238,9 +241,10 @@ module HTTP3
 
     # [the body to send, fill]. One whose length is known before it is
     # sent, a file or an Array, is held against length, the content-length,
-    # now; one read with each, as fill reads it. body_for yields when the
-    # Rack body is no longer for response_for to close.
-    def body_for(body, length)
+    # now; one read with each, and a streaming body, as fill writes it. A
+    # streaming body reads input, the request body. body_for yields when
+    # the Rack body is no longer for response_for to close.
+    def body_for(body, length, input)
       if body.respond_to?(:to_path)
         io = ::File.open(body.to_path, "rb")
         if length && io.size != length
@@ -263,11 +267,16 @@ module HTTP3
 
         [Body::Chunks.new(enum: chunks.each, rack_body: nil), nil]
       elsif body.respond_to?(:each)
+        # Rack 3: a body with both each and call is read with each.
         pipe = Body::Pipe.new(capacity: @pipe_capacity, wake: @wake)
         yield
-        [pipe, -> { fill(body, pipe, length) }]
+        [pipe, -> { fill_each(body, pipe, length) }]
+      elsif body.respond_to?(:call)
+        pipe = Body::Pipe.new(capacity: @pipe_capacity, wake: @wake)
+        yield
+        [pipe, -> { fill_call(body, pipe, length, input) }]
       else
-        raise InvalidResponse, "streaming bodies (#{body.class}) are not supported"
+        raise InvalidResponse, "the body (#{body.class}) responds to neither each nor call"
       end
     end
 
@@ -276,9 +285,10 @@ module HTTP3
     # of it, and an exception from each fail the pipe, and the stream is
     # aborted then, since the headers have gone. A pipe the server has given
     # up on (the client reset the stream, say) makes write raise
-    # StreamClosed, and the body stops there, without failing. The Rack
-    # body is closed in every case; an exception from its close is raised.
-    def fill(body, pipe, length)
+    # StreamClosed, and the body stops there, without failing. Returns an
+    # exception the pipe did not take, or nil. The Rack body is closed in
+    # every case; an exception from its close is raised.
+    def fill_each(body, pipe, length)
       size = 0
       body.each do |chunk|
         raise InvalidResponse, "body chunk must be a String (got #{chunk.class})" unless chunk.is_a?(String)
@@ -297,7 +307,28 @@ module HTTP3
       nil
     rescue Exception => e # rubocop:disable Lint/RescueException
       # Even exit, on a worker, ends only the body.
-      pipe.fail(e)
+      e unless pipe.fail(e)
+    ensure
+      close_rack_body(body)
+    end
+
+    # Call the streaming body with a Body::Stream that writes to pipe and
+    # reads input, and end the body once call returns, unless it has ended
+    # already: a write after that, from another thread, raises IOError. As
+    # with fill_each, the stream is aborted once the body goes past length
+    # bytes or ends short of it, or call raises, and it stops without
+    # failing once the server has given up on the pipe. Returns an
+    # exception the pipe did not take, such as one call raised after it
+    # closed the stream, or nil. The Rack body is closed in every case; an
+    # exception from its close is raised.
+    def fill_call(body, pipe, length, input)
+      stream = Body::Stream.new(pipe: pipe, input: input, length: length)
+      body.call(stream)
+      stream.close_write
+    rescue StreamClosed
+      nil
+    rescue Exception => e # rubocop:disable Lint/RescueException
+      e unless pipe.fail(e)
     ensure
       close_rack_body(body)
     end

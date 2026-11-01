@@ -13,8 +13,8 @@ module HTTP3
     # What :authority, or host, must look like.
     AUTHORITY: Regexp
 
-    # A body read with each goes through a Body::Pipe of pipe_capacity
-    # bytes, whose wake is wake.
+    # A body read with each, and a streaming body, go through a Body::Pipe
+    # of pipe_capacity bytes, whose wake is wake.
     def initialize: (untyped app, pipe_capacity: Integer, wake: ^() -> void) -> void
 
     # Returns [response, fill]. Answers, without calling the application,
@@ -25,11 +25,16 @@ module HTTP3
     # status outside 200..599, and a content-length that is malformed or
     # that a file or array body does not have); the Rack body is closed
     # either way. fill is nil, the Rack body closed already, unless the
-    # body is read with each: then the response has a Body::Pipe, and fill
-    # writes the body to it, fails it once the body passes content-length,
-    # ends short of it, yields a chunk that is not a String or raises, and
-    # closes the Rack body.
-    def call: (Request request, remote: Addrinfo) -> [Response, (^() -> void)?]
+    # response sends a body that is read with each or is a streaming body
+    # (call): then the response has a Body::Pipe, and fill writes the body
+    # to it, fails it once the body passes content-length, ends short of
+    # it or raises (or, with each, yields a chunk that is not a String),
+    # and closes the Rack body. A streaming body is called with a
+    # Body::Stream whose read reads the request body, and ends when call
+    # returns. fill returns nil, or an exception the body raised that did
+    # not abort its stream, the body having ended or the server having
+    # given up on it, for the caller to log.
+    def call: (Request request, remote: Addrinfo) -> [Response, (^() -> Exception?)?]
 
     # The 400s and 501s #call answered since the last call, as
     # {status => count}; the count starts over.

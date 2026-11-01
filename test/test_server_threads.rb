@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "test_helper"
+require "rack/lint"
 
 # HTTP3::Server calling the application on worker threads, with the server
 # in a child process. The application tells the test what it does through a
@@ -104,6 +105,24 @@ class TestServerThreads < Minitest::Test
     end
   end
 
+  # A streaming body, whose call runs the block with the stream; tells the
+  # test which thread closes it. Not a TrackedBody, which has each.
+  class TrackedStream
+    def initialize(detail, record, &block)
+      @detail = detail
+      @record = record
+      @block = block
+    end
+
+    def call(stream)
+      @block.call(stream)
+    end
+
+    def close
+      @record.call("close", @detail)
+    end
+  end
+
   def setup
     @dir = Dir.mktmpdir("http3-threads-")
     @log_path = File.join(@dir, "server.log")
@@ -161,19 +180,91 @@ class TestServerThreads < Minitest::Test
   end
 
   # call, each and close all run on the worker that took the request,
-  # whatever the body: a file, an Array, each, none (HEAD, 204), and one
-  # refused once the application returned it (a status that is not final).
+  # whatever the body: a file, an Array, each, a streaming body (which ends
+  # when its call returns), none (HEAD, 204), and one refused once the
+  # application returned it (a status that is not final).
   def test_call_and_close_run_on_the_same_worker
     client = connect
     assert_equal "file content", get(client, "/file").body
     assert_equal "ab", get(client, "/array").body
     assert_equal "one,two", get(client, "/each").body
+    assert_equal "streamed", get(client, "/stream").body
     assert_equal 204, get(client, "/no-content").status
     assert_equal 500, get(client, "/invalid").status
     id = client.request(:head, "/each?head")
     client.pump_until { client.response(id).finished? }
     assert_equal 200, client.response(id).status
-    %w[/file /array /each /no-content /invalid /each?head].each { |detail| assert_same_worker(client, detail) }
+    %w[/file /array /each /stream /no-content /invalid /each?head].each { |detail| assert_same_worker(client, detail) }
+  end
+
+  # What a streaming body writes goes out as it writes it: the client has
+  # the first chunk while call is still running, whether the worker waits
+  # or keeps the CPU busy.
+  def test_streaming_body_is_sent_as_it_is_written
+    client = connect
+    %w[/stream-wait /stream-busy].each do |path|
+      id = client.request(:get, path)
+      client.pump_until { client.response(id).body.to_s == "first" }
+      refute_predicate client.response(id), :finished?, path
+      release
+      client.pump_until { client.response(id).finished? }
+      assert_equal "firstsecond", client.response(id).body, path
+    end
+  end
+
+  def test_streaming_body_reads_the_request_body
+    client = connect
+    id = client.request(:post, "/stream-echo", body: "y" * 100_000)
+    client.pump_until { client.response(id).finished? }
+    assert_equal "y" * 100_000, client.response(id).body
+  end
+
+  # A client that resets the stream of a streaming body stops it: write
+  # raises StreamClosed in its call, which is neither a 500 nor an
+  # app_error.
+  def test_reset_during_a_streaming_body_stops_it
+    client = connect
+    id = client.request(:get, "/stream-endless")
+    client.pump_until { client.response(id).status }
+    client.cancel(id)
+    client.pump_until { client.closed?(id) }
+    ended = wait_for_event(client, "stream-ended", "/stream-endless")
+    assert_equal "HTTP3::StreamClosed", ended.extra
+    assert_same_worker(client, "/stream-endless")
+    assert_equal "fast", get(client, "/fast").body
+    refute_match(/app_error/, File.read(@log_path))
+  end
+
+  # A streaming body that writes past content-length, or ends short of it,
+  # has its stream aborted, and the cause logged.
+  def test_streaming_body_not_of_content_length_aborts_the_stream
+    client = connect
+    {"/stream-long" => "at least 4 bytes", "/stream-short" => "2 bytes"}.each do |path, size|
+      id = client.request(:get, path)
+      client.pump_until { client.aborted?(id) }
+      assert_logged(%r{app_error .* path=#{path} error=HTTP3::RackAdapter::InvalidResponse message="the body is #{size} but content-length says otherwise"})
+    end
+  end
+
+  # An exception a streaming body raises after it closed its stream can no
+  # longer abort it: the client has the response, and the exception is
+  # logged.
+  def test_exception_after_the_stream_closed_is_logged
+    client = connect
+    response = get(client, "/stream-raise-after-close")
+    assert_equal [200, "ok"], [response.status, response.body]
+    assert_logged(%r{app_error .* path=/stream-raise-after-close error=RuntimeError message="after close"})
+    assert_same_worker(client, "/stream-raise-after-close")
+  end
+
+  # A streaming body may close the stream itself, and Rack::Lint finds
+  # nothing amiss.
+  def test_streaming_body_may_close_the_stream
+    client = connect
+    assert_equal "closed", get(client, "/stream-close").body
+    assert_equal "lint", get(client, "/stream-lint").body
+    assert_same_worker(client, "/stream-lint")
+    refute_match(/ E, /, File.read(@log_path))
   end
 
   # A body that fails after its headers went out aborts its stream, and is
@@ -396,6 +487,16 @@ class TestServerThreads < Minitest::Test
       when "/each-raise" then [200, {}, FailingBody.new([], detail, record)]
       when "/endless" then [200, {}, EndlessBody.new([], detail, record)]
       when "/late-each" then [200, {}, LateBody.new([], detail, record)]
+      when "/stream", "/stream-wait", "/stream-busy", "/stream-echo", "/stream-endless", "/stream-long",
+        "/stream-short", "/stream-close", "/stream-raise-after-close"
+        streaming_response(env["PATH_INFO"], release_r, detail, record)
+      when "/stream-lint"
+        Rack::Lint.new(lambda do |_env|
+          [200, {}, TrackedStream.new(detail, record) do |stream|
+            stream.write("lint")
+            stream.close
+          end]
+        end).call(env)
       when "/raise" then raise "the app failed"
       when "/exit" then exit
       when "/close-input"
@@ -404,6 +505,50 @@ class TestServerThreads < Minitest::Test
       else [404, {}, []]
       end
     end
+  end
+
+  # The streaming bodies of /stream...: /stream ends when its call returns;
+  # /stream-wait and /stream-busy write and flush their first chunk, then
+  # wait for a byte on release_r, asleep or busy on the CPU; /stream-echo
+  # writes the request body; /stream-endless writes until it fails, and
+  # tells the test how; /stream-long and /stream-short do not match their
+  # content-length; /stream-close closes the stream itself, and
+  # /stream-raise-after-close raises after that.
+  def streaming_response(path, release_r, detail, record)
+    headers = {"/stream-long" => {"content-length" => "3"}, "/stream-short" => {"content-length" => "5"}}.fetch(path, {})
+    body = TrackedStream.new(detail, record) do |stream|
+      case path
+      when "/stream" then stream.write("streamed")
+      when "/stream-wait", "/stream-busy"
+        stream.write("first")
+        stream.flush
+        if path == "/stream-wait"
+          release_r.read(1)
+        else
+          loop { break if release_r.read_nonblock(1, exception: false).is_a?(String) }
+        end
+        stream.write("second")
+      when "/stream-echo"
+        stream.write(stream.read)
+        stream.close
+      when "/stream-endless"
+        begin
+          loop { stream.write("x" * 16_384) }
+        ensure
+          record.call("stream-ended", detail, $!&.class)
+        end
+      when "/stream-long" then stream.write("abcd")
+      when "/stream-short" then stream.write("ab")
+      when "/stream-close"
+        stream.write("closed")
+        stream.close
+      when "/stream-raise-after-close"
+        stream.write("ok")
+        stream.close
+        raise "after close"
+      end
+    end
+    [200, headers, body]
   end
 
   def connect

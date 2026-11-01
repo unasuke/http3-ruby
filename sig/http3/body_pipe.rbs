@@ -21,9 +21,10 @@ module HTTP3
       def finish: () -> nil
 
       # End the body with error, once what is queued has been taken, and
-      # wait until it has; does nothing once it has ended or been given up
-      # on.
-      def fail: (Exception error) -> nil
+      # wait until it has. Returns true once error has been taken, and false
+      # when it never will: the body had ended or been given up on (fail
+      # does nothing then), or was given up on while fail waited.
+      def fail: (Exception error) -> bool
 
       # Wait until every chunk queued has been taken.
       def flush: () -> self
