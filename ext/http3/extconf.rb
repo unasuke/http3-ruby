@@ -35,7 +35,9 @@ abort "libnghttp3 not linkable" unless have_func("nghttp3_version", "nghttp3/ngh
 # looked up at load time with rb_ext_resolve_symbol (Ruby 3.3 or later).
 require "quic/ext_include"
 append_cppflags("-I#{QUIC::EXT_INCLUDE_DIR}")
-abort "quic/ext.h not found (the quic gem 0.0.3 or later provides it)" unless have_header("quic/ext.h")
+abort "quic/ext.h not found (the quic gem 0.0.6 or later provides it)" unless have_header("quic/ext.h")
+abort "quic/ext.h lacks recv_stop_sending (the quic gem 0.0.6 or later provides it)" unless
+  have_struct_member("quic_ext_stream_handler", "recv_stop_sending", "quic/ext.h")
 abort "rb_ext_resolve_symbol not found (Ruby 3.3 or later is required)" unless
   have_func("rb_ext_resolve_symbol", "ruby.h")
 

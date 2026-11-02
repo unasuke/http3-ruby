@@ -726,8 +726,17 @@ static int h3_stream_close(void *ud, int64_t id, int has_code,
   return h3_fail(s, rv);
 }
 
+/* The size of a handler filled in up to member m. The size tells quic.so
+ * which members the handler has (quic/ext.h): those it fills in, whatever
+ * quic/ext.h it is built against. */
+#define H3_HANDLER_SIZE_TO(m)                                                  \
+  (offsetof(quic_ext_stream_handler, m) +                                      \
+   sizeof(((quic_ext_stream_handler *)0)->m))
+
+/* An ABI 1.0 handler: quic 0.0.6 tells of STOP_SENDING through
+ * recv_stop_sending (ABI 1.1), which this one does not take yet. */
 static const quic_ext_stream_handler h3_handler = {
-    .size = sizeof(quic_ext_stream_handler),
+    .size = H3_HANDLER_SIZE_TO(handshake_completed),
     .recv_stream_data = h3_recv_stream_data,
     .next_stream_data = h3_next_stream_data,
     .stream_data_written = h3_stream_data_written,
