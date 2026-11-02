@@ -20,9 +20,10 @@
 # stay within the limits of every connection and of the server, the server
 # is still running, and a GET on a new connection gets 200 afterwards, or
 # when it takes more than --timeout seconds. With --request-timeout, passed
-# on to server.rb, every request held open has to get 408 once that has
-# passed, and no temporary file be left open, too. Needs the extension
-# compiled (bundle exec rake compile) and Linux, for /proc.
+# on to server.rb with half of it as --response-timeout (which has to be
+# less), every request held open has to get 408 once that has passed, and
+# no temporary file be left open, too. Needs the extension compiled (bundle
+# exec rake compile) and Linux, for /proc.
 
 $LOAD_PATH.unshift File.expand_path("../../lib", __dir__)
 require "http3"
@@ -106,7 +107,12 @@ Dir.mktmpdir("http3-hold-") do |work|
   File.write(File.join(root, "index.html"), "hello from http3-ruby\n")
   credentials = TestCertificates.generate_credentials(dir: work)
   port = free_port
-  timeout_args = options[:request_timeout] ? ["--request-timeout", options[:request_timeout].to_s] : []
+  # response_timeout has to be less than request_timeout.
+  timeout_args = if options[:request_timeout]
+    ["--request-timeout", options[:request_timeout].to_s, "--response-timeout", (options[:request_timeout] / 2).to_s]
+  else
+    []
+  end
   pid = Process.spawn(
     RbConfig.ruby, File.join(__dir__, "server.rb"), "--root", root, "--bind", "127.0.0.1:#{port}",
     "--certificate", credentials.certificate_path, "--private-key", credentials.private_key_path, *timeout_args

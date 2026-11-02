@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/random.h>
+#include <time.h>
 #include <unistd.h>
 
 /*
@@ -65,12 +66,19 @@ typedef struct {
   size_t nchunks, cap;
   size_t handed;    /* how many of chunks read_data has handed to nghttp3 */
   uint64_t unsent;  /* bytes queued but not handed to nghttp3 yet */
+  uint64_t queued;  /* bytes ever queued, the pieces read from a file too */
   uint64_t acked;   /* bytes the peer has acknowledged */
   uint64_t shifted; /* bytes of the chunks already dropped */
   int fd;           /* a file body (#attach_file) not read in full yet, or -1 */
   off_t file_off, file_end;
-  bool eof;     /* nothing follows the queued chunks */
-  bool blocked; /* read_data returned NGHTTP3_ERR_WOULDBLOCK */
+  /* When the body began to wait on the peer, or last moved: the peer
+   * acknowledged some of it, or widened the stream's flow control window
+   * (CLOCK_MONOTONIC seconds; #response_stalled_since) */
+  double since;
+  bool fc_blocked; /* the peer's flow control window holds it back */
+  bool eof;        /* nothing follows the queued chunks */
+  bool blocked;    /* read_data returned NGHTTP3_ERR_WOULDBLOCK */
+  bool aborted;    /* #abort_stream stopped it: no more of the body is sent */
 } h3_stream;
 
 typedef struct {
@@ -89,7 +97,17 @@ typedef struct {
   /* stream_id => size of the header section received so far, while the
    * headers of that request come in */
   st_table *field_sizes;
+  /* When the peer last acknowledged some response body, on any stream
+   * (CLOCK_MONOTONIC seconds) */
+  double acked_at;
 } h3_session;
+
+/* CLOCK_MONOTONIC in seconds, as Process.clock_gettime gives it. */
+static double h3_now(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
 
 /* Streams */
 
@@ -130,7 +148,18 @@ static int h3_stream_push(h3_stream *st, const uint8_t *base, size_t len,
   }
   st->chunks[st->nchunks++] = (h3_chunk){base, len, str};
   st->unsent += len;
+  st->queued += len;
   return 0;
+}
+
+/* Bytes of the body the peer has not acknowledged: queued, the rest of a
+ * file not read yet, or sent; 0 once the stream has been aborted. */
+static uint64_t h3_stream_unacked(const h3_stream *st) {
+  if (st->aborted) {
+    return 0;
+  }
+  uint64_t rest = st->fd >= 0 ? (uint64_t)(st->file_end - st->file_off) : 0;
+  return st->queued - st->acked + rest;
 }
 
 /* The whole file body has been read: let go of its descriptor now rather
@@ -140,6 +169,24 @@ static void h3_stream_end_file(h3_stream *st) {
   close(st->fd);
   st->fd = -1;
   st->eof = true;
+}
+
+/* The stream has been aborted, and no more of its body will be sent: let go
+ * at once of what nghttp3 has not taken, and of the file's descriptor,
+ * rather than when the stream closes, which waits for the peer to
+ * acknowledge the reset. The chunks nghttp3 has taken stay until then,
+ * since it still points into them. */
+static void h3_stream_abort(h3_stream *st) {
+  for (size_t i = st->handed; i < st->nchunks; i++) {
+    h3_chunk_release(&st->chunks[i]);
+  }
+  st->nchunks = st->handed;
+  st->unsent = 0;
+  if (st->fd >= 0) {
+    close(st->fd);
+    st->fd = -1;
+  }
+  st->aborted = true;
 }
 
 /* Drop the chunks at the front the peer has acknowledged to their end. A
@@ -276,7 +323,14 @@ static VALUE h3_end_headers_body(VALUE arg) {
 static int h3_acked_stream_data_cb(nghttp3_conn *conn, int64_t id,
                                    uint64_t datalen, void *user_data,
                                    void *stream_user_data) {
-  h3_stream *st = h3_stream_find(user_data, id);
+  h3_session *s = user_data;
+  h3_stream *st = h3_stream_find(s, id);
+  if (datalen > 0) {
+    s->acked_at = h3_now();
+    if (st != NULL) {
+      st->since = s->acked_at;
+    }
+  }
   if (st != NULL) {
     h3_stream_acked(st, datalen);
   }
@@ -579,8 +633,13 @@ static int h3_stream_data_written(void *ud, int64_t id, size_t n) {
   return rv == 0 ? 0 : h3_fail(s, rv);
 }
 
+/* The peer's flow control window for the stream is used up. */
 static int h3_stream_blocked(void *ud, int64_t id) {
   h3_session *s = ud;
+  h3_stream *st = h3_stream_find(s, id);
+  if (st != NULL) {
+    st->fc_blocked = true;
+  }
   if (s->h3 != NULL) {
     nghttp3_conn_block_stream(s->h3, id);
   }
@@ -604,8 +663,15 @@ static int h3_acked_stream_data(void *ud, int64_t id, uint64_t n) {
   return rv == 0 ? 0 : h3_fail(s, rv);
 }
 
+/* The peer widened the stream's flow control window: it has read some of
+ * the body. */
 static int h3_extend_max_stream_data(void *ud, int64_t id) {
   h3_session *s = ud;
+  h3_stream *st = h3_stream_find(s, id);
+  if (st != NULL) {
+    st->fc_blocked = false;
+    st->since = h3_now();
+  }
   if (s->h3 == NULL) {
     return 0;
   }
@@ -781,6 +847,12 @@ NORETURN(static void h3_raise_no_body(VALUE rb_id));
 static void h3_raise_no_body(VALUE rb_id) {
   rb_raise(rb_eNghttp3StreamNotFoundError,
            "no response body is open on stream %" PRIsVALUE, rb_id);
+}
+
+NORETURN(static void h3_raise_aborted(VALUE rb_id));
+static void h3_raise_aborted(VALUE rb_id) {
+  rb_raise(rb_eNghttp3InvalidStateError,
+           "stream %" PRIsVALUE " has been aborted", rb_id);
 }
 
 /* The body of stream rb_id. Ruby code that runs once it is found may make
@@ -974,17 +1046,25 @@ static VALUE rb_http3_session_stop_reading(VALUE self, VALUE rb_id) {
  *   session.push_chunk(stream_id, str) -> self
  *
  * Queue a frozen copy of str as the next piece of the response body.
+ * Raises InvalidStateError once the stream has been aborted.
  */
 static VALUE rb_http3_session_push_chunk(VALUE self, VALUE rb_id, VALUE str) {
   h3_session *s = h3_session_enter(self);
   StringValue(str);
   VALUE copy = rb_str_new_frozen(str);
   h3_stream *st = h3_session_stream(self, rb_id);
+  if (st->aborted) {
+    h3_raise_aborted(rb_id);
+  }
   if (st->eof) {
     rb_raise(rb_eNghttp3InvalidStateError, "the body has ended");
   }
   if (RSTRING_LEN(copy) == 0) {
     return self;
+  }
+  if (h3_stream_unacked(st) == 0) {
+    /* The body waits on the peer from now. */
+    st->since = h3_now();
   }
   if (h3_stream_push(st, (const uint8_t *)RSTRING_PTR(copy),
                      (size_t)RSTRING_LEN(copy), copy) != 0) {
@@ -999,11 +1079,15 @@ static VALUE rb_http3_session_push_chunk(VALUE self, VALUE rb_id, VALUE str) {
  * call-seq:
  *   session.push_eof(stream_id) -> self
  *
- * Mark the end of the response body.
+ * Mark the end of the response body. Raises InvalidStateError once the
+ * stream has been aborted.
  */
 static VALUE rb_http3_session_push_eof(VALUE self, VALUE rb_id) {
   h3_session *s = h3_session_enter(self);
   h3_stream *st = h3_session_stream(self, rb_id);
+  if (st->aborted) {
+    h3_raise_aborted(rb_id);
+  }
   st->eof = true;
   h3_stream_wake(s, st);
   return self;
@@ -1017,7 +1101,8 @@ static VALUE rb_http3_session_push_eof(VALUE self, VALUE rb_id) {
  * descriptor is duplicated, so io may be closed afterwards. The duplicate
  * is close-on-exec, as Ruby's own descriptors are, so that a process the
  * application spawns does not inherit it, and is closed as soon as the
- * whole length has been read.
+ * whole length has been read. Raises InvalidStateError once the stream has
+ * been aborted.
  */
 static VALUE rb_http3_session_attach_file(VALUE self, VALUE rb_id, VALUE io,
                                           VALUE offset, VALUE length) {
@@ -1039,6 +1124,10 @@ static VALUE rb_http3_session_attach_file(VALUE self, VALUE rb_id, VALUE io,
     close(fd);
     h3_raise_no_body(rb_id);
   }
+  if (st->aborted) {
+    close(fd);
+    h3_raise_aborted(rb_id);
+  }
   if (st->fd >= 0 || st->eof || st->nchunks > 0) {
     close(fd);
     rb_raise(rb_eNghttp3InvalidStateError, "the body is already given");
@@ -1046,6 +1135,7 @@ static VALUE rb_http3_session_attach_file(VALUE self, VALUE rb_id, VALUE io,
   st->fd = fd;
   st->file_off = off;
   st->file_end = off + len;
+  st->since = h3_now();
   if (len == 0) {
     h3_stream_end_file(st);
   }
@@ -1063,6 +1153,36 @@ static VALUE rb_http3_session_attach_file(VALUE self, VALUE rb_id, VALUE io,
 static VALUE rb_http3_session_unsent_bytes(VALUE self, VALUE rb_id) {
   h3_stream *st = h3_stream_find(h3_session_get(self), NUM2LL(rb_id));
   return ULL2NUM(st == NULL ? 0 : st->unsent);
+}
+
+/*
+ * call-seq:
+ *   session.response_stalled_since(stream_id) -> Float or nil
+ *
+ * Since when (CLOCK_MONOTONIC seconds, as Process.clock_gettime gives it)
+ * the response body on stream_id has waited on the client: some of it has
+ * not been acknowledged, and nothing has moved since. nil while none of it
+ * waits, for a stream without a body, and once the stream has been
+ * aborted.
+ *
+ * Moving is the client acknowledging some of the body, or widening the
+ * stream's flow control window. While that window does not hold the body
+ * back, an acknowledgement of any response body on the connection counts
+ * too: nghttp3 sends the responses of one priority one at a time, so a
+ * response waiting its turn behind another the client is reading gets no
+ * acknowledgements of its own.
+ */
+static VALUE rb_http3_session_response_stalled_since(VALUE self, VALUE rb_id) {
+  h3_session *s = h3_session_get(self);
+  h3_stream *st = h3_stream_find(s, NUM2LL(rb_id));
+  if (st == NULL || h3_stream_unacked(st) == 0) {
+    return Qnil;
+  }
+  double since = st->since;
+  if (!st->fc_blocked && s->acked_at > since) {
+    since = s->acked_at;
+  }
+  return DBL2NUM(since);
 }
 
 /*
@@ -1116,13 +1236,21 @@ static VALUE rb_http3_session_shutdown_notice(VALUE self) {
  *   session.abort_stream(stream_id, app_error_code) -> self
  *
  * Stop the stream in both directions with app_error_code (for instance
- * H3_INTERNAL_ERROR after the response headers went out).
+ * H3_INTERNAL_ERROR after the response headers went out). What of the
+ * response body nghttp3 has not taken is let go at once, so that
+ * #unsent_bytes no longer counts it, and a file body's descriptor is
+ * closed; #push_chunk, #push_eof and #attach_file raise InvalidStateError
+ * from then on.
  */
 static VALUE rb_http3_session_abort_stream(VALUE self, VALUE rb_id,
                                            VALUE rb_code) {
   h3_session *s = h3_session_enter(self);
   int64_t id = NUM2LL(rb_id);
   uint64_t code = NUM2ULL(rb_code);
+  h3_stream *st = h3_stream_find(s, id);
+  if (st != NULL) {
+    h3_stream_abort(st);
+  }
   if (s->h3 != NULL) {
     nghttp3_conn_shutdown_stream_write(s->h3, id);
   }
@@ -1155,6 +1283,8 @@ void Init_http3_session(VALUE rb_mHTTP3) {
                    rb_http3_session_attach_file, 4);
   rb_define_method(rb_cHTTP3Session, "unsent_bytes",
                    rb_http3_session_unsent_bytes, 1);
+  rb_define_method(rb_cHTTP3Session, "response_stalled_since",
+                   rb_http3_session_response_stalled_since, 1);
   rb_define_method(rb_cHTTP3Session, "take_closed",
                    rb_http3_session_take_closed, 0);
   rb_define_method(rb_cHTTP3Session, "take_error", rb_http3_session_take_error,

@@ -82,12 +82,13 @@ size should grow by tens of MiB, not by the 2 GB sent; it varies from run to
 run, so the script checks no threshold.
 
 `--request-timeout` is passed on to `server.rb` as the server's
-`request_timeout` (30 seconds by default, longer than the script waits). With
-it, the script also waits for the requests held open to run out of time and
-exits non-zero unless every one of them gets 408 and no temporary file is
-left open afterwards. With `--request-timeout 5`, 512 got 408: the 256 held
-at first, then 256 more whose bodies were still on their way when the first
-ones let go of their files.
+`request_timeout` (30 seconds by default, longer than the script waits),
+with half of it as `--response-timeout`, since `response_timeout` has to be
+less. With it, the script also waits for the requests held open to run out
+of time and exits non-zero unless every one of them gets 408 and no
+temporary file is left open afterwards. With `--request-timeout 5`, 512 got
+408: the 256 held at first, then 256 more whose bodies were still on their
+way when the first ones let go of their files.
 
 ## Responses not read
 
@@ -99,19 +100,32 @@ The script opens 100 connections, and on each asks for `/big` 100 times and
 reads none of them. A worker writes an `each` body as the connection takes
 it, so the first three `/big` keep the three workers waiting, with no more
 than `send_buffer_size` of each queued, and the other requests wait for a
-worker; so does a `/small` on another connection, until the connections not
-reading have gone. The workers wait with no time limit, as the README's
-limitations say.
+worker. After `response_timeout` those responses are aborted, which frees
+the workers, but the next `/big` not read take them again, so a `/small` on
+another connection waits until the connections not reading have gone.
 
 ```sh
 bundle exec ruby test/interop/stall_responses.rb [--connections 100] [--streams 100] \
-  [--timeout 120]
+  [--timeout 120] [--response-timeout 10]
 ```
 
+`--response-timeout` is the server's `response_timeout`, 5 to 15 seconds:
+`/small` is checked about 3 seconds after the requests are in, before the
+first responses can time out (the script checks that too), and has to end
+within `request_timeout` (30 seconds). The clients not reading
+are pumped without waiting for datagrams: a hundred of them waiting 2 ms
+each would acknowledge what they get every 200 ms or so, and lose some of
+it, and their responses would crawl on rather than stop.
+
 It prints the server's resident set size before and while the workers wait.
-It exits non-zero unless the server is still running, a `/small` on a new
-connection gets no answer within 2 seconds while the workers wait, and all of
-it once the connections not reading have closed; or when a connection fails,
+It exits non-zero unless the server is still running, `/small` is checked
+less than `--response-timeout` after the first requests, a `/small` on a new
+connection gets no answer within 2 seconds while the workers wait, at least
+three of the responses not read are aborted within `--response-timeout` and
+4 seconds more (they stop a few seconds after they start, once they have
+used up the clients' windows), `/small` gets all of its body once the
+connections not reading have closed, and the server logs
+`responses_timed_out` for them when it stops; or when a connection fails,
 or it takes more than `--timeout` seconds. The resident set size should grow
 by about 50 MiB, mostly for the 10,000 requests waiting, not by the 100 GB
 asked for. Before the workers, when the thread that drives the connections

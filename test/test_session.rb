@@ -14,6 +14,10 @@ class TestSession < Minitest::Test
   # What /file serves; more than one 16 KiB read of the C part.
   FILE_CONTENT = Random.new(2).bytes(100_000).freeze
 
+  # The size of /big-file and /big-array: much more than the client's
+  # window lets the server send unread.
+  BIG = 2 * 1_024 * 1_024
+
   # An IO whose descriptor dup(2) refuses (EBADF), as it refuses any with
   # EMFILE once the process is out of descriptors.
   class UnattachableIO
@@ -37,6 +41,12 @@ class TestSession < Minitest::Test
     @dir = Dir.mktmpdir
     @file_path = File.join(File.realpath(@dir), "file")
     File.binwrite(@file_path, FILE_CONTENT)
+    @big_file_path = File.join(File.realpath(@dir), "big")
+    File.binwrite(@big_file_path, "x" * BIG)
+    # The stream ids the test wants aborted, and what the server saw when it
+    # aborted them (#abort_streams).
+    @aborts = Thread::Queue.new
+    @aborted = Thread::Queue.new
     @file_responses = Thread::Queue.new
     @body_errors = Thread::Queue.new
     @second_responses = Thread::Queue.new
@@ -178,6 +188,27 @@ class TestSession < Minitest::Test
 
   # More than initial_max_streams_bidi (100): the session has to give the
   # client new streams as the old ones close.
+  # abort_stream lets go at once of what nghttp3 has not taken of a body:
+  # the unsent chunks of an array body and the descriptor of a file body,
+  # without waiting for the stream to close, which a client can put off by
+  # never acknowledging the reset. Nothing can be added to the body after.
+  def test_abort_lets_go_of_what_was_not_sent
+    skip "needs /proc/self/fd" unless File.directory?("/proc/self/fd")
+    file = @client.request(:get, "/big-file").tap { |id| @client.pause(id) }
+    array = @client.request(:get, "/big-array").tap { |id| @client.pause(id) }
+    pump_for(0.5)
+    @aborts << [file, array]
+    @client.pump_until { !@aborted.empty? }
+    before, after, errors = @aborted.pop
+
+    refute_empty before[:fds], "the file should not have been read in full"
+    assert_operator before[:unsent][array], :>, 0
+    assert_empty after[:fds]
+    assert_equal({file => 0, array => 0}, after[:unsent])
+    assert_equal 4, errors.size
+    errors.each { |error| assert_kind_of HTTP3::Nghttp3::InvalidStateError, error }
+  end
+
   def test_250_requests_in_a_row_on_one_connection
     250.times do |i|
       id = @client.request(:get, "/hello")
@@ -210,6 +241,7 @@ class TestSession < Minitest::Test
         answer(session, request, nil)
       end
       session.fill_bodies(65_536) { |request, error| @fill_errors << [request, error] }
+      abort_streams(session) unless @aborts.empty?
       session.release_closed
       error = session.take_error and raise error
     end
@@ -244,6 +276,26 @@ class TestSession < Minitest::Test
     }
   end
 
+  # Abort the streams the test asked for, and tell it, from the same turn,
+  # what they held just before and just after (the descriptors open on
+  # /big-file, and unsent_bytes), and what adding to their bodies raised.
+  def abort_streams(session)
+    ids = @aborts.pop
+    held = -> { {fds: descriptors_of(@big_file_path), unsent: ids.to_h { |id| [id, session.unsent_bytes(id)] }} }
+    before = held.call
+    ids.each { |id| session.abort_stream(id, HTTP3::Nghttp3::H3_REQUEST_CANCELLED) }
+    after = held.call
+    errors = ids.flat_map do |id|
+      [-> { session.push_chunk(id, "x") }, -> { session.push_eof(id) }].map do |add|
+        add.call
+        nil
+      rescue => e
+        e
+      end
+    end
+    @aborted << [before, after, errors]
+  end
+
   # Pump for a while, so that the server gets what the client sent.
   def pump_for(seconds)
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + seconds
@@ -274,6 +326,12 @@ class TestSession < Minitest::Test
       io = File.open(@file_path, "rb")
       body = HTTP3::Body::File.new(io: io, offset: 0, length: FILE_CONTENT.bytesize, rack_body: nil)
       HTTP3::Response.new(status: 200, headers: [], body: body)
+    when "/big-file"
+      body = HTTP3::Body::File.new(io: File.open(@big_file_path, "rb"), offset: 0, length: BIG, rack_body: nil)
+      HTTP3::Response.new(status: 200, headers: [], body: body)
+    when "/big-array"
+      chunks = Array.new(BIG / 16_384) { "x" * 16_384 }
+      HTTP3::Response.new(status: 200, headers: [], body: HTTP3::Body::Chunks.new(enum: chunks.each, rack_body: nil))
     when "/fails"
       enum = Enumerator.new do |y|
         y << "first"

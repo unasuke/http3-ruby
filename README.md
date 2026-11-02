@@ -15,9 +15,12 @@ It is not suited for production yet:
   request until its response body has been generated, so an `each` or
   streaming body keeps the thread for as long as it goes on: no more than
   `threads:` long-lived responses, such as server-sent events, are sent at
-  once, and one that its client reads slowly, or not at all, keeps the
-  thread with no time limit. Once every worker is taken, other requests
-  wait, and get 503 after `request_timeout:`.
+  once. A response whose client stops reading is aborted after
+  `response_timeout:`, and the write its body waits in, or its next one,
+  raises `HTTP3::StreamClosed`, which ends the body and frees the thread;
+  one that its client keeps reading, however slowly, keeps the thread. Once
+  every worker is taken, other requests wait, and get 503 after
+  `request_timeout:`.
 - The workers share Ruby's GVL with the thread that drives every connection,
   so an application busy on the CPU delays packet handling. Ruby 3.4 and
   later can shorten that with `RUBY_THREAD_TIMESLICE`.
@@ -86,7 +89,8 @@ Other options, with their defaults:
 | `max_connection_send_buffer:` | `1_048_576` | Bytes of array, `each` and streaming response bodies a connection may have queued but unsent; more waits |
 | `max_total_send_buffer:` | `67_108_864` | The same over all connections |
 | `request_timeout:` | `30` | Seconds a request may take to come in full, counted from its headers (later gets 408), and then to wait for a worker (later gets 503). `nil` for no limit |
-| `refusal_log_interval:` | `60` | Seconds between the `requests_refused` log lines, which count the requests answered without the application (400, 408, 413, 431, 501, 503) |
+| `response_timeout:` | `10` | Seconds a response may stall, waiting on its client with nothing it sent acknowledged, before its stream is aborted (H3_REQUEST_CANCELLED). Not a limit on the whole response, which goes on for as long as its client keeps reading. Less than `request_timeout:`; `nil` for no limit |
+| `refusal_log_interval:` | `60` | Seconds between the `requests_refused` and `responses_timed_out` log lines, which count the requests answered without the application (400, 408, 413, 431, 501, 503) and the responses aborted after `response_timeout:` |
 | `shutdown_timeout:` | `30` | Seconds a graceful stop waits for the requests under way |
 | `qlog_dir:` | `nil` | Directory for one qlog file per connection |
 | `transport_params:` | `QUIC::TransportParams.default` | QUIC transport parameters |
@@ -100,6 +104,19 @@ is in memory; set `TMPDIR` to a directory on disk. A body still has to
 arrive within `request_timeout:`, so raise it together with
 `max_request_body:`.
 
+Unlike `request_timeout:`, `response_timeout:` does not bound how long a
+response takes: server-sent events or a large download go on for as long
+as the client keeps reading them. It bounds how long a response may stall.
+It counts, for each response, from the last time its client acknowledged
+some of it or widened its flow control window, while some of it waits to
+be sent; a response with nothing to send, such as server-sent events
+between events, never times out. A QUIC client widens its window in steps,
+so one that reads slowly, such as a video player, or pauses may have its
+response aborted, and browsers then ask for the rest with a Range request;
+for such clients, raise `response_timeout:`, and `request_timeout:` above
+it. While another response on the same connection is being read, those
+waiting their turn behind it do not time out.
+
 `max_connection_request_buffer:` has to be at least `max_field_section_size:`
 plus `max_request_body:`, or `request_body_buffer_size:` if that is smaller;
 `max_total_request_buffer:` at least `max_connection_request_buffer:`; when
@@ -108,8 +125,11 @@ a body may go to a file, `max_connection_request_spool:` at least
 `max_connection_request_spool:`; and `max_total_request_spool_files:` at
 least `max_connection_request_spool_files:`. That way a request within the
 limits never gets 503 from an idle server; otherwise `HTTP3::Server.new`
-raises `ArgumentError`. When a body may go to a file, `HTTP3::Server.new`
-also makes one in `Dir.tmpdir`, and raises what that raises.
+raises `ArgumentError`. It does too unless `response_timeout:` is less than
+`request_timeout:` (when neither is `nil`), so that the workers clients
+that stop reading keep are freed before the requests waiting for them get
+503. When a body may go to a file, `HTTP3::Server.new` also makes one in
+`Dir.tmpdir`, and raises what that raises.
 
 A request gets 413, 431 or 503 as soon as it passes a limit, without waiting
 for the rest of it, and the server reads no more of it (STOP_SENDING with
@@ -127,7 +147,8 @@ request body, received in full; the body ends when `call` returns, so
 writing to the stream from another thread afterwards is not supported. Its
 stream is aborted (H3_INTERNAL_ERROR) once what it writes goes past
 `content-length` or ends short of it, and `write` raises
-`HTTP3::StreamClosed` (an `IOError`) once the client has reset the stream.
+`HTTP3::StreamClosed` (an `IOError`) once the client has reset the stream,
+or the response has been aborted after `response_timeout:`.
 These get 500: a status outside 200..599; response headers whose names are not lowercase tokens or whose
 values contain NUL, CR or LF; a `content-length` given more than once, not a
 number, or not the length of a file or array body; and an array body with a

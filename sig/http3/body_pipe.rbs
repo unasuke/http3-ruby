@@ -1,6 +1,7 @@
 module HTTP3
   # The stream a response was being sent on is gone (reset by the client,
-  # its connection ended, or the server stopped).
+  # its connection ended, the server stopped, or the response was aborted
+  # after waiting on its client for response_timeout).
   class StreamClosed < IOError
   end
 

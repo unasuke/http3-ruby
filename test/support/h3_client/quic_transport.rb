@@ -12,10 +12,11 @@ module H3TestClient
     attr_reader :client, :quic
 
     # Connect to the HTTP/3 server on 127.0.0.1:port, trusting ca_file.
-    # settings overrides QUIC::Settings.default fields.
-    def self.connect(port, ca_file:, **settings)
+    # settings overrides QUIC::Settings.default fields; transport_params,
+    # if given, replaces QUIC::TransportParams.default.
+    def self.connect(port, ca_file:, transport_params: nil, **settings)
       quic = QUIC::Connection::Client.new(
-        host: "127.0.0.1", port: port, address_family: :inet,
+        host: "127.0.0.1", port: port, address_family: :inet, transport_params: transport_params,
         settings: QUIC::Settings.default.with(alpn: ["h3"], ca_file: ca_file, **settings)
       )
       sock = UDPSocket.new(Socket::AF_INET)
@@ -113,14 +114,16 @@ module H3TestClient
       end
     end
 
-    # One round: hand what HTTP/3 has to QUIC, run QUIC's I/O once, and
-    # hand back whatever arrived.
-    def pump
+    # One round: hand what HTTP/3 has to QUIC, run QUIC's I/O once, waiting
+    # up to timeout seconds for a datagram, and hand back whatever arrived.
+    # Many clients pumped in turn wait that long each, and acknowledge
+    # what they get only as often.
+    def pump(timeout: 0.002)
       @client.pump_writes do |id, data, fin|
         write(@streams.fetch(id), data, fin)
         data.bytesize
       end
-      @quic.pump_once(timeout: 0.002)
+      @quic.pump_once(timeout: timeout)
       feed
     end
 

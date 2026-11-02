@@ -20,12 +20,17 @@ class TestServerLimits < Minitest::Test
     max_connection_send_buffer: 8_192,
     max_total_send_buffer: 8_192,
     # Long enough for the requests the other tests hold open.
-    request_timeout: 2
+    request_timeout: 2,
+    # The default would not be less than request_timeout, as it has to be;
+    # the tests that hold responses not read need no limit.
+    response_timeout: nil
   }.freeze
 
   # The options of the tests that need more than LIMITS.
   OPTIONS = {
-    "test_refusals_are_logged_once_refusal_log_interval_has_passed" => {refusal_log_interval: 1}
+    "test_refusals_are_logged_once_refusal_log_interval_has_passed" => {refusal_log_interval: 1},
+    "test_timeouts_are_logged_once_refusal_log_interval_has_passed" => {response_timeout: 1, refusal_log_interval: 1},
+    "test_timeouts_are_logged_when_the_server_stops" => {response_timeout: 1}
   }.freeze
 
   # /big is far more than the client's window lets the server send unread.
@@ -123,7 +128,27 @@ class TestServerLimits < Minitest::Test
       error = assert_raises(ArgumentError, value.inspect) { new_server(request_timeout: value) }
       assert_equal "request_timeout must be nil or a positive number of seconds (got #{value.inspect})", error.message
     end
-    [nil, 0.5].each { |value| new_server(request_timeout: value) }
+    [nil, 0.5].each { |value| new_server(request_timeout: value, response_timeout: nil) }
+  end
+
+  def test_response_timeout_is_checked
+    [0, -1, "10"].each do |value|
+      error = assert_raises(ArgumentError, value.inspect) { new_server(response_timeout: value) }
+      assert_equal "response_timeout must be nil or a positive number of seconds (got #{value.inspect})", error.message
+    end
+    [nil, 0.5].each { |value| new_server(response_timeout: value) }
+  end
+
+  # Unless either is nil, response_timeout has to be less than request_timeout,
+  # so that the workers that clients not reading keep are freed before the
+  # requests waiting for them get 503.
+  def test_response_timeout_has_to_be_less_than_request_timeout
+    error = assert_raises(ArgumentError) { new_server(response_timeout: 30) }
+    assert_equal "response_timeout (30) must be less than request_timeout (30)", error.message
+    error = assert_raises(ArgumentError) { new_server(request_timeout: 5) }
+    assert_equal "response_timeout (10) must be less than request_timeout (5)", error.message
+    new_server(response_timeout: 30, request_timeout: nil)
+    new_server(response_timeout: nil, request_timeout: 5)
   end
 
   def test_threads_is_checked
@@ -151,6 +176,32 @@ class TestServerLimits < Minitest::Test
 
   # What has been counted is logged when the server stops, before
   # refusal_log_interval (60 seconds by default) has passed.
+  # The responses aborted after response_timeout are counted as the
+  # refusals are, and logged refusal_log_interval after the first.
+  def test_timeouts_are_logged_once_refusal_log_interval_has_passed
+    client = connect
+    client.request(:get, "/big").tap { |id| client.pause(id) }
+    client.pump_until(timeout: 10) { !timeout_lines.empty? }
+    lines = timeout_lines
+    assert_equal 1, lines.size, lines.inspect
+    # A second, or two on a busy machine that woke late.
+    assert_match(/\Aresponses_timed_out count=1 seconds=[12]\z/, lines.first)
+    assert_empty refusal_lines
+  end
+
+  def test_timeouts_are_logged_when_the_server_stops
+    client = connect
+    id = client.request(:get, "/big").tap { |i| client.pause(i) }
+    client.pump_until { client.aborted?(id) }
+    @clients.each(&:close)
+    status = stop_server(@pid)
+    @pid = nil
+    assert_predicate status, :success?
+    lines = timeout_lines
+    assert_equal 1, lines.size, lines.inspect
+    assert_match(/\Aresponses_timed_out count=1 seconds=\d+\z/, lines.first)
+  end
+
   def test_refusals_are_logged_when_the_server_stops
     held = hold_request
     second = connect
@@ -273,6 +324,10 @@ class TestServerLimits < Minitest::Test
   # The requests_refused lines of the server's log so far.
   def refusal_lines
     File.read(@log_path).scan(/requests_refused[^\n]*/)
+  end
+
+  def timeout_lines
+    File.read(@log_path).scan(/responses_timed_out[^\n]*/)
   end
 
   # Pump for a while, so that the server gets what the client sent.

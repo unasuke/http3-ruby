@@ -15,13 +15,21 @@ class TestServerThreads < Minitest::Test
   # The options of the tests that need more than the defaults.
   OPTIONS = {
     "test_requests_wait_for_a_free_worker" => {threads: 1},
-    "test_request_waiting_too_long_for_a_worker_gets_503" => {threads: 1, request_timeout: 1},
+    # response_timeout has to be less than request_timeout, and plays no part.
+    "test_request_waiting_too_long_for_a_worker_gets_503" => {threads: 1, request_timeout: 1, response_timeout: nil},
     "test_request_reset_while_waiting_never_reaches_the_application" => {threads: 1},
     "test_connections_take_turns" => {threads: 1},
     "test_exit_or_raise_in_the_application_keeps_the_worker" => {threads: 1},
     "test_stop_gives_up_on_a_stuck_job" => {shutdown_timeout: 1},
-    "test_stop_cancels_a_body_still_being_written" => {shutdown_timeout: 1}
+    "test_stop_cancels_a_body_still_being_written" => {shutdown_timeout: 1},
+    "test_responses_not_read_free_their_workers" => {response_timeout: 1},
+    "test_array_and_file_bodies_not_read_are_aborted" => {response_timeout: 1},
+    "test_streaming_body_with_nothing_to_send_is_not_aborted" => {response_timeout: 1}
   }.freeze
+
+  # The size of /big-array and /big-file: much more than the client's
+  # window lets the server send unread.
+  BIG = 4 * 1_024 * 1_024
 
   Event = Data.define(:name, :detail, :thread, :extra)
 
@@ -128,6 +136,8 @@ class TestServerThreads < Minitest::Test
     @log_path = File.join(@dir, "server.log")
     @file_path = File.join(@dir, "file")
     File.write(@file_path, "file content")
+    # What /big-file serves, next to /file.
+    File.binwrite(File.join(@dir, "big-file"), "x" * BIG) if name == "test_array_and_file_bodies_not_read_are_aborted"
     @clients = []
     @events = []
     @event_buffer = +""
@@ -440,6 +450,51 @@ class TestServerThreads < Minitest::Test
     refute_match(/workers_still_running/, File.read(@log_path))
   end
 
+  # Responses whose client reads none of them take every worker, an each
+  # body and a streaming one alike, until response_timeout: then they are
+  # aborted, their write raises StreamClosed, which stops them without an
+  # app_error, and the workers answer another connection.
+  def test_responses_not_read_free_their_workers
+    stalled = connect
+    held = %w[/endless?1 /endless?2 /stream-endless].map do |path|
+      stalled.request(:get, path).tap { |id| stalled.pause(id) }
+    end
+    %w[/endless?1 /endless?2 /stream-endless].each { |detail| wait_for_event(stalled, "call", detail) }
+    started = now
+    other = connect
+    id = other.request(:get, "/fast")
+    other.pump_until { other.response(id)&.finished? }
+    assert_equal "fast", other.response(id).body
+    assert_operator now - started, :<, 1 + 3
+
+    assert_equal "HTTP3::StreamClosed", wait_for_event(stalled, "each-ended", "/endless?1").extra
+    assert_equal "HTTP3::StreamClosed", wait_for_event(stalled, "each-ended", "/endless?2").extra
+    assert_equal "HTTP3::StreamClosed", wait_for_event(stalled, "stream-ended", "/stream-endless").extra
+    stalled.pump_until { held.all? { |stream| stalled.aborted?(stream) } }
+    refute_match(/app_error/, File.read(@log_path))
+  end
+
+  # Array and file bodies, which need no worker, are aborted too.
+  def test_array_and_file_bodies_not_read_are_aborted
+    client = connect
+    held = %w[/big-array /big-file].map { |path| client.request(:get, path).tap { |id| client.pause(id) } }
+    client.pump_until { held.all? { |id| client.aborted?(id) } }
+    refute_match(/app_error/, File.read(@log_path))
+  end
+
+  # A streaming body with nothing to send for longer than
+  # response_timeout, as server-sent events between events, is not
+  # aborted.
+  def test_streaming_body_with_nothing_to_send_is_not_aborted
+    client = connect
+    id = client.request(:get, "/stream-wait")
+    client.pump_until { client.response(id)&.body.to_s == "first" }
+    pump_for(client, 2.5)
+    release
+    client.pump_until { client.response(id).finished? }
+    assert_equal "firstsecond", client.response(id).body
+  end
+
   # Neither exit nor raise in the application costs the worker: the next
   # request gets the one there is.
   def test_exit_or_raise_in_the_application_keeps_the_worker
@@ -479,7 +534,9 @@ class TestServerThreads < Minitest::Test
       when "/slow-each" then [200, {}, SlowEachBody.new(release_r, detail, record)]
       when "/fast", "/rr" then [200, {}, [env["PATH_INFO"].delete("/")]]
       when "/file" then [200, {}, TrackedFile.new(file_path, detail, record)]
+      when "/big-file" then [200, {}, TrackedFile.new(File.join(File.dirname(file_path), "big-file"), detail, record)]
       when "/array" then [200, {}, TrackedArray.new(["a", "b"], detail, record)]
+      when "/big-array" then [200, {}, TrackedArray.new(["x" * BIG], detail, record)]
       when "/each" then [200, {}, tracked.call(["one,", "two"])]
       when "/empty-each" then [200, {}, tracked.call([])]
       when "/no-content" then [204, {}, tracked.call([])]

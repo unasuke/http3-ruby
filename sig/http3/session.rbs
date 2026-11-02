@@ -26,12 +26,17 @@ module HTTP3
     # Session sharing shared_spool count against its limits. More, or a
     # file that cannot be made or written, gets 503. A request counts until
     # its stream closes, or, once handed out, until #finish, though its
-    # stream or connection has gone.
+    # stream or connection has gone. A response whose body has waited on
+    # its client for response_timeout seconds is aborted
+    # (#expire_responses): a limit on a stall, not on the whole response;
+    # nil is no limit. The caller calls #expire_requests and
+    # #expire_responses every turn, and waits no longer than
+    # #next_request_deadline and #next_response_deadline.
     def self.attach: (QUIC::Connection::Server quic_conn, max_request_body: Integer, max_field_section_size: Integer,
                       ?max_connection_request_buffer: Integer, ?shared_buffer: shared_buffer?,
                       ?request_timeout: (Integer | Float)?, ?request_body_buffer_size: Integer,
                       ?max_connection_request_spool: Integer, ?max_connection_request_spool_files: Integer,
-                      ?shared_spool: shared_spool?) -> Session
+                      ?shared_spool: shared_spool?, ?response_timeout: (Integer | Float)?) -> Session
 
     # A limit of limit bytes for the requests of every Session given it.
     def self.shared_buffer: (Integer limit) -> shared_buffer
@@ -78,6 +83,15 @@ module HTTP3
     # When the next request still coming in, or waiting to be handed out,
     # runs out of time, or nil.
     def next_request_deadline: () -> Float?
+
+    # Abort with H3_REQUEST_CANCELLED the responses whose body has waited
+    # on its client response_timeout seconds or more at now
+    # (CLOCK_MONOTONIC), cancelling a Body::Pipe, whose writer then gets
+    # StreamClosed. Returns how many.
+    def expire_responses: (Float now) -> Integer
+
+    # When the next response waiting on its client runs out of time, or nil.
+    def next_response_deadline: () -> Float?
 
     # Send response. Yields the exception of a file body whose descriptor
     # could not be duplicated; its stream is aborted. Raises
@@ -131,13 +145,24 @@ module HTTP3
     # Read no more of the request on stream_id (STOP_SENDING with
     # H3_NO_ERROR); for one answered before it has arrived in full.
     def stop_reading: (Integer stream_id) -> self
+    # These three raise Nghttp3::InvalidStateError once the stream has been
+    # aborted.
     def push_chunk: (Integer stream_id, String str) -> self
     def push_eof: (Integer stream_id) -> self
     def attach_file: (Integer stream_id, IO io, Integer offset, Integer length) -> self
     def unsent_bytes: (Integer stream_id) -> Integer
+    # Since when (CLOCK_MONOTONIC seconds) the response body on stream_id
+    # has waited on the client with nothing moving: no acknowledgement of
+    # it, no wider flow control window for it, and, while that window does
+    # not hold it back, no acknowledgement of any body on the connection.
+    # nil while none of it waits, without a body, and once aborted.
+    def response_stalled_since: (Integer stream_id) -> Float?
     def take_closed: () -> Array[Integer]
     def take_error: () -> Exception?
     def shutdown_notice: () -> self
+    # Stop the stream in both directions with app_error_code. What of the
+    # body nghttp3 has not taken is let go at once (unsent_bytes no longer
+    # counts it), and a file body's descriptor closed.
     def abort_stream: (Integer stream_id, Integer app_error_code) -> self
   end
 end
