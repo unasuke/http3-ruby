@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/random.h>
+#include <time.h>
 #include <unistd.h>
 
 /*
@@ -65,13 +66,19 @@ typedef struct {
   size_t nchunks, cap;
   size_t handed;    /* how many of chunks read_data has handed to nghttp3 */
   uint64_t unsent;  /* bytes queued but not handed to nghttp3 yet */
+  uint64_t queued;  /* bytes ever queued, the pieces read from a file too */
   uint64_t acked;   /* bytes the peer has acknowledged */
   uint64_t shifted; /* bytes of the chunks already dropped */
   int fd;           /* a file body (#attach_file) not read in full yet, or -1 */
   off_t file_off, file_end;
-  bool eof;     /* nothing follows the queued chunks */
-  bool blocked; /* read_data returned NGHTTP3_ERR_WOULDBLOCK */
-  bool aborted; /* #abort_stream stopped it: no more of the body is sent */
+  /* When the body began to wait on the peer, or last moved: the peer
+   * acknowledged some of it, or widened the stream's flow control window
+   * (CLOCK_MONOTONIC seconds; #response_stalled_since) */
+  double since;
+  bool fc_blocked; /* the peer's flow control window holds it back */
+  bool eof;        /* nothing follows the queued chunks */
+  bool blocked;    /* read_data returned NGHTTP3_ERR_WOULDBLOCK */
+  bool aborted;    /* #abort_stream stopped it: no more of the body is sent */
 } h3_stream;
 
 typedef struct {
@@ -90,7 +97,17 @@ typedef struct {
   /* stream_id => size of the header section received so far, while the
    * headers of that request come in */
   st_table *field_sizes;
+  /* When the peer last acknowledged some response body, on any stream
+   * (CLOCK_MONOTONIC seconds) */
+  double acked_at;
 } h3_session;
+
+/* CLOCK_MONOTONIC in seconds, as Process.clock_gettime gives it. */
+static double h3_now(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
 
 /* Streams */
 
@@ -131,7 +148,18 @@ static int h3_stream_push(h3_stream *st, const uint8_t *base, size_t len,
   }
   st->chunks[st->nchunks++] = (h3_chunk){base, len, str};
   st->unsent += len;
+  st->queued += len;
   return 0;
+}
+
+/* Bytes of the body the peer has not acknowledged: queued, the rest of a
+ * file not read yet, or sent; 0 once the stream has been aborted. */
+static uint64_t h3_stream_unacked(const h3_stream *st) {
+  if (st->aborted) {
+    return 0;
+  }
+  uint64_t rest = st->fd >= 0 ? (uint64_t)(st->file_end - st->file_off) : 0;
+  return st->queued - st->acked + rest;
 }
 
 /* The whole file body has been read: let go of its descriptor now rather
@@ -295,7 +323,14 @@ static VALUE h3_end_headers_body(VALUE arg) {
 static int h3_acked_stream_data_cb(nghttp3_conn *conn, int64_t id,
                                    uint64_t datalen, void *user_data,
                                    void *stream_user_data) {
-  h3_stream *st = h3_stream_find(user_data, id);
+  h3_session *s = user_data;
+  h3_stream *st = h3_stream_find(s, id);
+  if (datalen > 0) {
+    s->acked_at = h3_now();
+    if (st != NULL) {
+      st->since = s->acked_at;
+    }
+  }
   if (st != NULL) {
     h3_stream_acked(st, datalen);
   }
@@ -598,8 +633,13 @@ static int h3_stream_data_written(void *ud, int64_t id, size_t n) {
   return rv == 0 ? 0 : h3_fail(s, rv);
 }
 
+/* The peer's flow control window for the stream is used up. */
 static int h3_stream_blocked(void *ud, int64_t id) {
   h3_session *s = ud;
+  h3_stream *st = h3_stream_find(s, id);
+  if (st != NULL) {
+    st->fc_blocked = true;
+  }
   if (s->h3 != NULL) {
     nghttp3_conn_block_stream(s->h3, id);
   }
@@ -623,8 +663,15 @@ static int h3_acked_stream_data(void *ud, int64_t id, uint64_t n) {
   return rv == 0 ? 0 : h3_fail(s, rv);
 }
 
+/* The peer widened the stream's flow control window: it has read some of
+ * the body. */
 static int h3_extend_max_stream_data(void *ud, int64_t id) {
   h3_session *s = ud;
+  h3_stream *st = h3_stream_find(s, id);
+  if (st != NULL) {
+    st->fc_blocked = false;
+    st->since = h3_now();
+  }
   if (s->h3 == NULL) {
     return 0;
   }
@@ -1015,6 +1062,10 @@ static VALUE rb_http3_session_push_chunk(VALUE self, VALUE rb_id, VALUE str) {
   if (RSTRING_LEN(copy) == 0) {
     return self;
   }
+  if (h3_stream_unacked(st) == 0) {
+    /* The body waits on the peer from now. */
+    st->since = h3_now();
+  }
   if (h3_stream_push(st, (const uint8_t *)RSTRING_PTR(copy),
                      (size_t)RSTRING_LEN(copy), copy) != 0) {
     rb_raise(rb_eNoMemError, "failed to queue a body chunk");
@@ -1084,6 +1135,7 @@ static VALUE rb_http3_session_attach_file(VALUE self, VALUE rb_id, VALUE io,
   st->fd = fd;
   st->file_off = off;
   st->file_end = off + len;
+  st->since = h3_now();
   if (len == 0) {
     h3_stream_end_file(st);
   }
@@ -1101,6 +1153,36 @@ static VALUE rb_http3_session_attach_file(VALUE self, VALUE rb_id, VALUE io,
 static VALUE rb_http3_session_unsent_bytes(VALUE self, VALUE rb_id) {
   h3_stream *st = h3_stream_find(h3_session_get(self), NUM2LL(rb_id));
   return ULL2NUM(st == NULL ? 0 : st->unsent);
+}
+
+/*
+ * call-seq:
+ *   session.response_stalled_since(stream_id) -> Float or nil
+ *
+ * Since when (CLOCK_MONOTONIC seconds, as Process.clock_gettime gives it)
+ * the response body on stream_id has waited on the client: some of it has
+ * not been acknowledged, and nothing has moved since. nil while none of it
+ * waits, for a stream without a body, and once the stream has been
+ * aborted.
+ *
+ * Moving is the client acknowledging some of the body, or widening the
+ * stream's flow control window. While that window does not hold the body
+ * back, an acknowledgement of any response body on the connection counts
+ * too: nghttp3 sends the responses of one priority one at a time, so a
+ * response waiting its turn behind another the client is reading gets no
+ * acknowledgements of its own.
+ */
+static VALUE rb_http3_session_response_stalled_since(VALUE self, VALUE rb_id) {
+  h3_session *s = h3_session_get(self);
+  h3_stream *st = h3_stream_find(s, NUM2LL(rb_id));
+  if (st == NULL || h3_stream_unacked(st) == 0) {
+    return Qnil;
+  }
+  double since = st->since;
+  if (!st->fc_blocked && s->acked_at > since) {
+    since = s->acked_at;
+  }
+  return DBL2NUM(since);
 }
 
 /*
@@ -1201,6 +1283,8 @@ void Init_http3_session(VALUE rb_mHTTP3) {
                    rb_http3_session_attach_file, 4);
   rb_define_method(rb_cHTTP3Session, "unsent_bytes",
                    rb_http3_session_unsent_bytes, 1);
+  rb_define_method(rb_cHTTP3Session, "response_stalled_since",
+                   rb_http3_session_response_stalled_since, 1);
   rb_define_method(rb_cHTTP3Session, "take_closed",
                    rb_http3_session_take_closed, 0);
   rb_define_method(rb_cHTTP3Session, "take_error", rb_http3_session_take_error,

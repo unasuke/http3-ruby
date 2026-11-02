@@ -137,6 +137,12 @@ module HTTP3
     def push_eof: (Integer stream_id) -> self
     def attach_file: (Integer stream_id, IO io, Integer offset, Integer length) -> self
     def unsent_bytes: (Integer stream_id) -> Integer
+    # Since when (CLOCK_MONOTONIC seconds) the response body on stream_id
+    # has waited on the client with nothing moving: no acknowledgement of
+    # it, no wider flow control window for it, and, while that window does
+    # not hold it back, no acknowledgement of any body on the connection.
+    # nil while none of it waits, without a body, and once aborted.
+    def response_stalled_since: (Integer stream_id) -> Float?
     def take_closed: () -> Array[Integer]
     def take_error: () -> Exception?
     def shutdown_notice: () -> self
