@@ -90,7 +90,7 @@ Other options, with their defaults:
 | `max_total_send_buffer:` | `67_108_864` | The same over all connections |
 | `request_timeout:` | `30` | Seconds a request may take to come in full, counted from its headers (later gets 408), and then to wait for a worker (later gets 503). `nil` for no limit |
 | `response_timeout:` | `10` | Seconds a response may stall, waiting on its client with nothing it sent acknowledged, before its stream is aborted (H3_REQUEST_CANCELLED). Not a limit on the whole response, which goes on for as long as its client keeps reading. Less than `request_timeout:`; `nil` for no limit |
-| `refusal_log_interval:` | `60` | Seconds between the `requests_refused` log lines, which count the requests answered without the application (400, 408, 413, 431, 501, 503) |
+| `refusal_log_interval:` | `60` | Seconds between the `requests_refused` and `responses_timed_out` log lines, which count the requests answered without the application (400, 408, 413, 431, 501, 503) and the responses aborted after `response_timeout:` |
 | `shutdown_timeout:` | `30` | Seconds a graceful stop waits for the requests under way |
 | `qlog_dir:` | `nil` | Directory for one qlog file per connection |
 | `transport_params:` | `QUIC::TransportParams.default` | QUIC transport parameters |
