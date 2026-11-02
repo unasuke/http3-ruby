@@ -131,6 +131,8 @@ module HTTP3
     # Read no more of the request on stream_id (STOP_SENDING with
     # H3_NO_ERROR); for one answered before it has arrived in full.
     def stop_reading: (Integer stream_id) -> self
+    # These three raise Nghttp3::InvalidStateError once the stream has been
+    # aborted.
     def push_chunk: (Integer stream_id, String str) -> self
     def push_eof: (Integer stream_id) -> self
     def attach_file: (Integer stream_id, IO io, Integer offset, Integer length) -> self
@@ -138,6 +140,9 @@ module HTTP3
     def take_closed: () -> Array[Integer]
     def take_error: () -> Exception?
     def shutdown_notice: () -> self
+    # Stop the stream in both directions with app_error_code. What of the
+    # body nghttp3 has not taken is let go at once (unsent_bytes no longer
+    # counts it), and a file body's descriptor closed.
     def abort_stream: (Integer stream_id, Integer app_error_code) -> self
   end
 end

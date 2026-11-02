@@ -71,6 +71,7 @@ typedef struct {
   off_t file_off, file_end;
   bool eof;     /* nothing follows the queued chunks */
   bool blocked; /* read_data returned NGHTTP3_ERR_WOULDBLOCK */
+  bool aborted; /* #abort_stream stopped it: no more of the body is sent */
 } h3_stream;
 
 typedef struct {
@@ -140,6 +141,24 @@ static void h3_stream_end_file(h3_stream *st) {
   close(st->fd);
   st->fd = -1;
   st->eof = true;
+}
+
+/* The stream has been aborted, and no more of its body will be sent: let go
+ * at once of what nghttp3 has not taken, and of the file's descriptor,
+ * rather than when the stream closes, which waits for the peer to
+ * acknowledge the reset. The chunks nghttp3 has taken stay until then,
+ * since it still points into them. */
+static void h3_stream_abort(h3_stream *st) {
+  for (size_t i = st->handed; i < st->nchunks; i++) {
+    h3_chunk_release(&st->chunks[i]);
+  }
+  st->nchunks = st->handed;
+  st->unsent = 0;
+  if (st->fd >= 0) {
+    close(st->fd);
+    st->fd = -1;
+  }
+  st->aborted = true;
 }
 
 /* Drop the chunks at the front the peer has acknowledged to their end. A
@@ -783,6 +802,12 @@ static void h3_raise_no_body(VALUE rb_id) {
            "no response body is open on stream %" PRIsVALUE, rb_id);
 }
 
+NORETURN(static void h3_raise_aborted(VALUE rb_id));
+static void h3_raise_aborted(VALUE rb_id) {
+  rb_raise(rb_eNghttp3InvalidStateError,
+           "stream %" PRIsVALUE " has been aborted", rb_id);
+}
+
 /* The body of stream rb_id. Ruby code that runs once it is found may make
  * the connection go on and close the stream, so convert everything else
  * first. */
@@ -974,12 +999,16 @@ static VALUE rb_http3_session_stop_reading(VALUE self, VALUE rb_id) {
  *   session.push_chunk(stream_id, str) -> self
  *
  * Queue a frozen copy of str as the next piece of the response body.
+ * Raises InvalidStateError once the stream has been aborted.
  */
 static VALUE rb_http3_session_push_chunk(VALUE self, VALUE rb_id, VALUE str) {
   h3_session *s = h3_session_enter(self);
   StringValue(str);
   VALUE copy = rb_str_new_frozen(str);
   h3_stream *st = h3_session_stream(self, rb_id);
+  if (st->aborted) {
+    h3_raise_aborted(rb_id);
+  }
   if (st->eof) {
     rb_raise(rb_eNghttp3InvalidStateError, "the body has ended");
   }
@@ -999,11 +1028,15 @@ static VALUE rb_http3_session_push_chunk(VALUE self, VALUE rb_id, VALUE str) {
  * call-seq:
  *   session.push_eof(stream_id) -> self
  *
- * Mark the end of the response body.
+ * Mark the end of the response body. Raises InvalidStateError once the
+ * stream has been aborted.
  */
 static VALUE rb_http3_session_push_eof(VALUE self, VALUE rb_id) {
   h3_session *s = h3_session_enter(self);
   h3_stream *st = h3_session_stream(self, rb_id);
+  if (st->aborted) {
+    h3_raise_aborted(rb_id);
+  }
   st->eof = true;
   h3_stream_wake(s, st);
   return self;
@@ -1017,7 +1050,8 @@ static VALUE rb_http3_session_push_eof(VALUE self, VALUE rb_id) {
  * descriptor is duplicated, so io may be closed afterwards. The duplicate
  * is close-on-exec, as Ruby's own descriptors are, so that a process the
  * application spawns does not inherit it, and is closed as soon as the
- * whole length has been read.
+ * whole length has been read. Raises InvalidStateError once the stream has
+ * been aborted.
  */
 static VALUE rb_http3_session_attach_file(VALUE self, VALUE rb_id, VALUE io,
                                           VALUE offset, VALUE length) {
@@ -1038,6 +1072,10 @@ static VALUE rb_http3_session_attach_file(VALUE self, VALUE rb_id, VALUE io,
   if (st == NULL) {
     close(fd);
     h3_raise_no_body(rb_id);
+  }
+  if (st->aborted) {
+    close(fd);
+    h3_raise_aborted(rb_id);
   }
   if (st->fd >= 0 || st->eof || st->nchunks > 0) {
     close(fd);
@@ -1116,13 +1154,21 @@ static VALUE rb_http3_session_shutdown_notice(VALUE self) {
  *   session.abort_stream(stream_id, app_error_code) -> self
  *
  * Stop the stream in both directions with app_error_code (for instance
- * H3_INTERNAL_ERROR after the response headers went out).
+ * H3_INTERNAL_ERROR after the response headers went out). What of the
+ * response body nghttp3 has not taken is let go at once, so that
+ * #unsent_bytes no longer counts it, and a file body's descriptor is
+ * closed; #push_chunk, #push_eof and #attach_file raise InvalidStateError
+ * from then on.
  */
 static VALUE rb_http3_session_abort_stream(VALUE self, VALUE rb_id,
                                            VALUE rb_code) {
   h3_session *s = h3_session_enter(self);
   int64_t id = NUM2LL(rb_id);
   uint64_t code = NUM2ULL(rb_code);
+  h3_stream *st = h3_stream_find(s, id);
+  if (st != NULL) {
+    h3_stream_abort(st);
+  }
   if (s->h3 != NULL) {
     nghttp3_conn_shutdown_stream_write(s->h3, id);
   }
