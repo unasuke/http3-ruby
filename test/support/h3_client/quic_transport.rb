@@ -114,14 +114,16 @@ module H3TestClient
       end
     end
 
-    # One round: hand what HTTP/3 has to QUIC, run QUIC's I/O once, and
-    # hand back whatever arrived.
-    def pump
+    # One round: hand what HTTP/3 has to QUIC, run QUIC's I/O once, waiting
+    # up to timeout seconds for a datagram, and hand back whatever arrived.
+    # Many clients pumped in turn wait that long each, and acknowledge
+    # what they get only as often.
+    def pump(timeout: 0.002)
       @client.pump_writes do |id, data, fin|
         write(@streams.fetch(id), data, fin)
         data.bytesize
       end
-      @quic.pump_once(timeout: 0.002)
+      @quic.pump_once(timeout: timeout)
       feed
     end
 
