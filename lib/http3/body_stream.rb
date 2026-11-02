@@ -9,8 +9,9 @@ module HTTP3
     # written, a write or flush after close_write raises IOError, as a read
     # after close_read does, and the closes may be called again.
     #
-    # Once the stream has gone away, write and flush raise StreamClosed, and
-    # so do close_write and close, once. Writing past length, the
+    # Once the stream has gone away (the client reset it, or it was aborted
+    # after response_timeout), write and flush raise StreamClosed, and so
+    # do close_write and close, once. Writing past length, the
     # content-length, fails the pipe, so that the stream is aborted, and
     # raises StreamClosed, so that the body stops there; ending short of it
     # fails the pipe too.

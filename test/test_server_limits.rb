@@ -20,7 +20,10 @@ class TestServerLimits < Minitest::Test
     max_connection_send_buffer: 8_192,
     max_total_send_buffer: 8_192,
     # Long enough for the requests the other tests hold open.
-    request_timeout: 2
+    request_timeout: 2,
+    # The default would not be less than request_timeout, as it has to be;
+    # the tests that hold responses not read need no limit.
+    response_timeout: nil
   }.freeze
 
   # The options of the tests that need more than LIMITS.
@@ -123,7 +126,27 @@ class TestServerLimits < Minitest::Test
       error = assert_raises(ArgumentError, value.inspect) { new_server(request_timeout: value) }
       assert_equal "request_timeout must be nil or a positive number of seconds (got #{value.inspect})", error.message
     end
-    [nil, 0.5].each { |value| new_server(request_timeout: value) }
+    [nil, 0.5].each { |value| new_server(request_timeout: value, response_timeout: nil) }
+  end
+
+  def test_response_timeout_is_checked
+    [0, -1, "10"].each do |value|
+      error = assert_raises(ArgumentError, value.inspect) { new_server(response_timeout: value) }
+      assert_equal "response_timeout must be nil or a positive number of seconds (got #{value.inspect})", error.message
+    end
+    [nil, 0.5].each { |value| new_server(response_timeout: value) }
+  end
+
+  # Unless either is nil, response_timeout has to be less than request_timeout,
+  # so that the workers that clients not reading keep are freed before the
+  # requests waiting for them get 503.
+  def test_response_timeout_has_to_be_less_than_request_timeout
+    error = assert_raises(ArgumentError) { new_server(response_timeout: 30) }
+    assert_equal "response_timeout (30) must be less than request_timeout (30)", error.message
+    error = assert_raises(ArgumentError) { new_server(request_timeout: 5) }
+    assert_equal "response_timeout (10) must be less than request_timeout (5)", error.message
+    new_server(response_timeout: 30, request_timeout: nil)
+    new_server(response_timeout: nil, request_timeout: 5)
   end
 
   def test_threads_is_checked

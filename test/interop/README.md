@@ -82,12 +82,13 @@ size should grow by tens of MiB, not by the 2 GB sent; it varies from run to
 run, so the script checks no threshold.
 
 `--request-timeout` is passed on to `server.rb` as the server's
-`request_timeout` (30 seconds by default, longer than the script waits). With
-it, the script also waits for the requests held open to run out of time and
-exits non-zero unless every one of them gets 408 and no temporary file is
-left open afterwards. With `--request-timeout 5`, 512 got 408: the 256 held
-at first, then 256 more whose bodies were still on their way when the first
-ones let go of their files.
+`request_timeout` (30 seconds by default, longer than the script waits),
+with half of it as `--response-timeout`, since `response_timeout` has to be
+less. With it, the script also waits for the requests held open to run out
+of time and exits non-zero unless every one of them gets 408 and no
+temporary file is left open afterwards. With `--request-timeout 5`, 512 got
+408: the 256 held at first, then 256 more whose bodies were still on their
+way when the first ones let go of their files.
 
 ## Responses not read
 

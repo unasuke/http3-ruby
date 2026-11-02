@@ -92,15 +92,22 @@ module HTTP3
     # start of its headers is answered with 408, and one not handed out
     # within request_timeout seconds of its end with 503
     # (#expire_requests); nil is no limit.
+    #
+    # A response whose body has waited on its client for response_timeout
+    # seconds (#response_stalled_since) is aborted (#expire_responses): a
+    # limit on a stall, not on the whole response. nil is no limit. Whoever
+    # drives the Session calls #expire_requests and #expire_responses every
+    # turn, and waits no longer than #next_request_deadline and
+    # #next_response_deadline.
     def self.attach(quic_conn, max_request_body:, max_field_section_size:,
       max_connection_request_buffer: 4_194_304, shared_buffer: nil, request_timeout: nil,
       request_body_buffer_size: 65_536, max_connection_request_spool: 16_777_216,
-      max_connection_request_spool_files: 16, shared_spool: nil)
+      max_connection_request_spool_files: 16, shared_spool: nil, response_timeout: nil)
       session = _attach(quic_conn, max_field_section_size)
       spool = Spool.new(Budget.new(max_connection_request_spool, parent: shared_spool&.bytes),
         Budget.new(max_connection_request_spool_files, parent: shared_spool&.files))
       session.send(:setup, max_request_body, Budget.new(max_connection_request_buffer, parent: shared_buffer),
-        request_timeout, request_body_buffer_size, spool)
+        request_timeout, request_body_buffer_size, spool, response_timeout)
       session
     end
 
@@ -212,6 +219,36 @@ module HTTP3
 
       started = @incoming.filter_map { |id, request| request.started unless @rejected[id] }.min
       [started, @ready.first&.last].compact.min&.+(@request_timeout)
+    end
+
+    # Abort, with H3_REQUEST_CANCELLED, the responses whose body has waited
+    # on its client (#response_stalled_since) response_timeout seconds or
+    # more at now (CLOCK_MONOTONIC): RFC 9114 section 4.1.1 has a server that
+    # abandons a response use that code. A Body::Pipe is cancelled, so that
+    # its writer's write, finish or flush raises StreamClosed; one busy
+    # elsewhere gets it from its next. The Rack body is closed as ever, once
+    # the stream closes (#release_closed). Returns how many were aborted.
+    def expire_responses(now)
+      return 0 if @response_timeout.nil?
+
+      expired = @outgoing.select do |id, _out|
+        since = response_stalled_since(id)
+        since && since + @response_timeout <= now
+      end
+      expired.each do |id, out|
+        abort_stream(id, Nghttp3::H3_REQUEST_CANCELLED)
+        out.done = true
+        out.body.cancel if out.body.is_a?(Body::Pipe)
+      end
+      expired.size
+    end
+
+    # When the next response to wait on its client runs out of time
+    # (CLOCK_MONOTONIC), or nil.
+    def next_response_deadline
+      return nil if @response_timeout.nil?
+
+      @outgoing.each_key.filter_map { |id| response_stalled_since(id) }.min&.+(@response_timeout)
     end
 
     # Send response to request. Its body, if any, is kept until the stream
@@ -405,10 +442,11 @@ module HTTP3
 
     private
 
-    def setup(max_request_body, budget, request_timeout, request_body_buffer_size, spool)
+    def setup(max_request_body, budget, request_timeout, request_body_buffer_size, spool, response_timeout)
       @max_request_body = max_request_body
       @budget = budget
       @request_timeout = request_timeout
+      @response_timeout = response_timeout
       @request_body_buffer_size = request_body_buffer_size
       @spool = spool
       @held = {}

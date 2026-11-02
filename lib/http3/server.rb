@@ -78,7 +78,12 @@ module HTTP3
     # connection; a body waits for room. Each has to be at least the one before. A request
     # not received in full within request_timeout seconds of the start of
     # its headers gets 408, and one that waits that long for a worker
-    # afterwards 503; nil is no limit. refusal_log_interval is the seconds
+    # afterwards 503; nil is no limit. A response that stalls, waiting on
+    # its client with nothing of it acknowledged, for response_timeout
+    # seconds is aborted with H3_REQUEST_CANCELLED, and a worker writing it
+    # gets StreamClosed; it bounds a stall, not the whole response. nil is
+    # no limit, and unless either is nil, it has to be less than
+    # request_timeout. refusal_log_interval is the seconds
     # between the requests_refused lines (see above). threads is the number
     # of worker threads.
     def initialize(app:, bind:, certificate_path:, private_key_path:, transport_params: nil, settings: nil,
@@ -88,7 +93,8 @@ module HTTP3
       max_total_request_spool: 1_073_741_824, max_connection_request_spool_files: 16,
       max_total_request_spool_files: 256,
       send_buffer_size: 65_536, max_connection_send_buffer: 1_048_576, max_total_send_buffer: 67_108_864,
-      request_timeout: 30, refusal_log_interval: 60, shutdown_timeout: 30, logger: Logger.new($stderr))
+      request_timeout: 30, response_timeout: 10, refusal_log_interval: 60, shutdown_timeout: 30,
+      logger: Logger.new($stderr))
       check_request_limits(max_request_body:, max_field_section_size:, max_connection_request_buffer:,
         max_total_request_buffer:, request_body_buffer_size:, max_connection_request_spool:,
         max_total_request_spool:, max_connection_request_spool_files:, max_total_request_spool_files:)
@@ -97,6 +103,7 @@ module HTTP3
       check_send_limits(send_buffer_size, max_connection_send_buffer, max_total_send_buffer)
       check_threads(threads)
       check_request_timeout(request_timeout)
+      check_response_timeout(response_timeout, request_timeout)
       check_refusal_log_interval(refusal_log_interval)
       @app = app
       @threads = threads
@@ -123,6 +130,7 @@ module HTTP3
       @max_connection_send_buffer = max_connection_send_buffer
       @max_total_send_buffer = max_total_send_buffer
       @request_timeout = request_timeout
+      @response_timeout = response_timeout
       @refusal_log_interval = refusal_log_interval
       @shutdown_timeout = shutdown_timeout
       @logger = logger
@@ -198,6 +206,7 @@ module HTTP3
       drain_wake
       take_results
       expire_requests
+      expire_responses
       serve_requests
       log_refusals if refusals_due?
       fill_bodies(room)
@@ -214,11 +223,12 @@ module HTTP3
       end
     end
 
-    # Until the next timer, the next request to run out of time (coming in,
-    # or waiting for a worker), the next requests_refused lines or the end
-    # of the drain, but no wait at all while a body could take more within
-    # the send buffers: a Body::Pipe only once its worker has written to it.
-    # A worker with a result wakes the loop through @wake_r.
+    # Until the next timer, the next request (coming in, or waiting for a
+    # worker) or response (waiting on its client) to run out of time, the
+    # next requests_refused lines or the end of the drain, but no wait at
+    # all while a body could take more within the send buffers: a
+    # Body::Pipe only once its worker has written to it. A worker with a
+    # result wakes the loop through @wake_r.
     def select_timeout(room)
       wants_fill = @sessions.each_value.any? { |session|
         session.wants_fill?(@send_buffer_size, connection_limit: @max_connection_send_buffer, room: room)
@@ -229,6 +239,8 @@ module HTTP3
       expiry = @endpoint.expiry
       timeouts << [(expiry - now_ns) / 1e9, 0.0].max if expiry
       deadline = @sessions.each_value.filter_map(&:next_request_deadline).min
+      timeouts << [deadline - now, 0.0].max if deadline
+      deadline = @sessions.each_value.filter_map(&:next_response_deadline).min
       timeouts << [deadline - now, 0.0].max if deadline
       timeouts << [refusal_log_at - now, 0.0].max if refusal_log_at
       timeouts << [@drain_deadline - now, 0.0].max if @drain_deadline
@@ -262,7 +274,8 @@ module HTTP3
         max_connection_request_buffer: @max_connection_request_buffer, shared_buffer: @request_buffer,
         request_timeout: @request_timeout, request_body_buffer_size: @request_body_buffer_size,
         max_connection_request_spool: @max_connection_request_spool,
-        max_connection_request_spool_files: @max_connection_request_spool_files, shared_spool: @request_spool
+        max_connection_request_spool_files: @max_connection_request_spool_files, shared_spool: @request_spool,
+        response_timeout: @response_timeout
       )
       @remotes[conn] = sender
     rescue => e
@@ -279,6 +292,12 @@ module HTTP3
     def expire_requests
       at = now
       @sessions.each_value { |session| session.expire_requests(at) }
+    end
+
+    # Abort the responses that have waited on their clients response_timeout.
+    def expire_responses
+      at = now
+      @sessions.each_value { |session| session.expire_responses(at) }
     end
 
     # Answer the refused requests at once, then hand those received in full
@@ -712,6 +731,19 @@ module HTTP3
       return if (request_timeout.is_a?(Integer) || request_timeout.is_a?(Float)) && request_timeout.positive?
 
       raise ArgumentError, "request_timeout must be nil or a positive number of seconds (got #{request_timeout.inspect})"
+    end
+
+    # response_timeout has to be less than request_timeout, so that the
+    # workers clients that stop reading keep are freed before the requests
+    # waiting for them get 503.
+    def check_response_timeout(response_timeout, request_timeout)
+      return if response_timeout.nil?
+
+      seconds = (response_timeout.is_a?(Integer) || response_timeout.is_a?(Float)) && response_timeout.positive?
+      raise ArgumentError, "response_timeout must be nil or a positive number of seconds (got #{response_timeout.inspect})" unless seconds
+      return if request_timeout.nil? || response_timeout < request_timeout
+
+      raise ArgumentError, "response_timeout (#{response_timeout}) must be less than request_timeout (#{request_timeout})"
     end
 
     def check_refusal_log_interval(refusal_log_interval)
