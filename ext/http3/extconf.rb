@@ -7,8 +7,8 @@ require "mini_portile2"
 # installing needs no system package and always gets this version.
 # nghttp3_conn_read_stream2 needs 1.12.0 or later. nghttp3 depends on nothing
 # but libc, so its version does not have to follow the quic gem's ngtcp2.
-NGHTTP3_VERSION = "1.13.1"
-NGHTTP3_SHA256 = "07160f28af3ddc3e8b95c8bbefe08c650e7cf303375141b6ca35cc89b319f70d"
+NGHTTP3_VERSION = "1.19.0"
+NGHTTP3_SHA256 = "0dc9a55d38ca04c282524bfecdc5e31d393a4bb430200263dd06a87801a150af"
 
 nghttp3 = MiniPortile.new("nghttp3", NGHTTP3_VERSION)
 nghttp3.files = [{

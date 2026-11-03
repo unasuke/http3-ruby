@@ -676,9 +676,12 @@ class TestServerThreads < Minitest::Test
 
   # Send client a request the server refuses at once (431, its headers
   # too large), and wait for the answer: by then the server has read what
-  # the client sent before it.
+  # the client sent before it. The headers are split into fields small
+  # enough for nghttp3 to decode: from 1.18.0, a single field it estimates
+  # over 64 KiB once decoded closes the connection instead.
   def barrier(client)
-    id = client.request(:get, "/", headers: {"x-large" => "x" * 70_000})
+    headers = Array.new(4) { |i| ["x-large-#{i}", "x" * 20_000] }.to_h
+    id = client.request(:get, "/", headers: headers)
     client.pump_until { client.response(id).finished? }
   end
 

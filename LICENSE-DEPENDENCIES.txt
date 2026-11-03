@@ -9,7 +9,7 @@ LICENSE-DEPENDENCIES.txt. The http3 gem itself is MIT licensed; see
 LICENSE.txt.
 
 
-nghttp3 1.13.1 -- https://github.com/ngtcp2/nghttp3
+nghttp3 1.19.0 -- https://github.com/ngtcp2/nghttp3
 ---------------------------------------------------
 
 The MIT License
@@ -39,7 +39,7 @@ Some nghttp3 source files also carry "Copyright (c) ngtcp2 contributors" or
 "Copyright (c) nghttp2 contributors" notices, under the same terms.
 
 
-sfparse (bundled in nghttp3 1.13.1, lib/sfparse) -- https://github.com/ngtcp2/sfparse
+sfparse (bundled in nghttp3 1.19.0, lib/sfparse) -- https://github.com/ngtcp2/sfparse
 -------------------------------------------------------------------------------------
 
 The MIT License

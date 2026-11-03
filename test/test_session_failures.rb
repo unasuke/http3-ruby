@@ -52,6 +52,36 @@ class TestSessionFailures < Minitest::Test
     assert_equal FAILED, outcome
   end
 
+  # A field nghttp3 estimates over 64 KiB once decoded (8/5 of its Huffman
+  # coded length, here about 98,000 for 70,000 bytes) is
+  # NGHTTP3_ERR_QPACK_HEADER_TOO_LARGE from nghttp3 1.18.0 on: the connection
+  # fails, though a header section over max_field_section_size made of
+  # smaller fields gets 431.
+  def test_a_field_too_large_to_decode
+    outcome = serve_in_child do |port|
+      client = H3TestClient::QuicTransport.connect(port, ca_file: credentials.ca_file)
+      client.request(:get, "/", headers: {"x-large" => "x" * 70_000})
+      # Hand the request to QUIC; the QUIC connection alone is pumped next.
+      client.pump
+      client.quic
+    end
+    assert_equal FAILED, outcome
+  end
+
+  # The same for a name, whose limit is 256 bytes: 200 bytes of "x" code to
+  # 175, which nghttp3 estimates at 280 once decoded. nghttp3 1.13.1 measured
+  # the coded length alone, and passed the request on.
+  def test_a_field_name_too_large_to_decode
+    outcome = serve_in_child do |port|
+      client = H3TestClient::QuicTransport.connect(port, ca_file: credentials.ca_file)
+      client.request(:get, "/", headers: {"x" * 200 => "1"})
+      # Hand the request to QUIC; the QUIC connection alone is pumped next.
+      client.pump
+      client.quic
+    end
+    assert_equal FAILED, outcome
+  end
+
   # STOP_SENDING on the server's control stream asks it to close a critical
   # stream, which is H3_CLOSED_CRITICAL_STREAM (RFC 9114 section 6.2.1): the
   # connection fails. quic shows Ruby no code of a connection's close, so
