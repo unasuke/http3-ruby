@@ -179,10 +179,11 @@ module HTTP3
     end
 
     # True while the request on stream_id can still be answered: its stream
-    # is open, the client has not reset it, it has not been refused, and it
-    # has not been answered.
+    # is open, the client has neither reset it nor asked for no more of it
+    # (STOP_SENDING), it has not been refused, and it has not been answered.
     def answerable?(stream_id)
-      @open.key?(stream_id) && !@reset[stream_id] && !@rejected[stream_id] && !@answered[stream_id]
+      @open.key?(stream_id) && !@reset[stream_id] && !@stopped[stream_id] && !@rejected[stream_id] &&
+        !@answered[stream_id]
     end
 
     # The first exception a temporary file raised since the last call, or
@@ -440,6 +441,31 @@ module HTTP3
       @incomplete << id
     end
 
+    # The client asked for no more of the response (STOP_SENDING). The C
+    # part has stopped sending it and reading the rest of the request, and
+    # the request is no longer #answerable?: one waiting to be handed out, or
+    # still coming in, is dropped with what it held, and one refused is not
+    # answered. A response being sent stops: a Body::Pipe is cancelled, so
+    # that its writer gets StreamClosed. Inside a callback, so it calls no C.
+    def on_stop_sending(id)
+      return unless @open.key?(id)
+
+      @stopped[id] = true
+      @refused.reject! { |request, _| request.stream_id == id }
+      if (out = @outgoing[id])
+        out.done = true
+        out.body.cancel if out.body.is_a?(Body::Pipe)
+      end
+      if (waiting = take_waiting(id))
+        close_input(waiting.input)
+        release_budget(id)
+      elsif (request = @incoming[id]) && !@rejected[id]
+        @incoming.delete(id)
+        close_input(request.body)
+        release_budget(id)
+      end
+    end
+
     private
 
     def setup(max_request_body, budget, request_timeout, request_body_buffer_size, spool, response_timeout)
@@ -468,6 +494,9 @@ module HTTP3
       @open = {}
       # stream_id => true for a stream the client has reset
       @reset = {}
+      # stream_id => true for a stream the client asked for no more of
+      # (STOP_SENDING)
+      @stopped = {}
       @rejected = {}
       @answered = {}
       @incomplete = []
@@ -670,6 +699,7 @@ module HTTP3
       close_input(waiting.input) if waiting
       release_budget(id) unless @handed.key?(id)
       @reset.delete(id)
+      @stopped.delete(id)
       @rejected.delete(id)
       @answered.delete(id)
       @refused.reject! { |request, _| request.stream_id == id }

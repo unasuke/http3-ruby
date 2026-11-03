@@ -1,11 +1,11 @@
 # frozen_string_literal: true
 
 module HTTP3
-  # The stream a response was being sent on is gone: the client reset it,
-  # the connection ended, the server stopped, or the response was aborted
-  # after waiting on its client for response_timeout. Body::Pipe's write,
-  # finish and flush raise it. It is an IOError, as a write to a closed
-  # socket raises one.
+  # The stream a response was being sent on is gone: the client reset it or
+  # asked for no more of it (STOP_SENDING), the connection ended, the server
+  # stopped, or the response was aborted after waiting on its client for
+  # response_timeout. Body::Pipe's write, finish and flush raise it. It is
+  # an IOError, as a write to a closed socket raises one.
   class StreamClosed < IOError
   end
 

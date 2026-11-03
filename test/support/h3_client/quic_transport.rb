@@ -90,7 +90,20 @@ module H3TestClient
       stream = @streams.fetch(id)
       @client.connection.shutdown_stream_write(id)
       stream.reset(HTTP3::Nghttp3::H3_REQUEST_CANCELLED)
-      stream.close_read if stop_sending
+      stop_sending(id) if stop_sending
+    end
+
+    # Ask for no more of what the server sends on stream id: STOP_SENDING
+    # alone, with error code 0, the only one QUIC::Stream#close_read sends.
+    # The request, if not sent in full, is left as it is.
+    def stop_sending(id)
+      @streams.fetch(id).close_read
+    end
+
+    # The QUIC::Stream of stream id: a request stream, or one the server
+    # opened, such as its control stream.
+    def quic_stream(id)
+      @streams.fetch(id)
     end
 
     # Stop reading the response on stream id, until #resume. QUIC::Stream
