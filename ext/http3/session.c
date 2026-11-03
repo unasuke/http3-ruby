@@ -727,16 +727,19 @@ static int h3_stream_reset(void *ud, int64_t id, uint64_t final_size,
  * nothing if all of the request has arrived. The Ruby part then drops the
  * request (#on_stop_sending).
  *
- * On one of our unidirectional streams (control or QPACK), nghttp3 only
- * sends no more; the connection fails once the stream has closed. */
+ * Our unidirectional streams are the control and QPACK streams, which the
+ * client must not ask us to close, and whose closing is a connection error
+ * of type H3_CLOSED_CRITICAL_STREAM (RFC 9114 section 6.2.1, RFC 9204
+ * section 4.2): the connection fails at once, rather than when the stream
+ * has closed. The client's own unidirectional streams never get here:
+ * ngtcp2 refuses STOP_SENDING on a stream we only receive on. */
 static int h3_recv_stop_sending(void *ud, int64_t id, uint64_t app_error_code) {
   h3_session *s = ud;
   if (s->h3 == NULL) {
     return 0;
   }
   if (id & 0x2) {
-    nghttp3_conn_shutdown_stream_write(s->h3, id);
-    return 0;
+    return h3_fail_with(s, NGHTTP3_H3_CLOSED_CRITICAL_STREAM);
   }
   h3_stream *st = h3_stream_find(s, id);
   if (st != NULL) {

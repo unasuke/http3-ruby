@@ -52,6 +52,25 @@ class TestSessionFailures < Minitest::Test
     assert_equal FAILED, outcome
   end
 
+  # STOP_SENDING on the server's control stream asks it to close a critical
+  # stream, which is H3_CLOSED_CRITICAL_STREAM (RFC 9114 section 6.2.1): the
+  # connection fails. quic shows Ruby no code of a connection's close, so
+  # only the failure is seen here.
+  def test_stop_sending_on_the_control_stream
+    outcome = serve_in_child do |port|
+      client = H3TestClient::QuicTransport.connect(port, ca_file: credentials.ca_file)
+      # The first stream the server opens (3) is its control stream.
+      client.pump_until do
+        client.quic_stream(3)
+      rescue KeyError
+        false
+      end
+      client.quic_stream(3).close_read
+      client.quic
+    end
+    assert_equal FAILED, outcome
+  end
+
   # A Session method called from inside a callback of the Session would
   # call into nghttp3, or delete it, while nghttp3 runs: it is refused.
   # The refusal is the callback's exception, which fails the connection
