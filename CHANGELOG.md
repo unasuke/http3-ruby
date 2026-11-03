@@ -32,6 +32,10 @@
 - The quic gem 0.0.6 or later is required (`quic/ext.h` ABI 1.1, with ngtcp2 1.26.0): its stream handler tells of a client's STOP_SENDING as it arrives. ([#27](https://github.com/unasuke/http3-ruby/pull/27))
 - A client's STOP_SENDING is acted on as it arrives, instead of when the stream closes, a round trip or more later: a request still coming in, or waiting for a worker, never reaches the application, and the server reads no more of it (STOP_SENDING with H3_REQUEST_CANCELLED); a refused one is not answered; a response being sent stops, its worker getting `HTTP3::StreamClosed`, and what of it was not sent, with a file body's descriptor, is let go at once. The response to a request the application is working on is dropped, as on a reset. ([#27](https://github.com/unasuke/http3-ruby/pull/27))
 - STOP_SENDING on the server's control or QPACK stream closes the connection with H3_CLOSED_CRITICAL_STREAM as it arrives, instead of once the stream has closed. ([#27](https://github.com/unasuke/http3-ruby/pull/27))
+- nghttp3 is now built from 1.19.0 (was 1.13.1). ([#28](https://github.com/unasuke/http3-ruby/pull/28))
+- From nghttp3 1.18.0, a request with a field whose Huffman-coded name nghttp3 estimates over 256 bytes once decoded, or whose value over 64 KiB (the estimate is 8/5 of the coded length), fails the connection with H3_INTERNAL_ERROR: nghttp3 refuses to decode it. Before, such a field reached the Session, which answered 431 if the header section was over `max_field_section_size`, and passed the request on otherwise. A header section over `max_field_section_size` made of smaller fields still gets 431. ([#28](https://github.com/unasuke/http3-ruby/pull/28))
+- `HTTP3::Nghttp3::Callbacks#on_stream_close` is also called for a unidirectional stream of an unknown type that nghttp3 drops (nghttp3 1.16.0). ([#28](https://github.com/unasuke/http3-ruby/pull/28))
+- The hash `HTTP3::Nghttp3::Callbacks#on_recv_settings` yields no longer has `:qpack_encoder_max_dtable_capacity`, which is not a setting the peer sends. ([#28](https://github.com/unasuke/http3-ruby/pull/28))
 
 ## [0.0.4] - 2026-10-27
 
