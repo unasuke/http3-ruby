@@ -67,8 +67,8 @@ module HTTP3
     def finish: (Integer stream_id) -> void
 
     # True while the request on stream_id can still be answered: its stream
-    # is open, and it has been neither reset by the client, nor refused,
-    # nor answered.
+    # is open, the client has neither reset it nor asked for no more of it
+    # (STOP_SENDING), it has not been refused, and it has not been answered.
     def answerable?: (Integer stream_id) -> bool
 
     # The first exception a temporary file raised since the last call (its
@@ -139,6 +139,8 @@ module HTTP3
     def on_end_stream: (Integer id) -> void
     # The client reset its side of the stream.
     def on_reset: (Integer id) -> void
+    # The client asked for no more of the response (STOP_SENDING).
+    def on_stop_sending: (Integer id) -> void
 
     # The C part.
     def submit_response: (Integer stream_id, Array[[String, String]] headers, bool has_body) -> self

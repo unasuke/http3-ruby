@@ -466,7 +466,8 @@ module HTTP3
     end
 
     # Send response for job, unless its request can no longer be answered:
-    # the client reset it, or its stream or connection is gone.
+    # the client reset it or sent STOP_SENDING, or its stream or connection
+    # is gone.
     def deliver(job, response)
       session = job.session
       if @sessions[job.conn].equal?(session) && session.answerable?(job.request.stream_id)

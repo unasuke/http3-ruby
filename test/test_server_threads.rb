@@ -18,6 +18,7 @@ class TestServerThreads < Minitest::Test
     # response_timeout has to be less than request_timeout, and plays no part.
     "test_request_waiting_too_long_for_a_worker_gets_503" => {threads: 1, request_timeout: 1, response_timeout: nil},
     "test_request_reset_while_waiting_never_reaches_the_application" => {threads: 1},
+    "test_request_stopped_while_waiting_never_reaches_the_application" => {threads: 1},
     "test_connections_take_turns" => {threads: 1},
     "test_exit_or_raise_in_the_application_keeps_the_worker" => {threads: 1},
     "test_stop_gives_up_on_a_stuck_job" => {shutdown_timeout: 1},
@@ -245,6 +246,21 @@ class TestServerThreads < Minitest::Test
     refute_match(/app_error/, File.read(@log_path))
   end
 
+  # The same with STOP_SENDING alone: the client asks for no more of the
+  # response, and leaves the request as it is.
+  def test_stop_sending_during_a_streaming_body_stops_it
+    client = connect
+    id = client.request(:get, "/stream-endless")
+    client.pump_until { client.response(id).status }
+    client.stop_sending(id)
+    client.pump_until { client.closed?(id) }
+    ended = wait_for_event(client, "stream-ended", "/stream-endless")
+    assert_equal "HTTP3::StreamClosed", ended.extra
+    assert_same_worker(client, "/stream-endless")
+    assert_equal "fast", get(client, "/fast").body
+    refute_match(/app_error/, File.read(@log_path))
+  end
+
   # A streaming body that writes past content-length, or ends short of it,
   # has its stream aborted, and the cause logged.
   def test_streaming_body_not_of_content_length_aborts_the_stream
@@ -304,6 +320,20 @@ class TestServerThreads < Minitest::Test
     refute_match(/app_error/, File.read(@log_path))
   end
 
+  # The same with STOP_SENDING alone.
+  def test_stop_sending_during_each_stops_the_body
+    client = connect
+    id = client.request(:get, "/endless")
+    client.pump_until { client.response(id).status }
+    client.stop_sending(id)
+    client.pump_until { client.closed?(id) }
+    ended = wait_for_event(client, "each-ended", "/endless")
+    assert_equal "HTTP3::StreamClosed", ended.extra
+    assert_same_worker(client, "/endless")
+    assert_equal "fast", get(client, "/fast").body
+    refute_match(/app_error/, File.read(@log_path))
+  end
+
   # With every worker taken, a request waits, and the connections are
   # served all the while: a new one is set up. The request is answered once
   # the worker is free.
@@ -340,10 +370,9 @@ class TestServerThreads < Minitest::Test
   end
 
   # A request the client gives up on while it waits for a worker never
-  # reaches the application. Sent in full, it gets STOP_SENDING alone, and
-  # the server drops it once its stream closes: when the client has
-  # acknowledged the server's reset, which it does by the next packet it
-  # sends.
+  # reaches the application. Sent in full, it gets STOP_SENDING alone. The
+  # worker comes free only once the stream has closed, so this does not
+  # tell when the request was dropped; the next test does.
   def test_request_reset_while_waiting_never_reaches_the_application
     client = connect
     held = client.request(:get, "/slow")
@@ -354,6 +383,33 @@ class TestServerThreads < Minitest::Test
     client.pump_until { client.closed?(id) }
     barrier(client)
     release
+    client.pump_until { client.response(held).finished? }
+    assert_equal "fast", get(client, "/fast?after").body
+    assert_nil event("call", "/fast")
+  end
+
+  # The same, though the server's side of the stream stays open: once
+  # STOP_SENDING is out, the client is not pumped, so that it acknowledges
+  # nothing, not even the server's reset, while the worker comes free and
+  # for a while after. The request was dropped as STOP_SENDING arrived, not
+  # when its stream closed. (The client's side closes at once, the request
+  # having been sent in full.)
+  def test_request_stopped_while_waiting_never_reaches_the_application
+    client = connect
+    held = client.request(:get, "/slow")
+    wait_for_event(client, "call", "/slow")
+    id = client.request(:get, "/fast")
+    barrier(client)
+    client.stop_sending(id)
+    client.pump
+    sleep 0.3
+    release
+    deadline = now + 5
+    sleep 0.01 until event("close", "/slow") || now > deadline
+    refute_nil event("close", "/slow"), "the worker should have finished /slow"
+    sleep 0.3
+    assert_nil event("call", "/fast")
+
     client.pump_until { client.response(held).finished? }
     assert_equal "fast", get(client, "/fast?after").body
     assert_nil event("call", "/fast")

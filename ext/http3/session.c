@@ -29,7 +29,7 @@
 VALUE rb_cHTTP3Session;
 
 static ID id_on_begin_headers, id_on_header, id_on_end_headers, id_on_data,
-    id_on_end_stream, id_on_fields_too_large, id_on_reset;
+    id_on_end_stream, id_on_fields_too_large, id_on_reset, id_on_stop_sending;
 
 /* What h3_session.field_sizes holds for a request whose header section has
  * gone over max_field_section_size. */
@@ -646,6 +646,9 @@ static int h3_stream_blocked(void *ud, int64_t id) {
   return 0;
 }
 
+/* quic found our side of the stream shut when next_stream_data offered it:
+ * nghttp3 sends no more of it. recv_stop_sending and #abort_stream tell
+ * nghttp3 first, so this is what is left for a stream shut otherwise. */
 static int h3_stream_shut_write(void *ud, int64_t id) {
   h3_session *s = ud;
   if (s->h3 != NULL) {
@@ -712,6 +715,51 @@ static int h3_stream_reset(void *ud, int64_t id, uint64_t final_size,
   return h3_call_ruby(s, id_on_reset, id, 0, NULL);
 }
 
+/* The client asked for no more of what goes out on the stream
+ * (STOP_SENDING); ngtcp2 resets our side of it once this returns. Of a
+ * response, what nghttp3 has not taken is let go at once, and nghttp3
+ * sends no more. The rest of the request is not read either: RFC 9114
+ * section 4.1.1 has a cancelled request stopped in every direction still
+ * open. That is done here, as #stop_reading does it, rather than left to
+ * the Ruby part, so that nothing more of the request comes in, from the
+ * packets read after this one too, even on a stream the Ruby part has not
+ * heard of yet, since STOP_SENDING may come before the request. quic sends
+ * nothing if all of the request has arrived. The Ruby part then drops the
+ * request (#on_stop_sending).
+ *
+ * Our unidirectional streams are the control and QPACK streams, which the
+ * client must not ask us to close, and whose closing is a connection error
+ * of type H3_CLOSED_CRITICAL_STREAM (RFC 9114 section 6.2.1, RFC 9204
+ * section 4.2): the connection fails at once, rather than when the stream
+ * has closed. The client's own unidirectional streams never get here:
+ * ngtcp2 refuses STOP_SENDING on a stream we only receive on. */
+static int h3_recv_stop_sending(void *ud, int64_t id, uint64_t app_error_code) {
+  h3_session *s = ud;
+  if (s->h3 == NULL) {
+    return 0;
+  }
+  if (id & 0x2) {
+    return h3_fail_with(s, NGHTTP3_H3_CLOSED_CRITICAL_STREAM);
+  }
+  h3_stream *st = h3_stream_find(s, id);
+  if (st != NULL) {
+    h3_stream_abort(st);
+  }
+  nghttp3_conn_shutdown_stream_write(s->h3, id);
+  int rv = h3_shutdown_stream_read(s, id);
+  if (rv != 0) {
+    return rv;
+  }
+  if (http3_quic_api->shutdown_stream_read(s->qc, id,
+                                           NGHTTP3_H3_REQUEST_CANCELLED) != 0) {
+    return h3_fail_with(s, NGHTTP3_H3_INTERNAL_ERROR);
+  }
+  /* No end_headers will come to drop the count of a section cut short. */
+  st_data_t key = (st_data_t)id;
+  st_delete(s->field_sizes, &key, NULL);
+  return h3_call_ruby(s, id_on_stop_sending, id, 0, NULL);
+}
+
 static int h3_stream_close(void *ud, int64_t id, int has_code,
                            uint64_t app_error_code) {
   h3_session *s = ud;
@@ -726,8 +774,16 @@ static int h3_stream_close(void *ud, int64_t id, int has_code,
   return h3_fail(s, rv);
 }
 
+/* The size of a handler filled in up to member m. The size tells quic.so
+ * which members the handler has (quic/ext.h): those it fills in, whatever
+ * quic/ext.h it is built against. */
+#define H3_HANDLER_SIZE_TO(m)                                                  \
+  (offsetof(quic_ext_stream_handler, m) +                                      \
+   sizeof(((quic_ext_stream_handler *)0)->m))
+
+/* An ABI 1.1 handler: recv_stop_sending came with quic 0.0.6. */
 static const quic_ext_stream_handler h3_handler = {
-    .size = sizeof(quic_ext_stream_handler),
+    .size = H3_HANDLER_SIZE_TO(recv_stop_sending),
     .recv_stream_data = h3_recv_stream_data,
     .next_stream_data = h3_next_stream_data,
     .stream_data_written = h3_stream_data_written,
@@ -740,6 +796,7 @@ static const quic_ext_stream_handler h3_handler = {
     .stream_reset = h3_stream_reset,
     .stream_close = h3_stream_close,
     .handshake_completed = h3_handshake_completed,
+    .recv_stop_sending = h3_recv_stop_sending,
 };
 
 /* The Ruby object */
@@ -1267,6 +1324,7 @@ void Init_http3_session(VALUE rb_mHTTP3) {
   id_on_end_stream = rb_intern("on_end_stream");
   id_on_fields_too_large = rb_intern("on_fields_too_large");
   id_on_reset = rb_intern("on_reset");
+  id_on_stop_sending = rb_intern("on_stop_sending");
 
   rb_cHTTP3Session = rb_define_class_under(rb_mHTTP3, "Session", rb_cObject);
   rb_undef_alloc_func(rb_cHTTP3Session);

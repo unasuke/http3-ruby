@@ -3,8 +3,9 @@ module HTTP3
     # The stream a streaming body (Rack 3's call(stream)) is called with:
     # writes go to a Body::Pipe, reads come from the request body. Its
     # methods behave as IO's do. Once the stream has gone away (the client
-    # reset it, or it was aborted after response_timeout), write and flush
-    # raise StreamClosed, and so do close_write and close, once;
+    # reset it or sent STOP_SENDING, or it was aborted after
+    # response_timeout), write and flush raise StreamClosed, and so do
+    # close_write and close, once;
     # writing past length, the content-length, fails the pipe and raises
     # StreamClosed too.
     class Stream

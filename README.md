@@ -135,6 +135,10 @@ A request gets 413, 431 or 503 as soon as it passes a limit, without waiting
 for the rest of it, and the server reads no more of it (STOP_SENDING with
 H3_NO_ERROR). The 503 has neither headers nor body.
 
+A request whose client asks for no more of its response (STOP_SENDING)
+before a worker takes it never reaches the application, and the server
+reads no more of it.
+
 A request gets 400, without the application seeing it, when its scheme is
 not `http` or `https`, its path has a fragment, its authority is not `host`
 or `host:port`, or its `:authority` and `host` field differ. `CONNECT` gets
@@ -147,8 +151,9 @@ request body, received in full; the body ends when `call` returns, so
 writing to the stream from another thread afterwards is not supported. Its
 stream is aborted (H3_INTERNAL_ERROR) once what it writes goes past
 `content-length` or ends short of it, and `write` raises
-`HTTP3::StreamClosed` (an `IOError`) once the client has reset the stream,
-or the response has been aborted after `response_timeout:`.
+`HTTP3::StreamClosed` (an `IOError`) once the client has reset the stream
+or asked for no more of it (STOP_SENDING), or the response has been aborted
+after `response_timeout:`.
 These get 500: a status outside 200..599; response headers whose names are not lowercase tokens or whose
 values contain NUL, CR or LF; a `content-length` given more than once, not a
 number, or not the length of a file or array body; and an array body with a
