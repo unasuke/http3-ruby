@@ -5,8 +5,9 @@ require "mini_portile2"
 
 # nghttp3 is downloaded and built at install time and linked statically, so
 # installing needs no system package and always gets this version.
-# nghttp3_conn_read_stream2 needs 1.12.0 or later. nghttp3 depends on nothing
-# but libc, so its version does not have to follow the quic gem's ngtcp2.
+# The const getters such as nghttp3_conn_is_stream_writable2 need 1.16.0 or
+# later. nghttp3 depends on nothing but libc, so its version does not have
+# to follow the quic gem's ngtcp2.
 NGHTTP3_VERSION = "1.19.0"
 NGHTTP3_SHA256 = "0dc9a55d38ca04c282524bfecdc5e31d393a4bb430200263dd06a87801a150af"
 

@@ -513,22 +513,19 @@ static int nghttp3_rb_shutdown_callback(nghttp3_conn *conn, int64_t id,
 
 typedef struct {
   VALUE proc;
-  const nghttp3_settings *settings;
+  const nghttp3_proto_settings *settings;
 } settings_call;
 
+/* The hash has the settings the peer sent, as nghttp3 parsed them. */
 static VALUE recv_settings_body(VALUE arg) {
   const settings_call *call = (const settings_call *)arg;
-  const nghttp3_settings *settings = call->settings;
+  const nghttp3_proto_settings *settings = call->settings;
 
-  /* Create a Ruby hash with settings values */
   VALUE rb_settings = rb_hash_new();
   rb_hash_aset(rb_settings, ID2SYM(rb_intern("max_field_section_size")),
                ULL2NUM(settings->max_field_section_size));
   rb_hash_aset(rb_settings, ID2SYM(rb_intern("qpack_max_dtable_capacity")),
                SIZET2NUM(settings->qpack_max_dtable_capacity));
-  rb_hash_aset(rb_settings,
-               ID2SYM(rb_intern("qpack_encoder_max_dtable_capacity")),
-               SIZET2NUM(settings->qpack_encoder_max_dtable_capacity));
   rb_hash_aset(rb_settings, ID2SYM(rb_intern("qpack_blocked_streams")),
                SIZET2NUM(settings->qpack_blocked_streams));
   rb_hash_aset(rb_settings, ID2SYM(rb_intern("enable_connect_protocol")),
@@ -540,9 +537,10 @@ static VALUE recv_settings_body(VALUE arg) {
   return Qnil;
 }
 
-static int nghttp3_rb_recv_settings_callback(nghttp3_conn *conn,
-                                             const nghttp3_settings *settings,
-                                             void *conn_user_data) {
+static int
+nghttp3_rb_recv_settings2_callback(nghttp3_conn *conn,
+                                   const nghttp3_proto_settings *settings,
+                                   void *conn_user_data) {
   ConnectionObj *obj = conn_user_data;
   if (NIL_P(obj->callbacks)) {
     return 0;
@@ -575,7 +573,7 @@ void nghttp3_rb_setup_callbacks(nghttp3_callbacks *callbacks) {
   callbacks->end_stream = nghttp3_rb_end_stream_callback;
   callbacks->reset_stream = nghttp3_rb_reset_stream_callback;
   callbacks->shutdown = nghttp3_rb_shutdown_callback;
-  callbacks->recv_settings = nghttp3_rb_recv_settings_callback;
+  callbacks->recv_settings2 = nghttp3_rb_recv_settings2_callback;
 }
 
 void Init_nghttp3_callbacks(void) {

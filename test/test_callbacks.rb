@@ -150,6 +150,41 @@ class TestNghttp3Callbacks < Minitest::Test
     conn&.close
   end
 
+  # The server's on_recv_settings gets the SETTINGS the client sent, as
+  # nghttp3 parsed them, and nothing else. Four of them differ from the
+  # defaults, so that none can pass for another.
+  def test_on_recv_settings_gets_the_peer_settings
+    settings = HTTP3::Nghttp3::Settings.default
+    settings.max_field_section_size = 12_345
+    settings.qpack_max_dtable_capacity = 1_024
+    settings.qpack_blocked_streams = 7
+    settings.h3_datagram = true
+    client = HTTP3::Nghttp3::Connection.client_new(settings)
+    client.bind_control_stream(2)
+    client.bind_qpack_streams(6, 10)
+
+    received = []
+    callbacks = HTTP3::Nghttp3::Callbacks.new
+    callbacks.on_recv_settings { |peer| received << peer }
+    server = HTTP3::Nghttp3::Connection.server_new(nil, callbacks)
+    server.bind_control_stream(3)
+    server.bind_qpack_streams(7, 11)
+
+    while (out = client.writev_stream)
+      server.read_stream(out[:stream_id], out[:data], fin: out[:fin])
+      client.add_write_offset(out[:stream_id], out[:data].bytesize)
+    end
+
+    expected = {
+      max_field_section_size: 12_345, qpack_max_dtable_capacity: 1_024, qpack_blocked_streams: 7,
+      enable_connect_protocol: false, h3_datagram: true
+    }
+    assert_equal [expected], received
+  ensure
+    client&.close
+    server&.close
+  end
+
   def test_connection_without_callbacks_still_works
     # Ensure backward compatibility - nil callbacks should work
     conn = HTTP3::Nghttp3::Connection.client_new
