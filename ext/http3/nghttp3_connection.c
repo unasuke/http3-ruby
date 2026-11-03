@@ -790,7 +790,7 @@ static VALUE rb_nghttp3_connection_stream_writable_p(VALUE self,
 
   entered = obj->entered;
   obj->entered = CONN_IN_OTHER;
-  rv = nghttp3_conn_is_stream_writable(obj->conn, stream_id);
+  rv = nghttp3_conn_is_stream_writable2(obj->conn, stream_id);
   obj->entered = entered;
 
   return rv ? Qtrue : Qfalse;

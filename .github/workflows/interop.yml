@@ -28,7 +28,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: tmp
-          key: ports-${{ runner.os }}-nghttp3-1.13.1-${{ hashFiles('ext/http3/extconf.rb') }}
+          key: ports-${{ runner.os }}-nghttp3-1.19.0-${{ hashFiles('ext/http3/extconf.rb') }}
       - name: Compile
         run: bundle exec rake compile
       - name: curl --http3-only against the server

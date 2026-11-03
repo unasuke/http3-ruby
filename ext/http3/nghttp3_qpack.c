@@ -248,7 +248,7 @@ static VALUE rb_nghttp3_qpack_encoder_get_num_blocked_streams(VALUE self) {
     rb_raise(rb_eNghttp3InvalidStateError, "Encoder is not initialized");
   }
 
-  num = nghttp3_qpack_encoder_get_num_blocked_streams(obj->encoder);
+  num = nghttp3_qpack_encoder_get_num_blocked_streams2(obj->encoder);
 
   return SIZET2NUM(num);
 }
@@ -554,7 +554,7 @@ static VALUE rb_nghttp3_qpack_decoder_decoder_stream_data(VALUE self) {
     rb_raise(rb_eNghttp3InvalidStateError, "Decoder is not initialized");
   }
 
-  len = nghttp3_qpack_decoder_get_decoder_streamlen(obj->decoder);
+  len = nghttp3_qpack_decoder_get_decoder_streamlen2(obj->decoder);
 
   if (len == 0) {
     return rb_str_new("", 0);
