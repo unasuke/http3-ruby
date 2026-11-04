@@ -119,8 +119,9 @@ module HTTP3
 
     # Let go of closed streams (a Body::Pipe is cancelled); yields a body
     # close that raised. Resets our side of the requests the client reset
-    # before their end (H3_REQUEST_INCOMPLETE), and of those it reset while
-    # they waited to be handed out (H3_REQUEST_CANCELLED).
+    # before their end (H3_REQUEST_INCOMPLETE), and of those it reset once
+    # they had come in full, while they waited to be handed out or once
+    # handed out and not answered (H3_REQUEST_CANCELLED).
     def release_closed: () ?{ (Integer stream_id, Exception error) -> void } -> void
 
     # The connection is gone: let go of the nghttp3 connection and, of each

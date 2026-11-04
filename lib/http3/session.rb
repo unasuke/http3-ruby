@@ -343,7 +343,8 @@ module HTTP3
     # close raised. First, the requests the client reset before their end
     # (#on_reset) get our side of their streams reset too, with
     # H3_REQUEST_INCOMPLETE as RFC 9114 section 4.1 says, so that the
-    # streams close; those it reset while they waited to be handed out, with
+    # streams close; those it reset once they had come in full, waiting to
+    # be handed out or handed out and not answered, with
     # H3_REQUEST_CANCELLED.
     def release_closed(&block)
       @incomplete.each { |id| abort_stream(id, Nghttp3::H3_REQUEST_INCOMPLETE) }
@@ -429,13 +430,21 @@ module HTTP3
     # #answerable?. A request it had not finished is dropped with what it
     # held, and #release_closed resets our side with H3_REQUEST_INCOMPLETE;
     # one waiting to be handed out likewise, with H3_REQUEST_CANCELLED, so
-    # that nobody answers what nobody reads. One handed out, or refused, is
-    # answered as it would have been. Inside a callback, so it calls no C.
+    # that nobody answers what nobody reads. One handed out and not
+    # answered yet has our side reset with H3_REQUEST_CANCELLED too, so that
+    # its stream closes without waiting for the application, whose response
+    # is dropped. One answered goes on: the client may still read the
+    # response. One refused is answered as it would have been. Inside a
+    # callback, so it calls no C.
     def on_reset(id)
       @reset[id] = true if @open.key?(id)
       if (waiting = take_waiting(id))
         close_input(waiting.input)
         release_budget(id)
+        @cancelled << id
+        return
+      end
+      if @handed.key?(id) && !@answered[id]
         @cancelled << id
         return
       end
@@ -506,7 +515,8 @@ module HTTP3
       @rejected = {}
       @answered = {}
       @incomplete = []
-      # The requests the client reset while they waited to be handed out
+      # The requests the client reset once they had come in full, while they
+      # waited to be handed out or before they were answered
       @cancelled = []
     end
 

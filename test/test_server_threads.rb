@@ -438,6 +438,34 @@ class TestServerThreads < Minitest::Test
     assert_nil event("call", "/fast")
   end
 
+  # A request the client resets once the application has it, though it was
+  # sent in full: its response is dropped, as ever, and the server's side of
+  # the stream is reset too, so that the stream closes without waiting for
+  # the application (TestStopSending checks the code, H3_REQUEST_CANCELLED,
+  # which the test client does not show). QUIC lets the client reset
+  # a request sent in full only until the server has acknowledged its end,
+  # so the client sends it with #flush, and reads nothing until the
+  # application has it.
+  def test_request_reset_while_the_application_has_it_closes_its_stream
+    client = connect
+    id = client.request(:get, "/slow")
+    client.flush
+    deadline = now + 5
+    until event("call", "/slow")
+      flunk "the application did not get /slow" if now > deadline
+      sleep 0.01
+    end
+    client.cancel(id, stop_sending: false)
+    client.pump_until { client.closed?(id) }
+    assert_nil event("close", "/slow"), "the application should still have /slow"
+
+    release
+    wait_for_event(client, "close", "/slow")
+    assert_nil client.response(id)&.status
+    assert_equal "fast", get(client, "/fast").body
+    refute_match(/app_error/, File.read(@log_path))
+  end
+
   # The connections take turns at the one worker, a request each.
   def test_connections_take_turns
     a = connect
