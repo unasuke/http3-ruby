@@ -12,6 +12,8 @@ class TestABI < Minitest::Test
   def test_raises_load_error_for_another_major_version
     error = assert_raises(LoadError) { HTTP3::Testing.load_quic_api(2) }
     assert_match(/ABI major version 2/, error.message)
+    # The quic the gemspec asks for.
+    assert_includes error.message, "(quic ~> 0.0.6)"
     assert_includes error.message, "quic #{QUIC::VERSION}"
   end
 end
