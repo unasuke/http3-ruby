@@ -826,6 +826,11 @@ static int h3_free_stream_i(st_data_t key, st_data_t value, st_data_t arg) {
   return ST_CONTINUE;
 }
 
+static int h3_abort_stream_i(st_data_t key, st_data_t value, st_data_t arg) {
+  h3_stream_abort((h3_stream *)value);
+  return ST_CONTINUE;
+}
+
 /* Never touches qc: the QUIC connection may be gone already. */
 static void h3_session_free(void *ptr) {
   h3_session *s = ptr;
@@ -1316,6 +1321,36 @@ static VALUE rb_http3_session_abort_stream(VALUE self, VALUE rb_id,
   return self;
 }
 
+/*
+ * call-seq:
+ *   session.release_connection -> self   (private; #release_all calls it)
+ *
+ * Let go of the HTTP/3 connection now, rather than when the Session is
+ * garbage collected: the nghttp3 connection is deleted, and every response
+ * body aborted as #abort_stream aborts one, though no stream is reset, so
+ * that what nghttp3 had not taken of it is let go of and a file body's
+ * descriptor closed. What nghttp3 had taken stays until the Session is
+ * freed, even once the stream closes, since without nghttp3 nothing tells
+ * of that: ngtcp2 may still point into it, to send it again.
+ *
+ * For a QUIC connection that has gone. One still driven goes on as after a
+ * failure (h3_fail_with), with H3_NO_ERROR; without nghttp3, it sends
+ * nothing more of a body let go of, its FIN included. A connection that
+ * failed keeps the error it failed with. From then on #submit_response and
+ * #stop_reading raise InvalidStateError, as on a failed connection, and
+ * #push_chunk, #push_eof and #attach_file as on an aborted stream. Raises
+ * InvalidStateError inside a callback of the Session, where nghttp3 may be
+ * running. Calling it again does nothing.
+ */
+static VALUE rb_http3_session_release_connection(VALUE self) {
+  h3_session *s = h3_session_enter(self);
+  if (!s->failed) {
+    h3_fail_with(s, NGHTTP3_H3_NO_ERROR);
+  }
+  st_foreach(s->streams, h3_abort_stream_i, 0);
+  return self;
+}
+
 void Init_http3_session(VALUE rb_mHTTP3) {
   id_on_begin_headers = rb_intern("on_begin_headers");
   id_on_header = rb_intern("on_header");
@@ -1351,4 +1386,6 @@ void Init_http3_session(VALUE rb_mHTTP3) {
                    rb_http3_session_shutdown_notice, 0);
   rb_define_method(rb_cHTTP3Session, "abort_stream",
                    rb_http3_session_abort_stream, 2);
+  rb_define_private_method(rb_cHTTP3Session, "release_connection",
+                           rb_http3_session_release_connection, 0);
 }

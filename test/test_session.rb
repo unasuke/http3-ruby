@@ -47,6 +47,10 @@ class TestSession < Minitest::Test
     # aborted them (#abort_streams).
     @aborts = Thread::Queue.new
     @aborted = Thread::Queue.new
+    # The same for release_all: the stream ids to tell of, and what the
+    # server saw (#release_all).
+    @releases = Thread::Queue.new
+    @released = Thread::Queue.new
     @file_responses = Thread::Queue.new
     @body_errors = Thread::Queue.new
     @second_responses = Thread::Queue.new
@@ -209,6 +213,27 @@ class TestSession < Minitest::Test
     errors.each { |error| assert_kind_of HTTP3::Nghttp3::InvalidStateError, error }
   end
 
+  # release_all lets go at once of what the C part holds of the bodies, the
+  # descriptor of a file body and what nghttp3 has not taken of an array
+  # body, rather than when the garbage collector frees the Session. The
+  # nghttp3 connection goes too: a call that needs it raises.
+  def test_release_all_lets_go_of_what_the_bodies_hold
+    skip "needs /proc/self/fd" unless File.directory?("/proc/self/fd")
+    file = @client.request(:get, "/big-file").tap { |id| @client.pause(id) }
+    array = @client.request(:get, "/big-array").tap { |id| @client.pause(id) }
+    pump_for(0.5)
+    @releases << [file, array]
+    @client.pump_until { !@released.empty? }
+    before, after, error = @released.pop
+
+    refute_empty before[:fds], "the file should not have been read in full"
+    assert_operator before[:unsent][array], :>, 0
+    assert_empty after[:fds]
+    assert_equal({file => 0, array => 0}, after[:unsent])
+    assert_kind_of HTTP3::Nghttp3::InvalidStateError, error
+    assert_equal "the HTTP/3 connection has failed", error.message
+  end
+
   def test_250_requests_in_a_row_on_one_connection
     250.times do |i|
       id = @client.request(:get, "/hello")
@@ -242,6 +267,12 @@ class TestSession < Minitest::Test
       end
       session.fill_bodies(65_536) { |request, error| @fill_errors << [request, error] }
       abort_streams(session) unless @aborts.empty?
+      unless @releases.empty?
+        release_all(session)
+        # As the server does, the connection is no longer driven once let
+        # go of: its handler would fail it.
+        break
+      end
       session.release_closed
       error = session.take_error and raise error
     end
@@ -294,6 +325,25 @@ class TestSession < Minitest::Test
       end
     end
     @aborted << [before, after, errors]
+  end
+
+  # Let go of the session as the test asked, and tell it, from the same
+  # turn, what the streams held just before and just after (the
+  # descriptors open on /big-file, and unsent_bytes), and what
+  # submit_response raised afterwards.
+  def release_all(session)
+    ids = @releases.pop
+    held = -> { {fds: descriptors_of(@big_file_path), unsent: ids.to_h { |id| [id, session.unsent_bytes(id)] }} }
+    before = held.call
+    session.release_all
+    after = held.call
+    error = begin
+      session.submit_response(ids.first, [[":status", "200"]], false)
+      nil
+    rescue => e
+      e
+    end
+    @released << [before, after, error]
   end
 
   # Pump for a while, so that the server gets what the client sent.

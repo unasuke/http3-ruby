@@ -25,12 +25,30 @@ class TestServerThreads < Minitest::Test
     "test_stop_cancels_a_body_still_being_written" => {shutdown_timeout: 1},
     "test_responses_not_read_free_their_workers" => {response_timeout: 1},
     "test_array_and_file_bodies_not_read_are_aborted" => {response_timeout: 1},
-    "test_streaming_body_with_nothing_to_send_is_not_aborted" => {response_timeout: 1}
+    "test_streaming_body_with_nothing_to_send_is_not_aborted" => {response_timeout: 1},
+    # response_timeout would abort the responses, closing their descriptors,
+    # also during the connection's closing or draining period.
+    "test_file_bodies_not_read_let_go_of_their_descriptors_when_the_connection_closes" => {response_timeout: nil},
+    "test_file_bodies_not_read_let_go_of_their_descriptors_when_the_connection_fails" => {response_timeout: nil}
   }.freeze
 
   # The size of /big-array and /big-file: much more than the client's
   # window lets the server send unread.
   BIG = 4 * 1_024 * 1_024
+
+  # The tests that ask for /big-file, which setup writes for them alone.
+  BIG_FILE_TESTS = %w[
+    test_array_and_file_bodies_not_read_are_aborted
+    test_file_bodies_not_read_let_go_of_their_descriptors_when_the_connection_closes
+    test_file_bodies_not_read_let_go_of_their_descriptors_when_the_connection_fails
+  ].freeze
+
+  # The tests whose server does not collect garbage: the Session's dfree
+  # closes descriptors too.
+  NO_GC_TESTS = %w[
+    test_file_bodies_not_read_let_go_of_their_descriptors_when_the_connection_closes
+    test_file_bodies_not_read_let_go_of_their_descriptors_when_the_connection_fails
+  ].freeze
 
   Event = Data.define(:name, :detail, :thread, :extra)
 
@@ -138,7 +156,7 @@ class TestServerThreads < Minitest::Test
     @file_path = File.join(@dir, "file")
     File.write(@file_path, "file content")
     # What /big-file serves, next to /file.
-    File.binwrite(File.join(@dir, "big-file"), "x" * BIG) if name == "test_array_and_file_bodies_not_read_are_aborted"
+    File.binwrite(File.join(@dir, "big-file"), "x" * BIG) if BIG_FILE_TESTS.include?(name)
     @clients = []
     @events = []
     @event_buffer = +""
@@ -147,11 +165,16 @@ class TestServerThreads < Minitest::Test
     release_r = @release_r
     events_w = @events_w
     file_path = @file_path
+    no_gc = NO_GC_TESTS.include?(name)
     @pid, @port = start_server(
       log_path: @log_path,
       certificate_path: credentials.certificate_path, private_key_path: credentials.private_key_path,
       **OPTIONS.fetch(name, {})
-    ) { build_app(release_r, events_w, file_path) }
+    ) do
+      # In the child.
+      GC.disable if no_gc
+      build_app(release_r, events_w, file_path)
+    end
     @release_r.close
     @events_w.close
   end
@@ -538,6 +561,37 @@ class TestServerThreads < Minitest::Test
     refute_match(/app_error/, File.read(@log_path))
   end
 
+  # File bodies their client reads none of keep their descriptors only while
+  # the connection lasts: once the client has closed it, the server lets go
+  # of them, after the connection's draining period, rather than when the
+  # garbage collector frees the connection's Session. Neither
+  # response_timeout nor the garbage collector can close them here: the
+  # server has neither.
+  def test_file_bodies_not_read_let_go_of_their_descriptors_when_the_connection_closes
+    skip "needs /proc/PID/fd" unless File.directory?("/proc/#{@pid}/fd")
+    client = connect
+    request_big_files(client)
+    client.close
+    assert_descriptors_go(big_file_path) { sleep 0.05 }
+  end
+
+  # The same once HTTP/3 fails on the connection: a second control stream is
+  # H3_STREAM_CREATION_ERROR (RFC 9114 section 6.2.1), and the connection
+  # closes, after its closing period.
+  def test_file_bodies_not_read_let_go_of_their_descriptors_when_the_connection_fails
+    skip "needs /proc/PID/fd" unless File.directory?("/proc/#{@pid}/fd")
+    client = connect
+    request_big_files(client)
+    # A stream type of 0x00 (control), then SETTINGS with no settings.
+    client.quic.open_uni_stream.write("\x00\x04\x00".b)
+    assert_descriptors_go(big_file_path) do
+      client.pump
+    rescue QUIC::Error
+      # The connection has closed.
+      sleep 0.01
+    end
+  end
+
   # A streaming body with nothing to send for longer than
   # response_timeout, as server-sent events between events, is not
   # aborted.
@@ -683,6 +737,36 @@ class TestServerThreads < Minitest::Test
     headers = Array.new(4) { |i| ["x-large-#{i}", "x" * 20_000] }.to_h
     id = client.request(:get, "/", headers: headers)
     client.pump_until { client.response(id).finished? }
+  end
+
+  # Ask for /big-file three times, reading none of it, until the server
+  # holds a descriptor on the file for each: the client's window is far too
+  # small for the whole file. A paused response is not read, so its headers
+  # cannot tell.
+  def request_big_files(client)
+    3.times { client.request(:get, "/big-file").tap { |id| client.pause(id) } }
+    client.pump_until { server_descriptors_of(big_file_path).size == 3 }
+  end
+
+  def big_file_path
+    File.realpath(File.join(@dir, "big-file"))
+  end
+
+  # Run the block until the server has no descriptor open on path, for 3
+  # seconds at most.
+  def assert_descriptors_go(path)
+    deadline = now + 3
+    yield until server_descriptors_of(path).empty? || now > deadline
+    assert_empty server_descriptors_of(path)
+  end
+
+  # The server's descriptors open on path (Linux).
+  def server_descriptors_of(path)
+    Dir.children("/proc/#{@pid}/fd").map(&:to_i).select do |fd|
+      File.readlink("/proc/#{@pid}/fd/#{fd}") == path
+    rescue Errno::ENOENT
+      false
+    end
   end
 
   # A byte for one /slow to go on.

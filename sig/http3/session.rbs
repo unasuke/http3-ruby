@@ -123,14 +123,18 @@ module HTTP3
     # they waited to be handed out (H3_REQUEST_CANCELLED).
     def release_closed: () ?{ (Integer stream_id, Exception error) -> void } -> void
 
-    # Close every body still held. What the requests handed out hold counts
-    # until #finish.
+    # The connection is gone: let go of the nghttp3 connection and, of each
+    # body, of what nghttp3 has not taken (a file body's descriptor
+    # included), then close every body still held. Afterwards submit_response
+    # and stop_reading raise Nghttp3::InvalidStateError, as on a failed
+    # connection, and push_chunk, push_eof and attach_file as on an aborted
+    # stream. What the requests handed out hold counts until #finish.
     def release_all: () ?{ (Integer stream_id, Exception error) -> void } -> void
 
     # Called inside nghttp3, or inside the QUIC connection's packet
     # handling, where submit_response, stop_reading, push_chunk, push_eof,
-    # attach_file, shutdown_notice and abort_stream (and so respond) raise
-    # Nghttp3::InvalidStateError.
+    # attach_file, shutdown_notice and abort_stream (and so respond), and
+    # release_all, raise Nghttp3::InvalidStateError.
     def on_begin_headers: (Integer id) -> void
     def on_header: (Integer id, String name, String value) -> void
     def on_fields_too_large: (Integer id) -> void

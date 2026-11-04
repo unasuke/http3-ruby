@@ -353,10 +353,16 @@ module HTTP3
       take_closed.each { |id| release(id, &block) }
     end
 
-    # The connection is gone: close every body still held. What the
-    # requests handed out hold still counts, until #finish, since the
-    # caller still has them.
+    # The connection is gone: close every body still held. First the C part
+    # lets go of the nghttp3 connection and, of each body, of what nghttp3
+    # has not taken, a file body's descriptor included, rather than when the
+    # Session is garbage collected. From then on #submit_response and
+    # #stop_reading raise Nghttp3::InvalidStateError, as on a failed
+    # connection, and #push_chunk, #push_eof and #attach_file as on an
+    # aborted stream. What the requests handed out hold still counts, until
+    # #finish, since the caller still has them.
     def release_all(&block)
+      release_connection
       (@open.keys | @outgoing.keys).each { |id| release(id, &block) }
     end
 
