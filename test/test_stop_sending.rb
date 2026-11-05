@@ -167,6 +167,26 @@ class TestStopSending < Minitest::Test
     }
   end
 
+  # Not STOP_SENDING, but this harness tells the code: a request the client
+  # resets once it has been handed out, though it was sent in full, has the
+  # server's side of its stream reset with H3_REQUEST_CANCELLED (RFC 9114
+  # section 4.1.1), rather than left open until the connection ends. QUIC
+  # lets the client reset a request sent in full only until the server has
+  # acknowledged its end, so the client sends it with #flush, and is not
+  # pumped until the server has handed it out.
+  def test_a_request_reset_once_handed_out_is_reset_with_request_cancelled
+    @client = connect
+    id = @client.request(:get, "/small")
+    @client.flush
+    assert_equal id, @ended.pop(timeout: 5)
+    @calls << ->(session) { session.next_request&.stream_id }
+    assert_equal id, @results.pop(timeout: 5)
+
+    @client.cancel(id, stop_sending: false)
+    assert_equal [id, HTTP3::Nghttp3::H3_REQUEST_CANCELLED], pop(@aborts)
+    @client.pump_until { @client.closed?(id) }
+  end
+
   # The writer of a Body::Pipe is stopped by StreamClosed as STOP_SENDING
   # arrives, and what it had queued no longer counts, from the same turn.
   # The client is not pumped once STOP_SENDING is out, so that it

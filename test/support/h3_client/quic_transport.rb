@@ -140,6 +140,21 @@ module H3TestClient
       feed
     end
 
+    # Hand what HTTP/3 has to QUIC and send all of it, reading nothing: what
+    # the server sends, its acknowledgements included, waits in the socket
+    # until the next #pump. Once the server has acknowledged the end of a
+    # request, QUIC no longer lets the client reset it, so a test that
+    # resets a request sent in full sends it this way.
+    def flush
+      @client.pump_writes do |id, data, fin|
+        write(@streams.fetch(id), data, fin)
+        data.bytesize
+      end
+      while (pkt = @quic.write_pkt)
+        @sock.send(pkt, 0)
+      end
+    end
+
     # Pass whatever the QUIC streams hold to HTTP/3, without any I/O. Useful
     # after #pump raised because the connection closed.
     def feed
