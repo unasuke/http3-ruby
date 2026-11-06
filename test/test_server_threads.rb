@@ -513,12 +513,14 @@ class TestServerThreads < Minitest::Test
     client.pump_until { client.response(held).finished? }
     assert_equal "slow", client.response(held).body
     # The stream closes, and the server stops, once the client has
-    # acknowledged the response.
+    # acknowledged the response. A packet the client sends once the server
+    # has exited, before Process.wait2 sees it, draws an ICMP port
+    # unreachable, which comes out of the next receive as ECONNREFUSED.
     status = nil
     begin
       client.pump_until { (status = Process.wait2(@pid, Process::WNOHANG)&.last) }
-    rescue QUIC::Error::Closed
-      # The server's CONNECTION_CLOSE.
+    rescue QUIC::Error::Closed, Errno::ECONNREFUSED
+      # The server's CONNECTION_CLOSE, or the server gone.
     end
     status ||= wait_server(@pid)
     @pid = nil
