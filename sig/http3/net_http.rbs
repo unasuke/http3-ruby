@@ -1,0 +1,56 @@
+module HTTP3
+  # Net::HTTP::Client over HTTP/3, a proof of concept loaded by
+  # `require "http3/net/http"`. It prepends to Net::HTTP::Client and its
+  # ConnectionFactory so that protocols: [:http3] connects over QUIC.
+  module NetHTTP
+    # The private constants of Net::HTTP::Client the adapter uses.
+    INTERNALS: Array[Symbol]
+
+    # The parameters of ConnectionFactory.open the adapter prepends to.
+    OPEN_PARAMETERS: Array[[Symbol, Symbol]]
+
+    # For the adapter's own use. Check that klass, Net::HTTP::Client, has
+    # what the adapter plugs into, and return INTERNALS by name. Raises
+    # LoadError naming what is missing.
+    def self.check_client: (Module klass) -> Hash[Symbol, untyped]
+
+    # For the adapter's own use. protocols with :http3 as :http1, for
+    # net-http's own checks.
+    def self.stand_in: (Array[Symbol] protocols) -> Array[Symbol]
+
+    # For the adapter's own use. Raises ArgumentError unless protocols is
+    # [:http3].
+    def self.check_alone: (Array[Symbol] protocols) -> void
+
+    # An HTTP/3 Session for Net::HTTP::Client, over the quic gem's
+    # connection and streams and HTTP3::Nghttp3. It keeps the known defects
+    # listed at the top of http3/net/http.rb.
+    class ClientSession
+      # Connect to uri's host and port over QUIC and set HTTP/3 up, within
+      # options[:open_timeout] and the operation's deadline.
+      def initialize: (URI::Generic uri, Hash[Symbol, untyped] options, untyped operation) -> void
+
+      # A right to open one request stream, or nil when the connection is
+      # closing, draining or has 100 reserved.
+      def reserve: () -> untyped
+
+      def release: (untyped reservation) -> void
+
+      def idle?: () -> bool
+
+      def closed?: () -> bool
+
+      def close: () -> void
+
+      # Close the socket only, in a forked child.
+      def discard_after_fork: () -> void
+
+      # One round of I/O, for a caller waiting on the pool.
+      def progress: (untyped operation) -> void
+
+      # Send request on reservation's stream, yield the response once its
+      # headers have arrived, and return it.
+      def exchange: (untyped request, untyped operation, untyped reservation) { (Net::HTTPResponse) -> void } -> Net::HTTPResponse
+    end
+  end
+end
