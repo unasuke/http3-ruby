@@ -522,7 +522,7 @@ static void h3_raise(h3_session *s, int rv, const char *message) {
   if (nghttp3_err_is_fatal(rv) || rv == NGHTTP3_ERR_QPACK_FATAL) {
     h3_fail(s, rv);
   }
-  nghttp3_rb_raise(rv, message);
+  nghttp3_rb_raise(rv, "%s", message);
 }
 
 /* Make the nghttp3 connection and its three unidirectional streams, as
