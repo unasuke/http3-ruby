@@ -13,3 +13,6 @@ gem "rake-compiler"
 gem "minitest", "~> 5.16"
 
 gem "standard", "~> 1.3"
+
+# Net::HTTP::Client, which http3/net/http plugs into, is only on this branch so far
+gem "net-http", github: "nurse/net-http", branch: "http2"
