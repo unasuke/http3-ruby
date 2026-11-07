@@ -1,4 +1,4 @@
-## [Unreleased]
+## [0.0.5] - 2026-11-07
 
 ### Added
 - `HTTP3::Server` takes `request_body_buffer_size` (64 KiB): a request body that grows past it goes, all of it, to an unnamed temporary file in `Dir.tmpdir` (O_TMPFILE, or a file with a random name unlinked at once where the file system does not take that), which the application reads as `rack.input`. `max_connection_request_buffer` and `max_total_request_buffer` count only the bodies in memory. Where `/tmp` is a tmpfs, the files are in memory too; set `TMPDIR` to a directory on disk. ([#22](https://github.com/unasuke/http3-ruby/pull/22))
