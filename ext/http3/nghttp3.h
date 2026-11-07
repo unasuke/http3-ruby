@@ -102,7 +102,9 @@ void nghttp3_rb_conn_stream_closed(ConnectionObj *obj, int64_t stream_id);
 
 /* Helper functions */
 VALUE nghttp3_rb_error_class_for_code(int error_code);
-void nghttp3_rb_raise(int error_code, const char *fmt, ...);
+NORETURN(PRINTF_ARGS(void nghttp3_rb_raise(int error_code, const char *fmt,
+                                           ...),
+                     2, 3));
 
 /* rb_id (to_int is called) as a stream id for nghttp3, which asserts the
  * range of the ids it is given: ArgumentError unless it is 0..2**62-1. */
