@@ -26,16 +26,15 @@ It is not suited for production yet:
   later can shorten that with `RUBY_THREAD_TIMESLICE`.
 - A request whose client goes away is not interrupted: the application runs
   to its end.
-- CI runs it on Ruby 4.0 alone, not on 3.3, the oldest it installs on. It is
-  checked against curl and the clients of quic-interop-runner, over links
-  with no loss or delay, and has not been run under load or over lossy
-  networks.
+- CI runs it on Ruby 3.4 and 4.0. It is checked against curl and the
+  clients of quic-interop-runner, over links with no loss or delay, and has
+  not been run under load or over lossy networks.
 
 ## Installation
 
-Linux only, Ruby 3.3 or later. Like the quic gem, installing builds C code, so
-it needs a C compiler, pkg-config and the OpenSSL development package
-(`build-essential pkg-config libssl-dev` on Debian and Ubuntu).
+Linux only, tested on Ruby 3.4 and 4.0. Like the quic gem, installing builds
+C code, so it needs a C compiler, pkg-config and the OpenSSL development
+package (`build-essential pkg-config libssl-dev` on Debian and Ubuntu).
 
 ```bash
 bundle add http3
