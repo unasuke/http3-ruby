@@ -1,3 +1,9 @@
+## [Unreleased]
+
+### Changed
+- The quic gem 0.0.7 or later is required (was 0.0.6). ([#35](https://github.com/unasuke/http3-ruby/pull/35))
+- The gem no longer declares a minimum Ruby version (was `>= 3.3.0`). It is tested on Ruby 3.4 and 4.0. ([#35](https://github.com/unasuke/http3-ruby/pull/35))
+
 ## [0.0.5] - 2026-11-07
 
 ### Added
