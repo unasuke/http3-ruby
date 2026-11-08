@@ -15,7 +15,6 @@ Gem::Specification.new do |spec|
     "and its Ruby bindings are available as HTTP3::Nghttp3."
   spec.homepage = "https://github.com/unasuke/http3-ruby"
   spec.license = "MIT"
-  spec.required_ruby_version = ">= 3.3.0"
 
   spec.metadata["homepage_uri"] = spec.homepage
   spec.metadata["source_code_uri"] = "https://github.com/unasuke/http3-ruby"
