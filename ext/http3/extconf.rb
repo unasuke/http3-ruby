@@ -31,6 +31,16 @@ append_cflags("-DNGHTTP3_STATICLIB")
 abort "nghttp3/nghttp3.h not found" unless have_header("nghttp3/nghttp3.h")
 abort "libnghttp3 not linkable" unless have_func("nghttp3_version", "nghttp3/nghttp3.h")
 
+# The bytes for nghttp3's rand callback: getrandom(2) where there is one
+# (Linux, FreeBSD), else arc4random_buf(3) (OpenBSD, macOS). The choice goes
+# in a macro of its own: ruby/config.h may already define HAVE_GETRANDOM and
+# HAVE_ARC4RANDOM_BUF, from what Ruby's own build found.
+if have_func("getrandom", "sys/random.h")
+  append_cppflags("-DHTTP3_RAND_GETRANDOM")
+elsif !have_func("arc4random_buf", "stdlib.h")
+  abort "neither getrandom nor arc4random_buf found"
+end
+
 # The quic gem's C function table, through which HTTP3::Session drives a
 # QUIC connection. The header ships in the quic gem; the table itself is
 # looked up at load time with rb_ext_resolve_symbol (Ruby 3.3 or later).
