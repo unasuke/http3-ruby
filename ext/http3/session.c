@@ -5,7 +5,9 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef HTTP3_RAND_GETRANDOM
 #include <sys/random.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 
@@ -420,10 +422,13 @@ static int h3_reset_stream_cb(nghttp3_conn *conn, int64_t id,
              : NGHTTP3_ERR_CALLBACK_FAILURE;
 }
 
-/* Unpredictable bytes for nghttp3's hardening against misbehaving peers.
- * Should getrandom fail other than by EINTR, the rest stays as it was:
- * nghttp3 only loses some unpredictability. */
+/* Unpredictable bytes for nghttp3's hardening against misbehaving peers,
+ * from getrandom where there is one (Linux, FreeBSD), else from
+ * arc4random_buf (OpenBSD, macOS), which cannot fail; extconf.rb picks, with
+ * HTTP3_RAND_GETRANDOM. Should getrandom fail other than by EINTR, the rest
+ * stays as it was: nghttp3 only loses some unpredictability. */
 static void h3_rand_cb(uint8_t *dest, size_t destlen) {
+#ifdef HTTP3_RAND_GETRANDOM
   while (destlen > 0) {
     ssize_t n = getrandom(dest, destlen, 0);
     if (n < 0) {
@@ -435,6 +440,9 @@ static void h3_rand_cb(uint8_t *dest, size_t destlen) {
     dest += n;
     destlen -= (size_t)n;
   }
+#else
+  arc4random_buf(dest, destlen);
+#endif
 }
 
 /* The body reader. A file body is read 16 KiB at a time as nghttp3 asks;

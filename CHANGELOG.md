@@ -4,6 +4,9 @@
 - The quic gem 0.0.7 or later is required (was 0.0.6). ([#35](https://github.com/unasuke/http3-ruby/pull/35))
 - The gem no longer declares a minimum Ruby version (was `>= 3.3.0`). It is tested on Ruby 3.4 and 4.0. ([#35](https://github.com/unasuke/http3-ruby/pull/35))
 
+### Fixed
+- Builds where there is no getrandom(2), taking the bytes for nghttp3's rand callback from arc4random_buf(3) instead, and no longer raises `NameError` where Ruby lacks `File::TMPFILE`, making the temporary file for a request body with a random name and unlinking it at once, as on a file system without O_TMPFILE. Both are so on OpenBSD. ([#37](https://github.com/unasuke/http3-ruby/pull/37))
+
 ## [0.0.5] - 2026-11-07
 
 ### Added

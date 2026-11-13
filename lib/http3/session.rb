@@ -124,14 +124,18 @@ module HTTP3
     end
 
     # A temporary file in Dir.tmpdir for a request body, without a name and
-    # in binary mode. O_TMPFILE makes it without one; where the file system
-    # does not take that (overlayfs, NFS), a file made with a random name is
-    # unlinked at once. Raises SystemCallError when no file can be had.
+    # in binary mode. O_TMPFILE makes it without one; where Ruby has no
+    # File::TMPFILE (OpenBSD) or the file system does not take it (overlayfs,
+    # NFS), a file made with a random name is unlinked at once. Raises
+    # SystemCallError when no file can be had.
     def self.spool_file
       dir = Dir.tmpdir
       file = begin
-        File.open(dir, File::RDWR | File::TMPFILE, 0o600)
+        File.open(dir, File::RDWR | File::TMPFILE, 0o600) if defined?(File::TMPFILE)
       rescue Errno::EOPNOTSUPP, Errno::EISDIR, Errno::EINVAL
+        nil
+      end
+      file ||= begin
         named = Tempfile.create(["http3-body-", ""], dir)
         begin
           File.unlink(named.path)
